@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
+import type { ToolCall } from '../types.ts'
 import type { ToolCallingPlan } from './types.ts'
 import { getToolProtocol } from './protocols/index.ts'
+import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 
 export class ToolStreamParser {
   private readonly plan: ToolCallingPlan
@@ -57,7 +59,7 @@ export class ToolStreamParser {
 
     const parsed = parseFirstValidToolBlock(this.buffer, this.plan)
     if (parsed.toolCalls.length > 0) {
-      for (const toolCall of parsed.toolCalls) {
+      for (const toolCall of uniqueResponseToolCalls(parsed.toolCalls)) {
         const indexedToolCall = {
           ...toolCall,
           index: this.nextToolCallIndex,
@@ -91,7 +93,7 @@ export class ToolStreamParser {
 
     const parsed = parseFirstValidToolBlock(this.buffer, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length > 0) {
-      const chunks = parsed.toolCalls.flatMap((toolCall) => {
+      const chunks = uniqueResponseToolCalls(parsed.toolCalls).flatMap((toolCall) => {
         const indexedToolCall = {
           ...toolCall,
           index: this.nextToolCallIndex,
@@ -125,7 +127,7 @@ export class ToolStreamParser {
     const parsed = parseFirstValidToolBlock(content, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length === 0) return []
 
-    const chunks = parsed.toolCalls.flatMap((toolCall, index) => {
+    const chunks = uniqueResponseToolCalls(parsed.toolCalls).flatMap((toolCall, index) => {
       const indexedToolCall = {
         ...toolCall,
         index: this.nextToolCallIndex,
@@ -159,6 +161,14 @@ export class ToolStreamParser {
     void parsedId
     return `${this.callIdPrefix}_${index}`
   }
+}
+
+function uniqueResponseToolCalls<T extends ToolCall>(toolCalls: readonly T[]): T[] {
+  const result = deduplicateEquivalentToolCalls(toolCalls)
+  if (result.duplicateCount > 0) {
+    console.warn(`[ToolCalling] Suppressed ${result.duplicateCount} duplicate tool call(s) in one response`)
+  }
+  return result.toolCalls
 }
 
 function parseBufferedToolCall(

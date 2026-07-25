@@ -397,6 +397,31 @@ test('non-stream parsing assigns request-scoped tool call IDs', () => {
   assert.notEqual(firstId, secondId)
 })
 
+test('non-stream parsing suppresses equivalent tool calls in one response', () => {
+  const engine = new ToolCallingEngine()
+  const transformed = engine.transformRequest({
+    request: request({ tool_choice: 'required' }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+  const result: any = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '<|CHAT2API|tool_calls><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter></|CHAT2API|invoke><|CHAT2API|invoke name="default_api:read_file"><|CHAT2API|parameter name="filePath"><![CDATA[/tmp/a]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>',
+      },
+      finish_reason: 'stop',
+    }],
+  }
+
+  engine.applyNonStreamResponse(result, transformed.plan)
+
+  assert.equal(result.choices[0].message.tool_calls.length, 1)
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, 'default_api:read_file')
+  assert.equal(transformed.plan.diagnostics.parsedToolCallCount, 1)
+  assert.equal(result.choices[0].finish_reason, 'tool_calls')
+})
+
 test('non-stream required tool call rejects malformed XML without complete parameters', () => {
   const engine = new ToolCallingEngine()
   const transformed = engine.transformRequest({

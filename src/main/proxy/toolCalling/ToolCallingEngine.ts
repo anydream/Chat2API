@@ -10,6 +10,7 @@ import { getToolProtocol } from './protocols/index.ts'
 import { getToolClientAdapter } from './clientAdapters/index.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
+import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
 
@@ -21,6 +22,7 @@ const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOST
 export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'Complete the active user request using the available context and tool results.',
   'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
+  'If a previous tool call was rejected or had schema validation errors, discard that malformed call and retry it using the declared JSON Schema exactly: include every required field, use only declared properties when the schema is strict, and preserve the declared value types.',
   'Treat progress updates and plans as incomplete.',
   'Return a final answer only after all requested operations are complete and verified by tool results.',
 ].join(' ')
@@ -98,12 +100,16 @@ export class ToolCallingEngine {
     if (!message || typeof message.content !== 'string') return
 
     const parseResult = parseSelectedProtocol(message.content, plan, { allowPartial: true })
+    const deduplicated = deduplicateEquivalentToolCalls(parseResult.toolCalls)
+    if (deduplicated.duplicateCount > 0) {
+      console.warn(`[ToolCalling] Suppressed ${deduplicated.duplicateCount} duplicate tool call(s) in one non-stream response`)
+    }
     plan.diagnostics.parserFormat = parseResult.protocol
-    plan.diagnostics.parsedToolCallCount = parseResult.toolCalls.length
+    plan.diagnostics.parsedToolCallCount = deduplicated.toolCalls.length
     plan.diagnostics.invalidToolNames = parseResult.invalidToolNames
     plan.diagnostics.malformedReason = parseResult.malformedReason
 
-    if (parseResult.toolCalls.length === 0) {
+    if (deduplicated.toolCalls.length === 0) {
       if (
         parseResult.rawMatches.length > 0 &&
         (plan.toolChoiceMode === 'forced' || plan.toolChoiceMode === 'required')
@@ -118,7 +124,7 @@ export class ToolCallingEngine {
 
     const callIdPrefix = `call_${randomUUID().replace(/-/g, '')}`
     message.content = parseResult.content || null
-    message.tool_calls = parseResult.toolCalls.map((toolCall, index) => ({
+    message.tool_calls = deduplicated.toolCalls.map((toolCall, index) => ({
       ...toolCall,
       id: `${callIdPrefix}_${index}`,
     }))

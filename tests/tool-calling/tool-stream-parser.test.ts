@@ -110,7 +110,7 @@ test('invalid tool name is not emitted as a tool call', () => {
   assert.equal(chunks.some((chunk) => chunk.choices[0].delta.tool_calls), false)
 })
 
-test('equivalent XML tool calls in one block remain distinct calls', () => {
+test('equivalent XML tool calls in one block are emitted once', () => {
   const parser = new ToolStreamParser(plan('managed_xml'))
   const chunks = parser.push(
     '<tool_calls><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke><invoke name="default_api:read_file"><parameter name="filePath">/tmp/a</parameter></invoke></tool_calls>',
@@ -118,12 +118,19 @@ test('equivalent XML tool calls in one block remain distinct calls', () => {
   )
 
   const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
-  assert.equal(toolChunks.length, 2)
+  assert.equal(toolChunks.length, 1)
   assert.equal(toolChunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
-  assert.notEqual(
-    toolChunks[0].choices[0].delta.tool_calls[0].id,
-    toolChunks[1].choices[0].delta.tool_calls[0].id,
+})
+
+test('equivalent XML arguments with different key order are emitted once', () => {
+  const parser = new ToolStreamParser(plan('managed_xml'))
+  const chunks = parser.push(
+    '<tool_calls><invoke name="default_api:read_file">{"filePath":"/tmp/a","encoding":"utf8"}</invoke><invoke name="default_api:read_file">{"encoding":"utf8","filePath":"/tmp/a"}</invoke></tool_calls>',
+    baseChunk,
   )
+
+  const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
+  assert.equal(toolChunks.length, 1)
 })
 
 test('parallel tool calls share the role only on the first emitted chunk', () => {

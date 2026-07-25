@@ -11,6 +11,13 @@ import { getToolClientAdapter } from './clientAdapters/index.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 
+const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
+  'Complete the active user request using the available context and tool results.',
+  'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
+  'Treat progress updates and plans as incomplete.',
+  'Return a final answer only after all requested operations are complete and verified by tool results.',
+].join(' ')
+
 export class ToolCallingEngine {
   private readonly config: ToolCallingConfig
 
@@ -52,8 +59,10 @@ export class ToolCallingEngine {
       }
     }
 
+    const messages = appendToolWorkflowContinuation(request.messages)
+
     return {
-      messages: injectPrompt(request.messages, renderPrompt(plan, this.config)),
+      messages: injectPrompt(messages, renderPrompt(plan, this.config)),
       tools: undefined,
       plan,
     }
@@ -94,6 +103,42 @@ export class ToolCallingEngine {
     const choice = result.choices[0]
     choice.finish_reason = 'tool_calls'
   }
+}
+
+/**
+ * Keep managed tool workflows moving after a tool result, including a client
+ * retry after the model returned only a progress update. The directive stays
+ * conditional so completed workflows and ordinary answers can still finish.
+ */
+function appendToolWorkflowContinuation(messages: ChatMessage[]): ChatMessage[] {
+  const lastMessage = messages.at(-1)
+  if (!lastMessage) return messages
+
+  const followsToolResult = lastMessage.role === 'tool'
+  let lastToolResultIndex = -1
+  for (let index = messages.length - 2; index >= 0; index -= 1) {
+    if (messages[index].role === 'tool') {
+      lastToolResultIndex = index
+      break
+    }
+  }
+  const resumesAfterToolResult = lastMessage.role === 'user'
+    && lastToolResultIndex >= 0
+    && messages
+      .slice(lastToolResultIndex + 1, -1)
+      .some(candidate => candidate.role === 'assistant')
+
+  if (!followsToolResult && !resumesAfterToolResult) {
+    return messages
+  }
+
+  return [
+    ...messages,
+    {
+      role: 'user',
+      content: TOOL_WORKFLOW_CONTINUATION_PROMPT,
+    },
+  ]
 }
 
 function renderPrompt(

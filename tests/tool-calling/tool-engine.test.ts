@@ -126,7 +126,7 @@ test('explicit Cherry Studio MCP adapter uses managed prompt and preserves tool 
   assert.equal(result.plan.tools[0].source, 'mcp')
 })
 
-test('tool result history is preserved without synthesizing a continuation message', () => {
+test('tool result history receives a generic continuation without mutating the request', () => {
   const messages = [
     { role: 'user' as const, content: 'complete the requested workflow' },
     { role: 'assistant' as const, content: null, tool_calls: [{
@@ -144,8 +144,46 @@ test('tool result history is preserved without synthesizing a continuation messa
   })
 
   assert.deepEqual(messages, originalMessages)
-  assert.equal(result.messages.at(-1)?.role, 'tool')
-  assert.equal(result.messages.filter(message => message.role === 'user').length, 1)
+  assert.equal(result.messages.at(-2)?.role, 'tool')
+  assert.equal(result.messages.at(-1)?.role, 'user')
+  assert.match(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
+  assert.doesNotMatch(String(result.messages.at(-1)?.content), /image2-p|Skill/)
+})
+
+test('a user retry after a progress-only tool turn receives the same generic continuation', () => {
+  const messages = [
+    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }] },
+    { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
+    { role: 'assistant' as const, content: 'I will perform the next operation now.' },
+    { role: 'user' as const, content: 'continue' },
+  ]
+  const originalMessages = [...messages]
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ messages }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.deepEqual(messages, originalMessages)
+  assert.equal(result.messages.at(-2)?.content, 'continue')
+  assert.equal(result.messages.at(-1)?.role, 'user')
+  assert.match(String(result.messages.at(-1)?.content), /Treat progress updates and plans as incomplete/)
+})
+
+test('ordinary user turns without prior tool progress are not extended', () => {
+  const result = new ToolCallingEngine().transformRequest({
+    request: request(),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.equal(result.messages.at(-1)?.content, 'read /tmp/a')
+  assert.doesNotMatch(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
 })
 
 test('client prompt signatures do not override selected adapter', () => {

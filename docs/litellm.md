@@ -271,7 +271,7 @@ Qwen can briefly reject that continuation with HTTP 200 and
 `code=CHAT_IN_PROGRESS` while it finalizes the parent response. The proxy then
 retries the exact same continuation payload in the same chat with bounded
 exponential backoff. `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS`
-defaults to `3`, and `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`
+defaults to `5` (providing up to 31 seconds with the default delay), and `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`
 defaults to `1000` ms. Set attempts to `0` to disable this recovery. Other JSON
 errors are not retried, and a client disconnect cancels the wait.
 The queue limit is applied per governor admission attempt; a logical request

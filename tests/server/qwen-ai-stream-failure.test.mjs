@@ -75,6 +75,10 @@ function loadQwenAiStreamHandler(overrides = {}) {
         ]))
         return JSON.stringify(normalized)
       }),
+      getToolArgumentValidationIssues: overrides.getToolArgumentValidationIssues || (() => ({
+        missingRequired: [],
+        unexpected: [],
+      })),
     },
     './qwen-ai-native-tools': {
       isCompleteJsonText: overrides.isCompleteJsonText || (() => true),
@@ -123,6 +127,30 @@ function isCompleteJsonText(value) {
     return true
   } catch {
     return false
+  }
+}
+
+function strictNativeArgumentValidation(value, tool) {
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch {
+      return { missingRequired: [], unexpected: [] }
+    }
+  }
+  if (!tool?.parameters || !value || typeof value !== 'object' || Array.isArray(value)) {
+    return { missingRequired: [], unexpected: [] }
+  }
+  const schema = tool.parameters
+  const properties = schema.properties && typeof schema.properties === 'object'
+    ? schema.properties
+    : {}
+  const required = Array.isArray(schema.required) ? schema.required : []
+  return {
+    missingRequired: required.filter(name => !Object.prototype.hasOwnProperty.call(value, name)),
+    unexpected: schema.additionalProperties === false
+      ? Object.keys(value).filter(name => !Object.prototype.hasOwnProperty.call(properties, name))
+      : [],
   }
 }
 
@@ -2654,6 +2682,36 @@ test('Qwen AI retries a rejected workflow continuation with the same payload', a
   }
 })
 
+test('Qwen AI default busy-chat retry budget covers 31 seconds and remains bounded', () => {
+  const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+
+  try {
+    delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+    delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    const {
+      qwenAiChatInProgressRetryAttemptsFromEnv,
+      qwenAiChatInProgressRetryDelayMsFromEnv,
+      qwenAiChatInProgressRetryBudgetMsFromEnv,
+    } = loadQwenAiStreamHandler()
+
+    assert.equal(qwenAiChatInProgressRetryAttemptsFromEnv(), 5)
+    assert.equal(qwenAiChatInProgressRetryDelayMsFromEnv(), 1_000)
+    assert.equal(qwenAiChatInProgressRetryBudgetMsFromEnv(), 31_000)
+
+    process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = '999'
+    process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '999999'
+    assert.equal(qwenAiChatInProgressRetryAttemptsFromEnv(), 5)
+    assert.equal(qwenAiChatInProgressRetryDelayMsFromEnv(), 60_000)
+    assert.equal(qwenAiChatInProgressRetryBudgetMsFromEnv(), 300_000)
+  } finally {
+    if (previousAttempts === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = previousAttempts
+    if (previousDelay === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
+  }
+})
+
 test('Qwen AI bounds CHAT_IN_PROGRESS continuation retries and keeps ordinary JSON failures non-retryable', async () => {
   const { QwenAiAdapter } = loadQwenAiStreamHandler()
   const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
@@ -3007,4 +3065,191 @@ test('Qwen AI stream reports a managed tool validation failure through its failu
   assert.match(serialized, /"accountFault":false/)
   assert.match(serialized, /"status":502/)
   assert.match(serialized, /"retryable":false/)
+})
+
+test('Qwen AI stream corrects a schema-invalid native tool call through same-chat continuation', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({
+    getToolArgumentValidationIssues: strictNativeArgumentValidation,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-invalid-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['arbitrary_tool']),
+    tools: [{
+      name: 'arbitrary_tool',
+      source: 'openai',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+    }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const continuationParents = []
+  let resumeCalls = 0
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => {
+      resumeCalls += 1
+      throw new Error('schema-invalid native call must not replay the old branch')
+    },
+    continueWorkflow: async parentId => {
+      continuationParents.push(parentId)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'response-invalid', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'response-invalid', choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      function_call: { name: 'arbitrary_tool', arguments: JSON.stringify({ prompt: 'wrong field' }) },
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+
+  setImmediate(() => {
+    continued.end([
+      `data: ${JSON.stringify({ 'response.created': { response_id: 'response-corrected', response_index: 0 } })}\n\n`,
+      `data: ${JSON.stringify({ response_id: 'response-corrected', choices: [{ delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: { name: 'arbitrary_tool', arguments: JSON.stringify({ command: 'Write-Output ok' }) },
+      } }] })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join(''))
+  })
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(continuationParents, ['response-invalid'])
+  assert.equal(resumeCalls, 0)
+  assert.equal(failure, undefined)
+  assert.doesNotMatch(body, /wrong field/)
+  assert.match(body, /"name":"arbitrary_tool"/)
+  assert.match(body, /Write-Output ok/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+})
+
+test('Qwen AI non-stream corrects a schema-invalid native tool call through same-chat continuation', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+  } = loadQwenAiStreamHandler({
+    getToolArgumentValidationIssues: strictNativeArgumentValidation,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-invalid-non-stream-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['arbitrary_tool']),
+    tools: [{
+      name: 'arbitrary_tool',
+      source: 'openai',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+    }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const continuationParents = []
+  let resumeCalls = 0
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => {
+      resumeCalls += 1
+      throw new Error('schema-invalid native call must not replay the old branch')
+    },
+    continueWorkflow: async parentId => {
+      continuationParents.push(parentId)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 2,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'response-invalid-non-stream', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ response_id: 'response-invalid-non-stream', choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      function_call: { name: 'arbitrary_tool', arguments: JSON.stringify({ prompt: 'wrong field' }) },
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+
+  setImmediate(() => {
+    continued.end([
+      `data: ${JSON.stringify({ 'response.created': { response_id: 'response-corrected-non-stream', response_index: 0 } })}\n\n`,
+      `data: ${JSON.stringify({ response_id: 'response-corrected-non-stream', choices: [{ delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: { name: 'arbitrary_tool', arguments: JSON.stringify({ command: 'Write-Output ok' }) },
+      } }] })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join(''))
+  })
+
+  const result = await resultPromise
+  assert.deepEqual(continuationParents, ['response-invalid-non-stream'])
+  assert.equal(resumeCalls, 0)
+  assert.equal(result.choices[0].finish_reason, 'tool_calls')
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, 'arbitrary_tool')
+  assert.deepEqual(JSON.parse(result.choices[0].message.tool_calls[0].function.arguments), {
+    command: 'Write-Output ok',
+  })
 })

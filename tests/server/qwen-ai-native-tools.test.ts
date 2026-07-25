@@ -5,6 +5,7 @@ import {
   mergeNativeToolArguments,
   normalizeNativeFunctionCallDelta,
 } from '../../src/main/proxy/adapters/qwen-ai-native-tools.ts'
+import { getToolArgumentValidationIssues } from '../../src/main/proxy/toolCalling/protocols/shared.ts'
 
 test('Qwen AI native tool argument merge supports cumulative chunks without duplication', () => {
   let args = ''
@@ -91,4 +92,47 @@ test('Qwen AI native function call normalization unwraps matching provider param
       arguments: '{"command":"Test-Path -LiteralPath \\"x\\"","untouched":"<｜QCML｜parameter name=\\"other\\"><![CDATA[value]]></｜QCML｜parameter>]]>"}',
     },
   ])
+})
+
+test('tool argument validation catches missing required and strict unknown fields without hardcoding tool names', () => {
+  const tool = {
+    name: 'arbitrary_tool',
+    source: 'openai' as const,
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  }
+
+  assert.deepEqual(
+    getToolArgumentValidationIssues({ prompt: 'generate an image' }, tool),
+    {
+      missingRequired: ['command'],
+      unexpected: ['prompt'],
+    },
+  )
+  assert.deepEqual(
+    getToolArgumentValidationIssues({ command: 'Get-ChildItem' }, tool),
+    { missingRequired: [], unexpected: [] },
+  )
+})
+
+test('tool argument validation preserves explicitly open additional properties', () => {
+  const tool = {
+    name: 'dynamic_tool',
+    source: 'openai' as const,
+    parameters: {
+      type: 'object',
+      properties: { known: { type: 'string' } },
+    },
+  }
+
+  assert.deepEqual(
+    getToolArgumentValidationIssues({ known: 'ok', dynamic: 1 }, tool),
+    { missingRequired: [], unexpected: [] },
+  )
 })

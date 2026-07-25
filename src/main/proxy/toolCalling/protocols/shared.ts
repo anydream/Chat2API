@@ -98,14 +98,36 @@ export function normalizeArguments(args: unknown, tool?: NormalizedToolDefinitio
   return JSON.stringify(normalizeArgumentsForSchema(args ?? {}, tool))
 }
 
-export function getMissingRequiredArguments(args: unknown, tool?: NormalizedToolDefinition): string[] {
-  if (!tool) return []
+export interface ToolArgumentValidationIssues {
+  missingRequired: string[]
+  unexpected: string[]
+}
+
+/**
+ * Validate the parts of a tool schema that must hold before a provider-native
+ * call is exposed to the client.  This intentionally does not attempt to be
+ * a complete JSON-Schema validator: type coercion remains owned by
+ * normalizeArgumentsForSchema(), while this check catches structural errors
+ * that downstream tool validators cannot recover from after execution.
+ */
+export function getToolArgumentValidationIssues(
+  args: unknown,
+  tool?: NormalizedToolDefinition,
+): ToolArgumentValidationIssues {
+  if (!tool) return { missingRequired: [], unexpected: [] }
 
   const parsed = parseArgumentCandidate(args)
-  if (!parsed.ok) return []
+  if (!parsed.ok) return { missingRequired: [], unexpected: [] }
 
   const normalized = normalizeArgumentsForSchema(parsed.value ?? {}, tool)
-  return collectMissingRequiredFields(normalized, tool.parameters)
+  return {
+    missingRequired: collectMissingRequiredFields(normalized, tool.parameters),
+    unexpected: collectUnexpectedArgumentFields(normalized, tool.parameters),
+  }
+}
+
+export function getMissingRequiredArguments(args: unknown, tool?: NormalizedToolDefinition): string[] {
+  return getToolArgumentValidationIssues(args, tool).missingRequired
 }
 
 export function parseJsonValue(value: string): unknown {
@@ -480,12 +502,86 @@ function collectMissingRequiredFields(value: unknown, schema: unknown, path: str
   return uniqueStrings([...allOfMissing, ...ownMissing, ...nestedMissing])
 }
 
+function collectUnexpectedArgumentFields(value: unknown, schema: unknown, path: string = ''): string[] {
+  if (!isPlainObject(schema)) return []
+
+  const oneOf = getSchemaArray(schema, 'oneOf')
+  const anyOf = getSchemaArray(schema, 'anyOf')
+  if (oneOf.length > 0 || anyOf.length > 0) {
+    const variants = [...oneOf, ...anyOf]
+    return shortestIssueSet(variants.map((variant) => collectUnexpectedArgumentFields(value, variant, path)))
+  }
+
+  const allOf = getSchemaArray(schema, 'allOf')
+  const allOfUnexpected = allOf.flatMap((variant) => collectUnexpectedArgumentFields(value, variant, path))
+
+  if (schemaExpectsArray(schema)) {
+    const itemSchema = getSchemaProperty(schema, 'items')
+    if (!Array.isArray(value)) return uniqueStrings(allOfUnexpected)
+    return uniqueStrings([
+      ...allOfUnexpected,
+      ...value.flatMap((item, index) => collectUnexpectedArgumentFields(item, itemSchema, `${path}[${index}]`)),
+    ])
+  }
+
+  const properties = getObjectSchemaProperties(schema)
+  if (!isPlainObject(value)) return uniqueStrings(allOfUnexpected)
+
+  const additionalProperties = getSchemaProperty(schema, 'additionalProperties')
+  const patternProperties = getSchemaProperty(schema, 'patternProperties')
+  const unexpected = additionalProperties === false
+    ? Object.keys(value)
+      .filter((key) => !properties || !Object.prototype.hasOwnProperty.call(properties, key))
+      .filter((key) => !matchesPatternProperty(key, patternProperties))
+      .map((key) => joinRequiredPath(path, key))
+    : []
+
+  const nested = properties
+    ? Object.entries(properties).flatMap(([field, propertySchema]) => {
+      if (!Object.prototype.hasOwnProperty.call(value, field)) return []
+      return collectUnexpectedArgumentFields(value[field], propertySchema, joinRequiredPath(path, field))
+    })
+    : []
+
+  // A schema can explicitly permit additional properties while still
+  // constraining their values with a nested schema. Unknown keys are valid in
+  // that case, but recurse so nested strict objects are checked as well.
+  const additionalSchema = isPlainObject(additionalProperties) ? additionalProperties : undefined
+  const additionalNested = additionalSchema
+    ? Object.keys(value)
+      .filter((key) => !properties || !Object.prototype.hasOwnProperty.call(properties, key))
+      .flatMap((key) => collectUnexpectedArgumentFields(value[key], additionalSchema, joinRequiredPath(path, key)))
+    : []
+
+  return uniqueStrings([...allOfUnexpected, ...unexpected, ...nested, ...additionalNested])
+}
+
+function matchesPatternProperty(key: string, patternProperties: unknown): boolean {
+  if (!isPlainObject(patternProperties)) return false
+
+  return Object.keys(patternProperties).some((pattern) => {
+    try {
+      return new RegExp(pattern).test(key)
+    } catch {
+      // Ignore malformed provider-supplied patterns. The rest of the schema
+      // remains enforceable and the invalid pattern is not a reason to reject
+      // every otherwise valid call.
+      return false
+    }
+  })
+}
+
 function getSchemaArray(schema: Record<string, unknown>, key: string): unknown[] {
   const value = schema[key]
   return Array.isArray(value) ? value : []
 }
 
 function shortestMissingSet(sets: string[][]): string[] {
+  if (sets.length === 0) return []
+  return sets.reduce((best, candidate) => candidate.length < best.length ? candidate : best)
+}
+
+function shortestIssueSet(sets: string[][]): string[] {
   if (sets.length === 0) return []
   return sets.reduce((best, candidate) => candidate.length < best.length ? candidate : best)
 }

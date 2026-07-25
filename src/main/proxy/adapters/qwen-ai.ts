@@ -23,7 +23,10 @@ import { createBaseChunk } from '../utils/streamToolHandler'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
-import { normalizeArguments } from '../toolCalling/protocols/shared'
+import {
+  getToolArgumentValidationIssues,
+  normalizeArguments,
+} from '../toolCalling/protocols/shared'
 import {
   getToolStreamValidationFailure,
   type ToolStreamValidationFailure,
@@ -44,6 +47,9 @@ const QWEN_AI_DEBUG_PAYLOAD_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_PAYLOADS =
 const QWEN_AI_DEBUG_STREAM_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_STREAM === 'true'
 const QWEN_AI_DEBUG_REQUEST_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_REQUEST === 'true'
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS = 60_000
+const QWEN_AI_CHAT_IN_PROGRESS_MAX_RETRY_ATTEMPTS = 5
+const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS = 5
+const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS = 1_000
 
 export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
@@ -192,16 +198,36 @@ export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
  */
 export function qwenAiChatInProgressRetryAttemptsFromEnv(): number {
   return Math.min(
-    5,
-    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS', 3),
+    QWEN_AI_CHAT_IN_PROGRESS_MAX_RETRY_ATTEMPTS,
+    nonNegativeIntegerFromEnv(
+      'CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS',
+      QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS,
+    ),
   )
 }
 
 export function qwenAiChatInProgressRetryDelayMsFromEnv(): number {
   return Math.min(
     QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
-    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS', 1_000),
+    nonNegativeIntegerFromEnv(
+      'CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS',
+      QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS,
+    ),
   )
+}
+
+/**
+ * Return the maximum time spent sleeping between busy-chat attempts for the
+ * current deployment settings. This excludes network request time, which is
+ * bounded separately by QWEN_AI_REQUEST_TIMEOUT_MS.
+ */
+export function qwenAiChatInProgressRetryBudgetMsFromEnv(): number {
+  const attempts = qwenAiChatInProgressRetryAttemptsFromEnv()
+  const baseDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
+  return Array.from({ length: attempts }, (_, index) => Math.min(
+    QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
+    baseDelayMs * (2 ** index),
+  )).reduce((total, delayMs) => total + delayMs, 0)
 }
 
 /**
@@ -944,7 +970,11 @@ type QwenAiErrorEnvelopeMetadata = {
 
 function createQwenAiStreamFailure(
   message: string,
-  code: 'qwen_ai_stream_incomplete' | 'qwen_ai_empty_stream' | 'qwen_ai_semantic_empty' | 'qwen_ai_semantic_incomplete' = 'qwen_ai_stream_incomplete',
+  code: 'qwen_ai_stream_incomplete'
+    | 'qwen_ai_empty_stream'
+    | 'qwen_ai_semantic_empty'
+    | 'qwen_ai_semantic_incomplete'
+    | 'qwen_ai_invalid_tool_arguments' = 'qwen_ai_stream_incomplete',
 ): QwenAiUpstreamError {
   const error = new Error(message) as QwenAiUpstreamError
   // The provider closed its SSE response without a usable completion. This
@@ -976,6 +1006,38 @@ function createQwenAiSemanticIncompleteError(): QwenAiUpstreamError {
   return error
 }
 
+type QwenAiNativeToolArgumentIssue = {
+  toolName: string
+  missingRequired: string[]
+  unexpected: string[]
+}
+
+function createQwenAiInvalidNativeToolArgumentsError(
+  issues: QwenAiNativeToolArgumentIssue[],
+): QwenAiUpstreamError {
+  const details = issues
+    .filter(issue => issue.toolName)
+    .map(issue => {
+      const problems = [
+        ...(issue.missingRequired.length > 0
+          ? [`missing required fields: ${issue.missingRequired.join(', ')}`]
+          : []),
+        ...(issue.unexpected.length > 0
+          ? [`unexpected fields: ${issue.unexpected.join(', ')}`]
+          : []),
+      ]
+      return `${issue.toolName}${problems.length > 0 ? ` (${problems.join('; ')})` : ''}`
+    })
+  const error = createQwenAiStreamFailure(
+    `Qwen AI returned native tool arguments that do not match the declared schema${details.length > 0 ? `: ${details.join(', ')}` : ''}`,
+    'qwen_ai_invalid_tool_arguments',
+  )
+  error.type = 'tool_call_parse_error'
+  error.param = 'tool_calls'
+  error.accountFault = false
+  return error
+}
+
 function createQwenAiContinuationAbortError(): QwenAiUpstreamError {
   const error = new Error('Qwen AI workflow continuation aborted because the client disconnected.') as QwenAiUpstreamError
   error.status = 499
@@ -1000,7 +1062,9 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
   const code = isObjectValue(error) && typeof error.code === 'string'
     ? error.code
     : ''
-  return code === 'qwen_ai_semantic_empty' || code === 'qwen_ai_semantic_incomplete'
+  return code === 'qwen_ai_semantic_empty'
+    || code === 'qwen_ai_semantic_incomplete'
+    || code === 'qwen_ai_invalid_tool_arguments'
 }
 
 function createQwenAiToolValidationError(
@@ -2206,9 +2270,22 @@ export class QwenAiAdapter {
 
     const maxChatInProgressRetries = qwenAiChatInProgressRetryAttemptsFromEnv()
     const baseRetryDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
+    const continuationDeadline = Date.now() + QWEN_AI_REQUEST_TIMEOUT_MS
     let chatInProgressRetries = 0
+    let lastChatInProgressError: QwenAiUpstreamError | undefined
+
+    const createBusyContinuationExhaustedError = (validationError?: Error): QwenAiUpstreamError => {
+      const exhausted = (validationError || new Error('Qwen AI chat is still in progress')) as QwenAiUpstreamError
+      exhausted.retryable = false
+      exhausted.accountFault = false
+      return exhausted
+    }
 
     while (true) {
+      if (Date.now() >= continuationDeadline) {
+        throw createBusyContinuationExhaustedError(lastChatInProgressError)
+      }
+
       const response = await this.postWithRefreshRetry(url, payload, createContinuationOptions)
 
       if (QWEN_AI_DEBUG_REQUEST_LOGS) {
@@ -2222,6 +2299,7 @@ export class QwenAiAdapter {
       if (!validation.chatInProgress) {
         return response
       }
+      lastChatInProgressError = validation.error
 
       // The JSON admission response has been fully consumed by validation and
       // cannot be attached to the SSE parser. Dispose of it before waiting so
@@ -2233,20 +2311,24 @@ export class QwenAiAdapter {
       }
 
       if (chatInProgressRetries >= maxChatInProgressRetries) {
-        const exhausted = (validation.error || new Error('Qwen AI chat is still in progress')) as QwenAiUpstreamError
-        exhausted.retryable = false
-        throw exhausted
+        throw createBusyContinuationExhaustedError(validation.error)
       }
 
       chatInProgressRetries += 1
-      const delayMs = Math.min(
+      const configuredDelayMs = Math.min(
         QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
         baseRetryDelayMs * (2 ** (chatInProgressRetries - 1)),
       )
+      const remainingBudgetMs = Math.max(0, continuationDeadline - Date.now())
+      if (remainingBudgetMs <= 0) {
+        throw createBusyContinuationExhaustedError(lastChatInProgressError)
+      }
+      const delayMs = Math.min(configuredDelayMs, remainingBudgetMs)
       console.warn('[QwenAI] Workflow continuation was rejected because the chat is still in progress; waiting before retry', JSON.stringify({
         retry: chatInProgressRetries,
         maxRetries: maxChatInProgressRetries,
         delayMs,
+        ...(delayMs < configuredDelayMs ? { deadlineLimited: true } : {}),
       }))
 
       if (!(await waitForQwenAiRetry(delayMs, request.signal))) {
@@ -2580,6 +2662,26 @@ export class QwenAiStreamHandler {
     return [...names]
   }
 
+  private getInvalidNativeToolArgumentIssues(): QwenAiNativeToolArgumentIssue[] {
+    const issues: QwenAiNativeToolArgumentIssue[] = []
+
+    for (const state of this.nativeToolCallStates.values()) {
+      if (!state.allowed || !state.name || !isCompleteJsonText(state.arguments)) continue
+
+      const tool = this.toolCallingPlan?.tools?.find(item => item.name === state.name)
+      const validation = getToolArgumentValidationIssues(state.arguments, tool)
+      if (validation.missingRequired.length === 0 && validation.unexpected.length === 0) continue
+
+      issues.push({
+        toolName: state.name,
+        missingRequired: validation.missingRequired,
+        unexpected: validation.unexpected,
+      })
+    }
+
+    return issues
+  }
+
   private getCompleteNativeToolCalls(force: boolean = false): ToolCall[] {
     const toolCalls: ToolCall[] = []
 
@@ -2910,6 +3012,12 @@ export class QwenAiStreamHandler {
     const finishAnswer = (finishReason: string = 'stop') => {
       if (finalChunkSent || semanticRecoveryInFlight) return
 
+      const invalidNativeToolArguments = this.getInvalidNativeToolArgumentIssues()
+      if (invalidNativeToolArguments.length > 0) {
+        recoverFromSemanticEmpty(createQwenAiInvalidNativeToolArgumentsError(invalidNativeToolArguments))
+        return
+      }
+
       const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
       if (incompleteDeclaredNativeToolNames.length > 0) {
         failStream(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
@@ -3088,10 +3196,19 @@ export class QwenAiStreamHandler {
             const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
 
             if (nativeToolProgress.sawFragment) {
+              const invalidNativeToolArguments = this.getInvalidNativeToolArgumentIssues()
+              if (status === 'finished') {
+                if (invalidNativeToolArguments.length > 0) {
+                  recoverFromSemanticEmpty(createQwenAiInvalidNativeToolArgumentsError(invalidNativeToolArguments))
+                  return
+                }
+              }
+
               const completeNativeToolCalls = this.getCompleteNativeToolCalls()
               const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
               if (
-                incompleteDeclaredNativeToolNames.length === 0
+                invalidNativeToolArguments.length === 0
+                && incompleteDeclaredNativeToolNames.length === 0
                 && completeNativeToolCalls.length > 0
                 && this.emitNativeToolCalls(transStream, completeNativeToolCalls)
               ) {
@@ -3366,6 +3483,12 @@ export class QwenAiStreamHandler {
         const choice = data.choices[0]
         const answerText = choice.message.content || ''
         const finalReasoning = reasoningText || summaryText
+        const invalidNativeToolArguments = this.getInvalidNativeToolArgumentIssues()
+        if (invalidNativeToolArguments.length > 0) {
+          recoverFromSemanticEmpty(createQwenAiInvalidNativeToolArgumentsError(invalidNativeToolArguments))
+          return
+        }
+
         const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
         if (incompleteDeclaredNativeToolNames.length > 0) {
           rejectOnce(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))

@@ -105,8 +105,8 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(forwarderSource, /lastRetryable = result\.retryable/)
   assert.match(forwarderSource, /retryable: lastRetryable/)
   assert.match(qwenAiForwarderSource, /createQwenAiResumableStream\(response\.data, \{[\s\S]*?resume: responseId => adapter\.resumeChatCompletion/)
-  assert.match(qwenAiForwarderSource, /handler\.handleStream\(resumableResponseStream, \{\s*signal: context\?\.signal,\s*onFailure: \(\) => cleanupChat\(chatId\),\s*recoverFromIdle: error => resumableResponseStream\.recoverFromIdle\(error\),\s*\}\)/)
-  assert.match(qwenAiForwarderSource, /handler\.handleNonStream\(resumableResponseStream, \{\s*signal: context\?\.signal,\s*recoverFromIdle: error => resumableResponseStream\.recoverFromIdle\(error\),\s*\}\)/)
+  assert.match(qwenAiForwarderSource, /handler\.handleStream\(resumableResponseStream, \{[\s\S]*?onFailure: \(\) => cleanupChat\(chatId\),[\s\S]*?recoverFromIdle: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?recoverFromSemanticEmpty: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?\}\)/)
+  assert.match(qwenAiForwarderSource, /handler\.handleNonStream\(resumableResponseStream, \{[\s\S]*?signal: context\?\.signal,[\s\S]*?recoverFromIdle: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?recoverFromSemanticEmpty: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?\}\)/)
 
   assert.match(governorSource, /CHAT2API_QWEN_AI_MAX_CONCURRENT/)
   assert.match(governorSource, /CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS/)
@@ -678,7 +678,7 @@ test('Qwen AI cancellation and timeout paths are not retried or logged as succes
   assert.match(qwenAiSource, /Qwen AI response stream aborted before reading started/)
   assert.match(qwenAiSource, /QWEN_AI_STREAM_FAILURE_EVENT/)
   assert.match(qwenAiSource, /transStream\.qwenAiFailure = error/)
-  assert.match(qwenAiSource, /stream\.once\('error', \(err: Error\) => \{\s*if \(finalChunkSent\) \{\s*return/)
+  assert.match(qwenAiSource, /stream\.once\('error', \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight\) \{\s*return/)
   assert.match(forwarderSource, /retryable = status === 499[\s\S]*status === 403[\s\S]*status === 429[\s\S]*status === 504[\s\S]*\? false/)
 
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')

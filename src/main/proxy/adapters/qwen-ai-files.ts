@@ -1001,9 +1001,36 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
   const fileParts: ChatMessageContent[] = []
   const usedLocalToolCallIds = new Set<string>()
   const pendingLocalIds = new Map<string, string[]>()
+  // Qwen receives this transcript as one user prompt, so keep the system preamble near the active turn.
+  const leadingSystemCount = messages.findIndex(message => message.role !== 'system')
+  const systemPreambleCount = leadingSystemCount === -1 ? messages.length : leadingSystemCount
+  let latestUserIndex = -1
+  for (let index = messages.length - 1; index >= systemPreambleCount; index -= 1) {
+    if (messages[index].role === 'user') {
+      latestUserIndex = index
+      break
+    }
+  }
+  const relocateSystemPreamble = systemPreambleCount > 0 && latestUserIndex >= systemPreambleCount
+  const systemPreamble = relocateSystemPreamble
+    ? messages
+        .slice(0, systemPreambleCount)
+        .map(message => textFromContent(message.content))
+        .filter(text => text.length > 0)
+        .map(text => formatRoleText('System', text))
+    : []
   let fallbackCallIndex = 0
 
-  for (const msg of messages) {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const msg = messages[messageIndex]
+    if (relocateSystemPreamble && messageIndex < systemPreambleCount) {
+      continue
+    }
+
+    if (relocateSystemPreamble && messageIndex === latestUserIndex) {
+      transcriptParts.push(...systemPreamble)
+    }
+
     const text = textFromContent(msg.content)
 
     if (msg.role === 'system') {

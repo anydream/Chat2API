@@ -1320,7 +1320,8 @@ export class RequestForwarder {
         let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
           onFailure: () => cleanupChat(chatId),
-          recoverFromIdle: error => resumableResponseStream.recoverFromIdle(error),
+          recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
+          recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
         })
 
         // Keep the HTTP status mutable until Qwen produces the first visible
@@ -1381,7 +1382,8 @@ export class RequestForwarder {
 
       const result = await handler.handleNonStream(resumableResponseStream, {
         signal: context?.signal,
-        recoverFromIdle: error => resumableResponseStream.recoverFromIdle(error),
+        recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
+        recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
       })
 
       this.applyToolCallsToResponse(result, transformed)

@@ -94,3 +94,75 @@ test('Qwen AI history preserves repeated tool results without inventing completi
   assert.match(prepared.content, /result-2/)
   assert.doesNotMatch(prepared.content, /Authoritative completed tool ledger/)
 })
+
+test('Qwen AI places the leading system preamble directly before the latest user turn', async () => {
+  const messages = [
+    { role: 'system' as const, content: 'general-system-instructions' },
+    { role: 'system' as const, content: 'managed-tool-protocol' },
+    { role: 'user' as const, content: 'earlier request' },
+    assistantToolCall('call_position', 'position_tool', 1),
+    toolResult('call_position', 1),
+    { role: 'assistant' as const, content: 'earlier answer' },
+    { role: 'user' as const, content: 'current request' },
+  ]
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
+  const earlierUserPosition = prepared.content.indexOf('User: earlier request')
+  const toolCallPosition = prepared.content.indexOf('name="position_tool"')
+  const toolResultPosition = prepared.content.indexOf('result-1')
+  const generalSystemPosition = prepared.content.indexOf('System: general-system-instructions')
+  const managedSystemPosition = prepared.content.indexOf('System: managed-tool-protocol')
+  const currentUserPosition = prepared.content.indexOf('User: current request')
+
+  assert.ok(earlierUserPosition >= 0)
+  assert.ok(toolCallPosition > earlierUserPosition)
+  assert.ok(toolResultPosition > toolCallPosition)
+  assert.ok(generalSystemPosition > toolResultPosition)
+  assert.ok(managedSystemPosition > generalSystemPosition)
+  assert.ok(currentUserPosition > managedSystemPosition)
+  assert.match(
+    prepared.content,
+    /System: general-system-instructions\n\nSystem: managed-tool-protocol\n\nUser: current request/,
+  )
+  assert.equal((prepared.content.match(/general-system-instructions/g) ?? []).length, 1)
+  assert.equal((prepared.content.match(/managed-tool-protocol/g) ?? []).length, 1)
+})
+
+test('Qwen AI keeps the leading system preamble in place when no user turn exists', async () => {
+  const messages = [
+    { role: 'system' as const, content: 'system-without-user' },
+    { role: 'assistant' as const, content: 'assistant-only history' },
+  ]
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
+
+  assert.ok(prepared.content.indexOf('System: system-without-user') >= 0)
+  assert.ok(
+    prepared.content.indexOf('Assistant: assistant-only history')
+      > prepared.content.indexOf('System: system-without-user'),
+  )
+})
+
+test('Qwen AI keeps a generic continuation after the latest tool result', async () => {
+  const messages = [
+    { role: 'system' as const, content: 'tool protocol and task instructions' },
+    { role: 'user' as const, content: 'Create the requested artifact.' },
+    assistantToolCall('call_next', 'workspace:inspect', 1),
+    toolResult('call_next', 1),
+    {
+      role: 'user' as const,
+      content: 'Continue the original request using the tool result above. If any requested operation remains, emit the next tool call immediately. Only provide a final answer after the results have been verified by tool output.',
+    },
+  ]
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
+  const resultPosition = prepared.content.indexOf('result-1')
+  const continuationPosition = prepared.content.indexOf('Continue the original request using the tool result above.')
+  const systemPosition = prepared.content.indexOf('System: tool protocol and task instructions')
+
+  assert.ok(resultPosition >= 0)
+  assert.ok(continuationPosition > resultPosition)
+  assert.ok(systemPosition > resultPosition)
+  assert.ok(systemPosition < continuationPosition)
+  assert.match(prepared.content, /Only provide a final answer after the results have been verified by tool output\./)
+})

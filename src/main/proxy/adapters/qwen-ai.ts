@@ -86,8 +86,11 @@ type StreamHandlingOptions = {
   responseTimeoutMs?: number
   idleTimeoutMs?: number
   onFailure?: (error: Error) => void
-  recoverFromIdle?: (error: Error) => Promise<boolean>
+  recoverFromIdle?: QwenAiRecoveryCallback
+  recoverFromSemanticEmpty?: QwenAiRecoveryCallback
 }
+
+type QwenAiRecoveryCallback = (error: Error, onResume?: () => void) => Promise<boolean>
 
 type QwenAiResumableStreamOptions = {
   signal?: AbortSignal
@@ -101,7 +104,7 @@ type QwenAiResumableStreamOptions = {
 
 export type QwenAiResumableStream = PassThrough & {
   /** Replace a semantically stalled source with Qwen's response-id continuation. */
-  recoverFromIdle: (error: Error) => Promise<boolean>
+  recoverFromIdle: QwenAiRecoveryCallback
 }
 
 interface ChatCompletionRequest {
@@ -263,8 +266,12 @@ export function createQwenAiResumableStream(
   let sourceComplete = false
   let terminalMarkerSeen = false
   let recoveryInFlight = false
+  let activeRecovery: Promise<boolean> | undefined
+  let recoveryResumed = false
+  let recoveryResumeCallbacks: Array<() => void> = []
   let attempts = 0
   let settled = false
+  let settledError: Error | undefined
 
   type SourceListeners = {
     data: (chunk: Buffer | string) => void
@@ -299,6 +306,7 @@ export function createQwenAiResumableStream(
   const fail = (error: Error) => {
     if (settled) return
     settled = true
+    settledError = error
     detachSource(source, true)
     removeAbortListener()
     bridge.destroy(error)
@@ -369,30 +377,33 @@ export function createQwenAiResumableStream(
     detachSource(source, true)
   }
 
-  const recover = async (initialError?: Error): Promise<boolean> => {
+  const recover = async (
+    initialError?: Error,
+    onResume?: () => void,
+  ): Promise<boolean> => {
     if (recoveryInFlight || settled) return false
     recoveryInFlight = true
     let lastError = initialError || new Error('Qwen AI response stream closed before completion')
+    const failRecovery = (error: Error): never => {
+      recoveryInFlight = false
+      fail(error)
+      throw error
+    }
 
     while (!settled && attempts < maxAttempts) {
       if (checkComplete()) {
         const completionError = takeCompletionCheckError()
-        recoveryInFlight = false
-        if (completionError) fail(completionError)
+        if (completionError) failRecovery(completionError)
         else finish()
         return false
       }
       const completionError = takeCompletionCheckError()
       if (completionError) {
-        recoveryInFlight = false
-        fail(completionError)
-        return false
+        failRecovery(completionError)
       }
 
       if (options.signal?.aborted) {
-        recoveryInFlight = false
-        fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
-        return false
+        failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
       }
 
       const responseId = options.getResponseId().trim()
@@ -400,24 +411,22 @@ export function createQwenAiResumableStream(
 
       attempts += 1
       if (!(await waitForRetry())) {
-        recoveryInFlight = false
-        fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
+      }
+      if (settled) {
+        if (settledError) throw settledError
         return false
       }
-      if (settled) return false
 
       if (checkComplete()) {
         const lateCompletionError = takeCompletionCheckError()
-        recoveryInFlight = false
-        if (lateCompletionError) fail(lateCompletionError)
+        if (lateCompletionError) failRecovery(lateCompletionError)
         else finish()
         return false
       }
       const lateCompletionCheckError = takeCompletionCheckError()
       if (lateCompletionCheckError) {
-        recoveryInFlight = false
-        fail(lateCompletionCheckError)
-        return false
+        failRecovery(lateCompletionCheckError)
       }
 
       try {
@@ -452,48 +461,97 @@ export function createQwenAiResumableStream(
         terminalMarkerSeen = false
         completionScan = ''
         recoveryInFlight = false
+        onResume?.()
         attachSource(nextStream, sourceGeneration)
         return true
       } catch (error) {
-        if (settled) return false
+        if (settled) {
+          if (settledError) throw settledError
+          return false
+        }
         lastError = error instanceof Error ? error : new Error(String(error))
         if (isClientCancellationError(lastError) || options.signal?.aborted) {
-          recoveryInFlight = false
-          fail(new Error('Qwen AI response stream aborted because the client disconnected.'))
-          return false
+          failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
         }
       }
     }
 
-    if (settled) return false
+    if (settled) {
+      if (settledError) throw settledError
+      return false
+    }
     recoveryInFlight = false
     if (checkComplete()) {
       const completionError = takeCompletionCheckError()
-      if (completionError) fail(completionError)
+      if (completionError) failRecovery(completionError)
       else finish()
       return false
     }
     const completionError = takeCompletionCheckError()
     if (completionError) {
-      fail(completionError)
-      return false
+      failRecovery(completionError)
     }
     const transportError = normalizeQwenAiStreamFailure(lastError)
-    // A transport reset is not evidence that credentials/account state is bad;
-    // avoid cooling a single account when the shared upstream path is failing.
-    transportError.accountFault = false
-    fail(transportError)
-    return false
+    // Network and upstream 5xx failures are account-neutral. Preserve the
+    // provider's 4xx classification (auth, risk control, or capacity) so the
+    // governor can apply the appropriate account/cooldown policy.
+    if (transportError.status === undefined || transportError.status >= 500) {
+      transportError.accountFault = false
+    }
+    failRecovery(transportError)
   }
 
-  bridge.recoverFromIdle = async (error: Error): Promise<boolean> => {
-    if (settled || recoveryInFlight) return false
+  const startRecovery = (
+    initialError?: Error,
+    onResume?: () => void,
+  ): Promise<boolean> => {
+    if (activeRecovery) {
+      if (onResume) {
+        if (recoveryResumed) onResume()
+        else recoveryResumeCallbacks.push(onResume)
+      }
+      return activeRecovery
+    }
+
+    recoveryResumed = false
+    recoveryResumeCallbacks = onResume ? [onResume] : []
+    const pending = recover(initialError, () => {
+      recoveryResumed = true
+      const callbacks = recoveryResumeCallbacks
+      recoveryResumeCallbacks = []
+      for (const callback of callbacks) {
+        try {
+          callback()
+        } catch (error) {
+          console.warn('[QwenAI] Recovery resume callback failed:', describeErrorForLog(error))
+        }
+      }
+    })
+    let tracked: Promise<boolean>
+    tracked = pending.finally(() => {
+      if (activeRecovery === tracked) activeRecovery = undefined
+      recoveryResumeCallbacks = []
+    })
+    activeRecovery = tracked
+    return tracked
+  }
+
+  bridge.recoverFromIdle = async (
+    error: Error,
+    onResume?: () => void,
+  ): Promise<boolean> => {
+    if (settled) {
+      if (settledError) throw settledError
+      return false
+    }
+    if (activeRecovery) return startRecovery(undefined, onResume)
+    if (recoveryInFlight) return false
 
     const complete = checkComplete()
     const completionError = takeCompletionCheckError()
     if (completionError) {
       fail(completionError)
-      return false
+      throw completionError
     }
     if (complete) {
       finish()
@@ -504,7 +562,7 @@ export function createQwenAiResumableStream(
     // cannot race the continuation stream into the shared parser.
     sourceHandled = true
     retireCurrentSource()
-    return recover(error)
+    return startRecovery(error, onResume)
   }
 
   const handleSourceEnd = (generation: number) => {
@@ -521,7 +579,7 @@ export function createQwenAiResumableStream(
       finish()
       return
     }
-    void recover()
+    void startRecovery().catch(() => undefined)
   }
 
   const handleSourceError = (generation: number, error: Error) => {
@@ -543,7 +601,7 @@ export function createQwenAiResumableStream(
       return
     }
     if (isResumableQwenAiTransportError(error)) {
-      void recover(error)
+      void startRecovery(error).catch(() => undefined)
       return
     }
     fail(error)
@@ -557,6 +615,19 @@ export function createQwenAiResumableStream(
           bridge.write(chunk)
         } catch (error) {
           fail(error instanceof Error ? error : new Error(String(error)))
+          return
+        }
+
+        // A downstream parser can synchronously classify this terminal frame
+        // as semantically incomplete and replace the current source through
+        // recoverFromIdle(). Do not let the old source's [DONE] settle the
+        // bridge after that recovery has already started.
+        if (
+          settled
+          || generation !== sourceGeneration
+          || sourceHandled
+          || recoveryInFlight
+        ) {
           return
         }
 
@@ -677,7 +748,7 @@ type QwenAiErrorEnvelopeMetadata = {
 
 function createQwenAiStreamFailure(
   message: string,
-  code: 'qwen_ai_stream_incomplete' | 'qwen_ai_empty_stream' = 'qwen_ai_stream_incomplete',
+  code: 'qwen_ai_stream_incomplete' | 'qwen_ai_empty_stream' | 'qwen_ai_semantic_empty' = 'qwen_ai_stream_incomplete',
 ): QwenAiUpstreamError {
   const error = new Error(message) as QwenAiUpstreamError
   // The provider closed its SSE response without a usable completion. This
@@ -686,6 +757,17 @@ function createQwenAiStreamFailure(
   error.status = 502
   error.code = code
   error.retryable = false
+  return error
+}
+
+function createQwenAiSemanticEmptyError(): QwenAiUpstreamError {
+  const error = createQwenAiStreamFailure(
+    'Qwen AI completed with reasoning but without an answer or tool call',
+    'qwen_ai_semantic_empty',
+  )
+  // A reasoning-only completion is a response-shape problem, not evidence
+  // that this account is invalid or rate limited.
+  error.accountFault = false
   return error
 }
 
@@ -2131,6 +2213,7 @@ export class QwenAiStreamHandler {
     let responseTimer: NodeJS.Timeout | undefined
     let idleTimer: NodeJS.Timeout | undefined
     let idleRecoveryInFlight = false
+    let semanticRecoveryInFlight = false
     const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
 
     const cleanupTimers = () => {
@@ -2203,7 +2286,7 @@ export class QwenAiStreamHandler {
     }
 
     const handleIdle = async () => {
-      if (finalChunkSent || idleRecoveryInFlight) return
+      if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight) return
       idleTimer = undefined
       const idleError = new Error(
         `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
@@ -2248,6 +2331,43 @@ export class QwenAiStreamHandler {
       // downstream stream.
       if (!finalChunkSent) refreshIdleTimer()
       return true
+    }
+
+    const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
+      if (finalChunkSent || semanticRecoveryInFlight) return
+
+      const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
+      if (!recover) {
+        failStream(error)
+        return
+      }
+
+      semanticRecoveryInFlight = true
+      // The current response has reached a provider terminal marker, but it
+      // is not complete from the client's perspective. Let the response-id
+      // continuation own the next terminal marker instead of treating this
+      // one as definitive.
+      sawUpstreamCompletion = false
+      console.warn('[QwenAI] Recovering semantic-empty stream response')
+
+      const onResume = () => {
+        semanticRecoveryInFlight = false
+        if (!finalChunkSent) refreshIdleTimer()
+      }
+
+      void recover(error, onResume).then(recovered => {
+        semanticRecoveryInFlight = false
+        if (finalChunkSent) return
+        if (recovered) {
+          refreshIdleTimer()
+          return
+        }
+        failStream(error)
+      }).catch(recoveryError => {
+        semanticRecoveryInFlight = false
+        if (finalChunkSent) return
+        failStream(recoveryError instanceof Error ? recoveryError : error)
+      })
     }
 
     const onAbort = () => {
@@ -2322,7 +2442,7 @@ export class QwenAiStreamHandler {
     }
 
     const finishAnswer = (finishReason: string = 'stop') => {
-      if (finalChunkSent) return
+      if (finalChunkSent || semanticRecoveryInFlight) return
 
       const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
       if (incompleteDeclaredNativeToolNames.length > 0) {
@@ -2379,7 +2499,15 @@ export class QwenAiStreamHandler {
         return
       }
 
-      const hasUsableOutput = Boolean(hasAnswerOrTool || reasoningText.trim() || summaryText.trim())
+      const hasReasoningOnlyOutput = Boolean(
+        !hasAnswerOrTool && (reasoningText.trim() || summaryText.trim()),
+      )
+      if (hasReasoningOnlyOutput) {
+        recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
+        return
+      }
+
+      const hasUsableOutput = Boolean(hasAnswerOrTool)
       if (!hasUsableOutput) {
         failStream(createQwenAiStreamFailure(
           'Qwen AI returned an empty response stream without answer, reasoning, or tool calls',
@@ -2428,7 +2556,7 @@ export class QwenAiStreamHandler {
     const parser = createParser({
       onEvent: (event: any) => {
         try {
-          if (finalChunkSent) {
+          if (finalChunkSent || semanticRecoveryInFlight) {
             return
           }
 
@@ -2603,7 +2731,7 @@ export class QwenAiStreamHandler {
       parser.feed(text)
     })
     stream.once('error', (err: Error) => {
-      if (finalChunkSent) {
+      if (finalChunkSent || semanticRecoveryInFlight) {
         return
       }
       const description = describeErrorForLog(err)
@@ -2618,7 +2746,7 @@ export class QwenAiStreamHandler {
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
         console.log('[QwenAI] Stream ended')
       }
-      if (!finalChunkSent) {
+      if (!finalChunkSent && !semanticRecoveryInFlight) {
         if (sawUpstreamCompletion) {
           finishAnswer('stop')
         } else {
@@ -2630,7 +2758,7 @@ export class QwenAiStreamHandler {
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
         console.log('[QwenAI] Stream closed')
       }
-      if (!finalChunkSent) {
+      if (!finalChunkSent && !semanticRecoveryInFlight) {
         if (sawUpstreamCompletion) {
           finishAnswer('stop')
         } else {
@@ -2676,6 +2804,7 @@ export class QwenAiStreamHandler {
       let responseTimer: NodeJS.Timeout | undefined
       let idleTimer: NodeJS.Timeout | undefined
       let idleRecoveryInFlight = false
+      let semanticRecoveryInFlight = false
       const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
 
       const cleanupTimers = () => {
@@ -2741,7 +2870,7 @@ export class QwenAiStreamHandler {
       }
 
       const finishNonStream = () => {
-        if (resolved) return
+        if (resolved || semanticRecoveryInFlight) return
 
         const choice = data.choices[0]
         const answerText = choice.message.content || ''
@@ -2757,6 +2886,11 @@ export class QwenAiStreamHandler {
         const undeclaredNativeToolNames = this.getUndeclaredNativeToolNames()
         if (undeclaredNativeToolNames.length > 0 && !answerText.trim()) {
           rejectOnce(createQwenAiUndeclaredNativeToolError(undeclaredNativeToolNames))
+          return
+        }
+
+        if (!answerText.trim() && finalReasoning.trim()) {
+          recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
           return
         }
 
@@ -2788,7 +2922,7 @@ export class QwenAiStreamHandler {
       }
 
       const handleIdle = async () => {
-        if (resolved || idleRecoveryInFlight) return
+        if (resolved || idleRecoveryInFlight || semanticRecoveryInFlight) return
         idleTimer = undefined
         const idleError = new Error(
           `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
@@ -2823,6 +2957,40 @@ export class QwenAiStreamHandler {
         }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
       }
 
+      const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
+        if (resolved || semanticRecoveryInFlight) return
+
+        const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
+        if (!recover) {
+          rejectOnce(error)
+          return
+        }
+
+        semanticRecoveryInFlight = true
+        sawUpstreamCompletion = false
+        console.warn('[QwenAI] Recovering semantic-empty non-stream response')
+
+        const onResume = () => {
+          semanticRecoveryInFlight = false
+          if (!resolved) refreshIdleTimer()
+        }
+
+        void recover(error, onResume).then(recovered => {
+          semanticRecoveryInFlight = false
+          if (resolved) return
+          if (recovered) {
+            refreshIdleTimer()
+            return
+          }
+          rejectOnce(error)
+        }).catch(recoveryError => {
+          semanticRecoveryInFlight = false
+          if (!resolved) {
+            rejectOnce(recoveryError instanceof Error ? recoveryError : error)
+          }
+        })
+      }
+
       function onAbort() {
         rejectOnce(new Error('Qwen AI response stream aborted because the client disconnected.'))
       }
@@ -2844,7 +3012,7 @@ export class QwenAiStreamHandler {
       const parser = createParser({
         onEvent: (event: any) => {
           try {
-            if (resolved) {
+            if (resolved || semanticRecoveryInFlight) {
               return
             }
 
@@ -2943,7 +3111,7 @@ export class QwenAiStreamHandler {
         parser.feed(buffer.toString())
       })
       stream.once('error', (err: Error) => {
-        if (resolved) {
+        if (resolved || semanticRecoveryInFlight) {
           return
         }
         const description = describeErrorForLog(err)
@@ -2955,7 +3123,7 @@ export class QwenAiStreamHandler {
         rejectOnce(err)
       })
       const finishFromClose = () => {
-        if (resolved) return
+        if (resolved || semanticRecoveryInFlight) return
         if (!sawUpstreamCompletion) {
           rejectOnce(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
           return

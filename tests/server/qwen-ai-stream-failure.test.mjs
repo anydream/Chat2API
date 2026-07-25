@@ -189,6 +189,64 @@ test('Qwen AI resumable bridge continues after a transport reset', async () => {
   assert.match(serialized, /resumed answer/)
 })
 
+test('Qwen AI concurrent stream recoveries share one response-id continuation', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      resumed.end(`data: ${JSON.stringify({
+        response_id: responseId,
+        choices: [{ delta: { phase: 'answer', status: 'finished', content: 'shared answer' } }],
+      })}\n\ndata: [DONE]\n\n`)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    recoverFromIdle: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-concurrent-stream', response_index: 0 },
+  })}\n\n`)
+  await new Promise(resolve => setImmediate(resolve))
+
+  let secondResumeNotified = false
+  const firstRecovery = bridge.recoverFromIdle(new Error('synthetic idle'))
+  const secondRecovery = bridge.recoverFromIdle(new Error('synthetic semantic empty'), () => {
+    secondResumeNotified = true
+  })
+  const [firstRecovered, secondRecovered] = await Promise.all([firstRecovery, secondRecovery])
+  await ended
+
+  assert.equal(firstRecovered, true)
+  assert.equal(secondRecovered, true)
+  assert.equal(secondResumeNotified, true)
+  assert.deepEqual(resumeCalls, ['response-concurrent-stream'])
+  assert.equal(failure, undefined)
+  assert.match(Buffer.concat(chunks).toString(), /shared answer/)
+})
+
 test('Qwen AI resumable bridge does not resume a completed stream', async () => {
   const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
   const initial = new PassThrough()
@@ -566,6 +624,289 @@ test('Qwen AI non-stream parsing resumes on semantic idle without resubmitting t
   assert.deepEqual(resumeCalls, ['response-non-stream-idle'])
   assert.equal(result.choices[0].message.reasoning_content, 'summary continued')
   assert.equal(result.choices[0].message.content, 'complete')
+})
+
+test('Qwen AI concurrent non-stream recoveries share one response-id continuation', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      await new Promise(resolve => setTimeout(resolve, 20))
+      resumed.end(`data: ${JSON.stringify({
+        response_id: responseId,
+        choices: [{ delta: { phase: 'answer', status: 'finished', content: 'shared non-stream answer' } }],
+      })}\n\ndata: [DONE]\n\n`)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 1_000,
+    recoverFromIdle: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-concurrent-non-stream', response_index: 0 },
+  })}\n\n`)
+  await new Promise(resolve => setImmediate(resolve))
+
+  let secondResumeNotified = false
+  const firstRecovery = bridge.recoverFromIdle(new Error('synthetic idle'))
+  const secondRecovery = bridge.recoverFromIdle(new Error('synthetic semantic empty'), () => {
+    secondResumeNotified = true
+  })
+  const [firstRecovered, secondRecovered] = await Promise.all([firstRecovery, secondRecovery])
+  const result = await resultPromise
+
+  assert.equal(firstRecovered, true)
+  assert.equal(secondRecovered, true)
+  assert.equal(secondResumeNotified, true)
+  assert.deepEqual(resumeCalls, ['response-concurrent-non-stream'])
+  assert.equal(result.choices[0].message.content, 'shared non-stream answer')
+})
+
+test('Qwen AI stream rejects a reasoning-only terminal response when continuation is unavailable', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  const output = await handler.handleStream(upstream, { responseTimeoutMs: 1_000 })
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const ended = once(output, 'end')
+
+  const reasoningEvent = JSON.stringify({
+    response_id: 'response-semantic-empty',
+    choices: [{ delta: { phase: 'think', status: 'typing', content: 'internal reasoning' } }],
+  })
+  upstream.end(`data: ${reasoningEvent}\n\ndata: [DONE]\n\n`)
+
+  const [failure] = await failurePromise
+  await ended
+  assert.equal(failure.status, 502)
+  assert.equal(failure.code, 'qwen_ai_semantic_empty')
+  assert.equal(failure.retryable, false)
+  assert.match(failure.message, /reasoning but without an answer or tool call/)
+  assert.match(Buffer.concat(chunks).toString(), /qwen_ai_semantic_empty/)
+})
+
+test('Qwen AI stream resumes a reasoning-only [DONE] through the same response id', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      resumed.end(`data: ${JSON.stringify({
+        response_id: 'response-semantic-resume',
+        choices: [{ delta: { phase: 'answer', status: 'finished', content: 'visible answer' } }],
+      })}\n\ndata: [DONE]\n\n`)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.write(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-semantic-resume', response_index: 0 },
+  })}\n\n`)
+  initial.end(`data: ${JSON.stringify({
+    response_id: 'response-semantic-resume',
+    choices: [{ delta: { phase: 'think', status: 'typing', content: 'internal reasoning' } }],
+  })}\n\ndata: [DONE]\n\n`)
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('semantic-empty response was not resumed')), 500)
+    const poll = setInterval(() => {
+      if (resumeCalls.length === 0) return
+      clearInterval(poll)
+      clearTimeout(timeout)
+      resolve()
+    }, 5)
+  })
+
+  await ended
+
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(resumeCalls, ['response-semantic-resume'])
+  assert.equal(failure, undefined)
+  assert.match(body, /internal reasoning/)
+  assert.match(body, /visible answer/)
+  assert.match(body, /"finish_reason":"stop"/)
+  assert.match(body, /\[DONE\]/)
+})
+
+test('Qwen AI stream preserves a continuation endpoint failure after semantic recovery', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => {
+      throw Object.assign(new Error('continuation quota exhausted'), {
+        status: 429,
+        code: 'qwen_ai_capacity_limit',
+        retryable: false,
+      })
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const ended = once(output, 'end')
+  output.resume()
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-semantic-failure', response_index: 0 },
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'response-semantic-failure',
+    choices: [{ delta: { phase: 'think', status: 'typing', content: 'internal reasoning' } }],
+  })}\n\ndata: [DONE]\n\n`)
+
+  const [failure] = await failurePromise
+  await ended
+  assert.equal(failure.status, 429)
+  assert.equal(failure.code, 'qwen_ai_capacity_limit')
+  assert.equal(failure.accountFault, undefined)
+  assert.match(failure.message, /continuation quota exhausted/)
+})
+
+test('Qwen AI non-stream resumes a reasoning-only terminal response through the same response id', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const resumed = new PassThrough()
+  initial.on('error', () => {})
+  resumed.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const resumeCalls = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async responseId => {
+      resumeCalls.push(responseId)
+      resumed.end(`data: ${JSON.stringify({
+        response_id: 'response-semantic-non-stream',
+        choices: [{ delta: { phase: 'answer', status: 'finished', content: 'visible answer' } }],
+      })}\n\ndata: [DONE]\n\n`)
+      return { data: resumed }
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+
+  initial.write(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-semantic-non-stream', response_index: 0 },
+  })}\n\n`)
+  initial.end(`data: ${JSON.stringify({
+    response_id: 'response-semantic-non-stream',
+    choices: [{ delta: { phase: 'think', status: 'typing', content: 'internal reasoning' } }],
+  })}\n\ndata: [DONE]\n\n`)
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('non-stream semantic-empty response was not resumed')), 500)
+    const poll = setInterval(() => {
+      if (resumeCalls.length === 0) return
+      clearInterval(poll)
+      clearTimeout(timeout)
+      resolve()
+    }, 5)
+  })
+
+  const result = await resultPromise
+  assert.deepEqual(resumeCalls, ['response-semantic-non-stream'])
+  assert.equal(result.choices[0].message.content, 'visible answer')
+  assert.equal(result.choices[0].message.reasoning_content, 'internal reasoning')
+})
+
+test('Qwen AI non-stream preserves a continuation endpoint failure after semantic recovery', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+
+  const handler = new QwenAiStreamHandler('test-model')
+  handler.setChatId('test-chat')
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    resume: async () => {
+      throw Object.assign(new Error('non-stream continuation quota exhausted'), {
+        status: 429,
+        code: 'qwen_ai_capacity_limit',
+        retryable: false,
+      })
+    },
+    maxAttempts: 1,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'response-semantic-non-stream-failure', response_index: 0 },
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'response-semantic-non-stream-failure',
+    choices: [{ delta: { phase: 'think', status: 'typing', content: 'internal reasoning' } }],
+  })}\n\ndata: [DONE]\n\n`)
+
+  await assert.rejects(resultPromise, error => {
+    assert.equal(error.status, 429)
+    assert.equal(error.code, 'qwen_ai_capacity_limit')
+    assert.equal(error.accountFault, undefined)
+    assert.match(error.message, /non-stream continuation quota exhausted/)
+    return true
+  })
 })
 
 test('Qwen AI response timeout zero disables the absolute deadline for stream and non-stream parsing', async () => {

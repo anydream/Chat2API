@@ -143,6 +143,52 @@ test('Qwen AI keeps the leading system preamble in place when no user turn exist
   )
 })
 
+test('Qwen AI places the existing system preamble after a trailing tool result', async () => {
+  const messages = [
+    { role: 'system' as const, content: 'general-system-instructions' },
+    { role: 'system' as const, content: 'managed-tool-protocol' },
+    { role: 'user' as const, content: 'complete the workflow' },
+    {
+      role: 'assistant' as const,
+      content: null,
+      tool_calls: [
+        {
+          id: 'call_trailing_a',
+          type: 'function' as const,
+          function: { name: 'workspace:inspect-a', arguments: '{"round":1}' },
+        },
+        {
+          id: 'call_trailing_b',
+          type: 'function' as const,
+          function: { name: 'workspace:inspect-b', arguments: '{"round":2}' },
+        },
+      ],
+    },
+    toolResult('call_trailing_a', 1),
+    toolResult('call_trailing_b', 2),
+  ]
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
+  const userPosition = prepared.content.indexOf('User: complete the workflow')
+  const firstToolCallPosition = prepared.content.indexOf('name="workspace:inspect-a"')
+  const secondToolCallPosition = prepared.content.indexOf('name="workspace:inspect-b"')
+  const firstToolResultPosition = prepared.content.indexOf('result-1')
+  const secondToolResultPosition = prepared.content.indexOf('result-2')
+  const generalSystemPosition = prepared.content.indexOf('System: general-system-instructions')
+  const managedSystemPosition = prepared.content.indexOf('System: managed-tool-protocol')
+
+  assert.ok(userPosition >= 0)
+  assert.ok(firstToolCallPosition > userPosition)
+  assert.ok(secondToolCallPosition > firstToolCallPosition)
+  assert.ok(firstToolResultPosition > secondToolCallPosition)
+  assert.ok(secondToolResultPosition > firstToolResultPosition)
+  assert.ok(generalSystemPosition > secondToolResultPosition)
+  assert.ok(managedSystemPosition > generalSystemPosition)
+  assert.equal((prepared.content.match(/general-system-instructions/g) ?? []).length, 1)
+  assert.equal((prepared.content.match(/managed-tool-protocol/g) ?? []).length, 1)
+  assert.doesNotMatch(prepared.content, /Continue the original request using the tool result above/)
+})
+
 test('Qwen AI keeps a generic continuation after the latest tool result', async () => {
   const messages = [
     { role: 'system' as const, content: 'tool protocol and task instructions' },

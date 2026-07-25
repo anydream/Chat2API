@@ -1011,7 +1011,11 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
       break
     }
   }
-  const relocateSystemPreamble = systemPreambleCount > 0 && latestUserIndex >= systemPreambleCount
+  const systemPreambleInsertionIndex = messages.at(-1)?.role === 'tool'
+    ? messages.length
+    : latestUserIndex
+  const relocateSystemPreamble = systemPreambleCount > 0
+    && systemPreambleInsertionIndex >= systemPreambleCount
   const systemPreamble = relocateSystemPreamble
     ? messages
         .slice(0, systemPreambleCount)
@@ -1027,7 +1031,7 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
       continue
     }
 
-    if (relocateSystemPreamble && messageIndex === latestUserIndex) {
+    if (relocateSystemPreamble && messageIndex === systemPreambleInsertionIndex) {
       transcriptParts.push(...systemPreamble)
     }
 
@@ -1098,6 +1102,10 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
         transcriptParts.push(formatRoleText('Tool', text))
       }
     }
+  }
+
+  if (relocateSystemPreamble && systemPreambleInsertionIndex === messages.length) {
+    transcriptParts.push(...systemPreamble)
   }
 
   return {

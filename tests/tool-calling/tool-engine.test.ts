@@ -126,6 +126,28 @@ test('explicit Cherry Studio MCP adapter uses managed prompt and preserves tool 
   assert.equal(result.plan.tools[0].source, 'mcp')
 })
 
+test('tool result history is preserved without synthesizing a continuation message', () => {
+  const messages = [
+    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }] },
+    { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
+  ]
+  const originalMessages = [...messages]
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ messages }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.deepEqual(messages, originalMessages)
+  assert.equal(result.messages.at(-1)?.role, 'tool')
+  assert.equal(result.messages.filter(message => message.role === 'user').length, 1)
+})
+
 test('client prompt signatures do not override selected adapter', () => {
   const result = new ToolCallingEngine().transformRequest({
     request: request({

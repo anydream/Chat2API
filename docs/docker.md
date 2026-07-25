@@ -185,6 +185,7 @@ QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
 CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
+CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 ```
@@ -218,6 +219,12 @@ continuations and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` (default `1000`)
 controls the pause between attempts. Set the attempts value to `0` to disable
 this transport recovery. It never resubmits the original prompt and is not
 selected by a session id, project path, or task content.
+When a managed-tool response reaches a semantic terminal without a tool call,
+Chat2API starts a new user-turn continuation in the same Qwen chat instead of
+replaying that completed response branch. The generic continuation is bounded
+by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `1`); set it to
+`0` to disable this semantic recovery. The new turn is parented to Qwen's
+latest `response_id` and does not resend the original messages or files.
 Qwen's early-error preflight is bounded by
 `CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS`. Once that window expires, the
 HTTP response switches to live SSE and later provider failures are reported

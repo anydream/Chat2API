@@ -13,12 +13,24 @@ import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformRes
 
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
 
-const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
+/**
+ * Generic instruction used when a managed-tool turn needs another model
+ * generation. Keep this provider/client agnostic: the provider adapter may
+ * submit it as a new user turn without replaying the original request.
+ */
+export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'Complete the active user request using the available context and tool results.',
   'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
   'Treat progress updates and plans as incomplete.',
   'Return a final answer only after all requested operations are complete and verified by tool results.',
 ].join(' ')
+
+export function createToolWorkflowContinuationMessage(): ChatMessage {
+  return {
+    role: 'user',
+    content: TOOL_WORKFLOW_CONTINUATION_PROMPT,
+  }
+}
 
 export class ToolCallingEngine {
   private readonly config: ToolCallingConfig
@@ -146,10 +158,7 @@ function appendToolWorkflowContinuation(messages: ChatMessage[]): { messages: Ch
   return {
     messages: [
       ...messages,
-      {
-        role: 'user',
-        content: TOOL_WORKFLOW_CONTINUATION_PROMPT,
-      },
+      createToolWorkflowContinuationMessage(),
     ],
     appended: true,
   }

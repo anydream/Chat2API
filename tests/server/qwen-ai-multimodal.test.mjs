@@ -261,12 +261,16 @@ test('Qwen AI file payload preserves audio and video file types', () => {
 
 test('Qwen AI adapter sends prepared multimodal files instead of a fixed empty list', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const chatCompletionSource = source.slice(
+    source.indexOf('async chatCompletion('),
+    source.indexOf('async resumeChatCompletion('),
+  )
 
   assert.match(source, /QwenAiFileUploader/)
   assert.match(source, /prepareQwenAiMultimodalMessage/)
   assert.match(source, /const qwenFiles = preparedUserMessage\.files/)
-  assert.match(source, /files:\s*qwenFiles/)
-  assert.doesNotMatch(source, /files:\s*\[\]/)
+  assert.match(chatCompletionSource, /files:\s*qwenFiles/)
+  assert.doesNotMatch(chatCompletionSource, /files:\s*\[\]/)
 })
 
 test('Qwen AI adapter request timeout is configurable for long-context document runs', () => {

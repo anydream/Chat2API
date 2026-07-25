@@ -96,10 +96,20 @@ type QwenAiResumableStreamOptions = {
   signal?: AbortSignal
   getResponseId: () => string
   resume?: (responseId: string) => Promise<any>
+  /**
+   * Start a new user-turn generation in the existing chat when a semantic
+   * completion leaves the response-id branch unusable. This callback must
+   * submit only the continuation turn; it must never replay the original
+   * request.
+   */
+  continueWorkflow?: (parentResponseId: string) => Promise<any>
+  /** Reset provider/parser state before a fresh workflow stream is attached. */
+  onWorkflowContinuation?: () => void
   /** Return true once the adapter has emitted a terminal response. */
   isComplete?: () => boolean
   maxAttempts?: number
   delayMs?: number
+  workflowContinuationAttempts?: number
 }
 
 export type QwenAiResumableStream = PassThrough & {
@@ -117,6 +127,17 @@ interface ChatCompletionRequest {
   enable_thinking?: boolean
   thinking_budget?: number
   chatId?: string
+  signal?: AbortSignal
+}
+
+interface QwenAiWorkflowContinuationRequest {
+  chatId: string
+  parentId: string
+  model: string
+  originalModel?: string
+  content: string
+  enable_thinking?: boolean
+  thinking_budget?: number
   signal?: AbortSignal
 }
 
@@ -152,6 +173,13 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
   return Math.min(
     60_000,
     nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS', 1_000),
+  )
+}
+
+export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
+  return Math.min(
+    3,
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS', 1),
   )
 }
 
@@ -247,10 +275,11 @@ function isResumableQwenAiTransportError(error: unknown): boolean {
 }
 
 /**
- * Keep a Qwen SSE response alive across a transport close. Qwen's web client
- * resumes an in-progress response with the chat and response identifiers;
- * keeping that recovery below the protocol adapter means every compatible
- * downstream client benefits without knowing provider-specific details.
+ * Keep a Qwen SSE response alive across recoverable provider failures.
+ * Interrupted generations resume by response id; semantically completed but
+ * unfinished managed-tool turns may start one bounded same-chat continuation.
+ * Keeping both paths below the protocol adapter makes them transparent to
+ * compatible downstream clients.
  */
 export function createQwenAiResumableStream(
   initialStream: any,
@@ -259,6 +288,10 @@ export function createQwenAiResumableStream(
   const bridge = new PassThrough() as QwenAiResumableStream
   const maxAttempts = Math.max(0, options.maxAttempts ?? qwenAiStreamResumeAttemptsFromEnv())
   const delayMs = Math.max(0, options.delayMs ?? qwenAiStreamResumeDelayMsFromEnv())
+  const maxWorkflowContinuationAttempts = Math.max(
+    0,
+    options.workflowContinuationAttempts ?? qwenAiWorkflowContinuationAttemptsFromEnv(),
+  )
 
   let source = initialStream
   let sourceGeneration = 0
@@ -270,6 +303,7 @@ export function createQwenAiResumableStream(
   let recoveryResumed = false
   let recoveryResumeCallbacks: Array<() => void> = []
   let attempts = 0
+  let workflowContinuationAttempts = 0
   let settled = false
   let settledError: Error | undefined
 
@@ -384,13 +418,20 @@ export function createQwenAiResumableStream(
     if (recoveryInFlight || settled) return false
     recoveryInFlight = true
     let lastError = initialError || new Error('Qwen AI response stream closed before completion')
+    let semanticRecoveryEligible = isQwenAiSemanticRecoveryError(initialError)
     const failRecovery = (error: Error): never => {
       recoveryInFlight = false
       fail(error)
       throw error
     }
 
-    while (!settled && attempts < maxAttempts) {
+    // A semantic terminal means Qwen already completed this response branch;
+    // replaying it with GET only repeats the dangling text. When a same-chat
+    // continuation is available, go straight to that new user turn. Keep the
+    // response-id loop for transport/idle recovery and for callers that do
+    // not provide a workflow continuation callback.
+    const useWorkflowContinuation = semanticRecoveryEligible && Boolean(options.continueWorkflow)
+    while (!settled && attempts < maxAttempts && !useWorkflowContinuation) {
       if (checkComplete()) {
         const completionError = takeCompletionCheckError()
         if (completionError) failRecovery(completionError)
@@ -470,8 +511,79 @@ export function createQwenAiResumableStream(
           return false
         }
         lastError = error instanceof Error ? error : new Error(String(error))
+        if (!isQwenAiSemanticRecoveryError(lastError)) {
+          semanticRecoveryEligible = false
+        }
         if (isClientCancellationError(lastError) || options.signal?.aborted) {
           failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        }
+      }
+    }
+
+    // A response-id GET can only continue the provider's existing generation.
+    // For a managed-tool semantic terminal, start one bounded continuation
+    // user turn in the same chat instead of replaying that branch. This path
+    // is deliberately opt-in: ordinary transport failures and providers
+    // without a continuation callback still use the normal recovery budget.
+    if (
+      !settled
+      && semanticRecoveryEligible
+      && options.continueWorkflow
+      && workflowContinuationAttempts < maxWorkflowContinuationAttempts
+    ) {
+      const parentResponseId = options.getResponseId().trim()
+      if (parentResponseId) {
+        workflowContinuationAttempts += 1
+        if (!(await waitForRetry())) {
+          failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        }
+
+        try {
+          console.warn('[QwenAI] Starting managed workflow continuation', JSON.stringify({
+            parentResponseId,
+            attempt: workflowContinuationAttempts,
+            maxAttempts: maxWorkflowContinuationAttempts,
+          }))
+          const continued = await options.continueWorkflow(parentResponseId)
+          const nextStream = continued?.data ?? continued
+
+          if (settled || options.signal?.aborted || checkComplete()) {
+            destroyReadableStream(nextStream)
+            if (!settled) {
+              const lateContinuationError = takeCompletionCheckError()
+              if (lateContinuationError) fail(lateContinuationError)
+              else finish()
+            }
+            return false
+          }
+
+          if (!nextStream || typeof nextStream.on !== 'function') {
+            throw new Error('Qwen AI workflow continuation did not return a stream')
+          }
+
+          source = nextStream
+          sourceGeneration += 1
+          sourceHandled = false
+          sourceComplete = false
+          terminalMarkerSeen = false
+          completionScan = ''
+          // A fresh user turn has a new response branch and can use the
+          // response-id recovery budget independently of the old branch.
+          attempts = 0
+          recoveryInFlight = false
+          options.onWorkflowContinuation?.()
+          onResume?.()
+          attachSource(nextStream, sourceGeneration)
+          return true
+        } catch (error) {
+          if (settled) {
+            if (settledError) throw settledError
+            return false
+          }
+          lastError = error instanceof Error ? error : new Error(String(error))
+          if (isClientCancellationError(lastError) || options.signal?.aborted) {
+            failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
+          }
         }
       }
     }
@@ -789,6 +901,13 @@ function isDanglingManagedToolAnswer(
   }
 
   return /[:\uFF1A]\s*$/.test(content)
+}
+
+function isQwenAiSemanticRecoveryError(error: unknown): boolean {
+  const code = isObjectValue(error) && typeof error.code === 'string'
+    ? error.code
+    : ''
+  return code === 'qwen_ai_semantic_empty' || code === 'qwen_ai_semantic_incomplete'
 }
 
 function createQwenAiToolValidationError(
@@ -1802,7 +1921,9 @@ export class QwenAiAdapter {
       return {
         response,
         chatId,
-        parentId: null,
+        // The placeholder is only a fallback until the first
+        // response.created event supplies the real assistant response id.
+        parentId: childId,
       }
     } catch (error) {
       await this.deleteChat(chatId)
@@ -1842,6 +1963,127 @@ export class QwenAiAdapter {
     if (QWEN_AI_DEBUG_REQUEST_LOGS) {
       console.log('[QwenAI] Resume response status:', response.status)
       console.log('[QwenAI] Resume response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers)))
+    }
+
+    await this.assertChatCompletionStreamResponse(response)
+    return response
+  }
+
+  /**
+   * Submit a provider-native follow-up user turn in the existing chat.
+   *
+   * This is intentionally different from resumeChatCompletion(): a response
+   * id GET can only replay an interrupted generation. A semantic tool stall
+   * needs a new generation whose parent is the completed assistant response,
+   * while the original user/files payload remains untouched on Qwen's side.
+   */
+  async continueChatCompletion(
+    request: QwenAiWorkflowContinuationRequest,
+  ): Promise<AxiosResponse> {
+    const chatId = request.chatId.trim()
+    const parentId = request.parentId.trim()
+    const content = request.content.trim()
+    if (!chatId || !parentId || !content) {
+      throw new Error('Qwen AI workflow continuation requires chat ID, parent response ID, and content')
+    }
+
+    await this.refreshTokenIfNeeded(request.signal)
+    if (!this.getToken() && !this.getCookies()) {
+      const error = new Error('Qwen AI token/cookies not configured, please add credentials in account settings') as QwenAiUpstreamError
+      error.status = 401
+      error.retryable = false
+      throw error
+    }
+
+    const modelId = this.mapModel(request.model)
+    const modelForThinking = request.originalModel || request.model
+    const modelLower = modelForThinking.toLowerCase()
+    let forceThinking: boolean | undefined
+    if (modelForThinking.endsWith('-thinking')) {
+      forceThinking = true
+    } else if (modelForThinking.endsWith('-fast')) {
+      forceThinking = false
+    } else if (modelLower.includes('think') || modelLower.includes('r1')) {
+      forceThinking = true
+    } else {
+      forceThinking = (this as any)._forceThinking
+    }
+
+    const modelCapability = findModelCapability(this.provider, modelForThinking, modelId)
+    const shouldEnableThinking = resolveQwenThinkingEnabled(
+      request.enable_thinking,
+      forceThinking,
+      modelCapability,
+    )
+    const featureConfig: Record<string, any> = {
+      thinking_enabled: shouldEnableThinking,
+      output_schema: 'phase',
+      research_mode: 'normal',
+      auto_thinking: shouldEnableThinking,
+      thinking_format: 'summary',
+      auto_search: false,
+    }
+    if (request.thinking_budget) {
+      featureConfig.thinking_budget = request.thinking_budget
+    }
+
+    const fid = uuid()
+    const childId = uuid()
+    const ts = Math.floor(Date.now() / 1000)
+    const payload = {
+      stream: true,
+      version: '2.1',
+      incremental_output: true,
+      chat_id: chatId,
+      chat_mode: 'normal',
+      model: modelId,
+      parent_id: parentId,
+      messages: [
+        {
+          fid,
+          parentId,
+          childrenIds: [childId],
+          role: 'user',
+          content,
+          user_action: 'chat',
+          files: [],
+          timestamp: ts,
+          models: [modelId],
+          chat_type: 't2t',
+          feature_config: featureConfig,
+          extra: { meta: { subChatType: 't2t' } },
+          sub_chat_type: 't2t',
+          parent_id: parentId,
+        },
+      ],
+      timestamp: ts + 1,
+    }
+    const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${encodeURIComponent(chatId)}`
+
+    if (QWEN_AI_DEBUG_REQUEST_LOGS || QWEN_AI_DEBUG_PAYLOAD_LOGS) {
+      console.log('[QwenAI] Sending workflow continuation to /api/v2/chat/completions...')
+      console.log('[QwenAI] Continuation request URL:', url)
+      if (QWEN_AI_DEBUG_PAYLOAD_LOGS) {
+        console.log('[QwenAI] Continuation request payload:', JSON.stringify(this.sanitizePayloadForLog(payload), null, 2))
+      } else {
+        console.log('[QwenAI] Continuation request payload summary:', JSON.stringify(this.summarizePayloadForLog(payload), null, 2))
+      }
+    }
+
+    const response = await this.postWithRefreshRetry(url, payload, () => ({
+      headers: {
+        ...this.getHeaders(chatId),
+        'x-accel-buffering': 'no',
+      },
+      responseType: 'stream',
+      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      signal: request.signal,
+      validateStatus: () => true,
+    }))
+
+    if (QWEN_AI_DEBUG_REQUEST_LOGS) {
+      console.log('[QwenAI] Workflow continuation response status:', response.status)
+      console.log('[QwenAI] Workflow continuation response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers)))
     }
 
     await this.assertChatCompletionStreamResponse(response)
@@ -1899,6 +2141,7 @@ export class QwenAiStreamHandler {
   private responseBranchLocked = false
   private processedResponseEvent = false
   private streamCompleted = false
+  private continuationResetter?: () => void
   private readonly toolCallIdPrefix: string
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
@@ -1907,9 +2150,33 @@ export class QwenAiStreamHandler {
     this.onEnd = onEnd
     this.toolCallingPlan = toolCallingPlan
     this.toolCallIdPrefix = `call_${uuid().replace(/-/g, '')}`
-    this.toolStreamParser = toolCallingPlan?.shouldParseResponse
-      ? new ToolStreamParser(toolCallingPlan, this.toolCallIdPrefix)
+    this.resetToolStreamParser()
+  }
+
+  private resetToolStreamParser(): void {
+    this.toolStreamParser = this.toolCallingPlan?.shouldParseResponse
+      ? new ToolStreamParser(this.toolCallingPlan, this.toolCallIdPrefix)
       : undefined
+  }
+
+  /**
+   * Prepare this handler for a new provider response branch created by a
+   * same-chat workflow continuation. The visible downstream stream remains
+   * open; only provider/parser state from the abandoned branch is cleared.
+   */
+  prepareForWorkflowContinuation(): void {
+    this.responseId = ''
+    this.content = ''
+    this.toolCallsSent = false
+    this.nativeToolCallStates = new Map<string, NativeToolCallState>()
+    this.nativeToolCallIndex = 0
+    this.warnedUndeclaredNativeToolNames = new Set<string>()
+    this.ignoredResponseIds = new Set<string>()
+    this.responseBranchLocked = false
+    this.processedResponseEvent = false
+    this.streamCompleted = false
+    this.resetToolStreamParser()
+    this.continuationResetter?.()
   }
 
   setChatId(chatId: string) {
@@ -2234,7 +2501,21 @@ export class QwenAiStreamHandler {
     let idleTimer: NodeJS.Timeout | undefined
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
+    let parser: ReturnType<typeof createParser>
     const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
+
+    this.continuationResetter = () => {
+      // The old dangling answer has already been classified as incomplete;
+      // do not carry its text, native fragments, or managed-parser buffer into
+      // the new response branch. Keep initialChunkSent so a second role frame
+      // is not emitted after visible prefix bytes have reached the client.
+      reasoningText = ''
+      summaryText = ''
+      sawUpstreamCompletion = false
+      idleRecoveryInFlight = false
+      semanticRecoveryInFlight = false
+      parser?.reset()
+    }
 
     const cleanupTimers = () => {
       if (responseTimer) {
@@ -2578,7 +2859,7 @@ export class QwenAiStreamHandler {
       }
     }
 
-    const parser = createParser({
+    parser = createParser({
       onEvent: (event: any) => {
         try {
           if (finalChunkSent || semanticRecoveryInFlight) {
@@ -2830,7 +3111,27 @@ export class QwenAiStreamHandler {
       let idleTimer: NodeJS.Timeout | undefined
       let idleRecoveryInFlight = false
       let semanticRecoveryInFlight = false
+      let parser: ReturnType<typeof createParser>
       const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
+
+      this.continuationResetter = () => {
+        // Keep the same downstream promise alive, but start parsing the fresh
+        // provider response as a new assistant branch.
+        reasoningText = ''
+        summaryText = ''
+        data.id = ''
+        data.choices[0].message = {
+          role: 'assistant',
+          content: '',
+          reasoning_content: '',
+        }
+        data.choices[0].finish_reason = 'stop'
+        sawAnswerFinish = false
+        sawUpstreamCompletion = false
+        idleRecoveryInFlight = false
+        semanticRecoveryInFlight = false
+        parser?.reset()
+      }
 
       const cleanupTimers = () => {
         if (responseTimer) {
@@ -3039,7 +3340,7 @@ export class QwenAiStreamHandler {
 
       options.signal?.addEventListener('abort', onAbort, { once: true })
 
-      const parser = createParser({
+      parser = createParser({
         onEvent: (event: any) => {
           try {
             if (resolved || semanticRecoveryInFlight) {

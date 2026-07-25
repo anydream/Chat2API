@@ -61,7 +61,7 @@ function loadRequestForwarder(overrides = {}) {
     './adapters/qwen-ai': {
       describeErrorForLog: error => error?.message || String(error),
       QWEN_AI_STREAM_FAILURE_EVENT: 'qwen-ai-stream-failure',
-      createQwenAiResumableStream: stream => stream,
+      createQwenAiResumableStream: overrides.createQwenAiResumableStream || (stream => stream),
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
     },
@@ -75,7 +75,11 @@ function loadRequestForwarder(overrides = {}) {
     },
     './adapters/perplexity': { PerplexityAdapter: adapterWithMatcher('isPerplexityProvider') },
     './adapters/perplexity-stream': { PerplexityStreamHandler: StreamHandler },
-    './toolCalling/ToolCallingEngine': { ToolCallingEngine: class {} },
+    './toolCalling/ToolCallingEngine': {
+      ToolCallingEngine: class {},
+      createToolWorkflowContinuationMessage: overrides.createToolWorkflowContinuationMessage
+        || (() => ({ role: 'user', content: 'generic workflow continuation' })),
+    },
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: { run: (_accountId, operation) => operation() },
     },
@@ -441,6 +445,110 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
   output.destroy()
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(deleteCalls, ['temporary-chat-1'])
+})
+
+test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn', async () => {
+  const output = new PassThrough()
+  const initialUpstream = new PassThrough()
+  const continuedUpstream = new PassThrough()
+  const continuationCalls = []
+  const resumeCalls = []
+  const bridgeOptions = []
+  let resetCalls = 0
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: initialUpstream, headers: {} },
+        chatId: 'temporary-chat-continuation',
+        parentId: 'placeholder-parent',
+      }
+    }
+
+    async resumeChatCompletion(_chatId, responseId) {
+      resumeCalls.push(responseId)
+      return { data: continuedUpstream }
+    }
+
+    async continueChatCompletion(request) {
+      continuationCalls.push(request)
+      return { data: continuedUpstream }
+    }
+
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    getResponseId() { return 'latest-response-id' }
+    isComplete() { return false }
+    prepareForWorkflowContinuation() { resetCalls += 1 }
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter,
+    QwenAiStreamHandler,
+    createQwenAiResumableStream: (stream, options) => {
+      bridgeOptions.push(options)
+      return stream
+    },
+    createToolWorkflowContinuationMessage: () => ({
+      role: 'user',
+      content: 'generic workflow continuation',
+    }),
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: {
+      shouldParseResponse: true,
+      allowedToolNames: new Set(['lookup']),
+    },
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    {
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'original request must not be replayed' }],
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+
+  output.write('data: {"choices":[{"delta":{"content":"ready"}}]}\n\n')
+  const result = await resultPromise
+  assert.equal(result.success, true)
+  assert.equal(bridgeOptions.length, 1)
+
+  const options = bridgeOptions[0]
+  assert.equal(typeof options.continueWorkflow, 'function')
+  assert.equal(typeof options.onWorkflowContinuation, 'function')
+  assert.equal(typeof options.resume, 'function')
+
+  const continuation = await options.continueWorkflow('response-parent-42')
+  assert.equal(continuation.data, continuedUpstream)
+  assert.equal(continuationCalls.length, 1)
+  assert.equal(continuationCalls[0].chatId, 'temporary-chat-continuation')
+  assert.equal(continuationCalls[0].parentId, 'response-parent-42')
+  assert.equal(continuationCalls[0].content, 'generic workflow continuation')
+  assert.equal(continuationCalls[0].messages, undefined)
+
+  options.onWorkflowContinuation()
+  assert.equal(resetCalls, 1)
+  await options.resume('response-parent-42')
+  assert.deepEqual(resumeCalls, ['response-parent-42'])
+
+  output.destroy()
+  initialUpstream.destroy()
+  continuedUpstream.destroy()
 })
 
 test('Qwen AI preflight releases a quiet stream after the configured hold', async () => {

@@ -262,6 +262,11 @@ prompt a second time. `CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` defaults to `3`
 and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` to `1000` ms; set attempts to `0`
 to disable this bounded recovery. These are generic deployment controls and do
 not depend on a Claude session, project directory, model name, or prompt.
+For managed-tool semantic terminals, the proxy submits a generic continuation
+user turn in the same Qwen chat, parented to the latest response id. This path
+is bounded by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `1`),
+does not replay the original prompt or uploaded files, and can be disabled with
+`0`.
 The queue limit is applied per governor admission attempt; a logical request
 that opts into a provider recovery retry can have more than one attempt and a
 longer total wall-clock duration. A client abort during a later attempt is

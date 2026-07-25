@@ -29,6 +29,7 @@ import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
 import { ToolCallingEngine } from './toolCalling/ToolCallingEngine'
+import { createToolWorkflowContinuationMessage } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 import { BufferedSseError, bufferValidatedSseStream } from './utils/validatedSseStream'
@@ -1309,11 +1310,43 @@ export class RequestForwarder {
 
       const handler = new QwenAiStreamHandler(actualModel, undefined, transformed.plan)
       handler.setChatId(chatId)
+      const canContinueManagedWorkflow = Boolean(
+        transformed.plan.shouldParseResponse
+        && transformed.plan.allowedToolNames?.size
+        && typeof (adapter as any).continueChatCompletion === 'function',
+      )
+      const workflowContinuationMessage = canContinueManagedWorkflow
+        ? createToolWorkflowContinuationMessage()
+        : undefined
+      const workflowContinuationContent = typeof workflowContinuationMessage?.content === 'string'
+        ? workflowContinuationMessage.content
+        : workflowContinuationMessage
+          ? JSON.stringify(workflowContinuationMessage.content)
+          : ''
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
         getResponseId: () => handler.getResponseId(),
         isComplete: () => handler.isComplete(),
         resume: responseId => adapter.resumeChatCompletion(chatId, responseId, context?.signal),
+        ...(canContinueManagedWorkflow
+          ? {
+              continueWorkflow: (responseId: string) => adapter.continueChatCompletion({
+                chatId,
+                parentId: responseId,
+                model: actualModel,
+                originalModel: request.model,
+                content: workflowContinuationContent,
+                enable_thinking: request.enable_thinking !== undefined
+                  ? request.enable_thinking
+                  : request.reasoning_effort !== undefined
+                    ? Boolean(request.reasoning_effort)
+                    : undefined,
+                thinking_budget: request.thinking_budget,
+                signal: context?.signal,
+              }),
+              onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+            }
+          : {}),
       })
 
       if (request.stream) {

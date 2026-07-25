@@ -186,6 +186,8 @@ QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
 CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
+CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=3
+CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 ```
@@ -225,6 +227,15 @@ replaying that completed response branch. The generic continuation is bounded
 by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `1`); set it to
 `0` to disable this semantic recovery. The new turn is parented to Qwen's
 latest `response_id` and does not resend the original messages or files.
+If Qwen is still finalizing the parent response, its continuation endpoint
+returns HTTP 200 JSON with `code=CHAT_IN_PROGRESS` instead of an SSE stream.
+Chat2API waits with bounded exponential backoff and retries the exact same
+continuation payload. `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS`
+(default `3`) limits those retries and
+`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS` (default `1000` ms) sets
+the initial delay; set attempts to `0` to fail immediately. The response is
+recognized by the provider code only, so an ordinary JSON error remains a
+non-stream `502`, and cancellation stops the wait without another request.
 Qwen's early-error preflight is bounded by
 `CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS`. Once that window expires, the
 HTTP response switches to live SSE and later provider failures are reported

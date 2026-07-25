@@ -30,6 +30,10 @@ services:
       CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS: ${CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3}
       CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS: ${CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000}
       CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1}
+      # A busy-chat admission response retries the exact same continuation
+      # payload; it never creates another user turn or switches accounts.
+      CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS:-3}
+      CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:-1000}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}

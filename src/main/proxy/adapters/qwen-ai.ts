@@ -43,6 +43,7 @@ const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDL
 const QWEN_AI_DEBUG_PAYLOAD_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_PAYLOADS === 'true'
 const QWEN_AI_DEBUG_STREAM_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_STREAM === 'true'
 const QWEN_AI_DEBUG_REQUEST_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_REQUEST === 'true'
+const QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS = 60_000
 
 export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
@@ -181,6 +182,53 @@ export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
     3,
     nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS', 1),
   )
+}
+
+/**
+ * Qwen may reject a same-chat follow-up while the previous response is still
+ * being finalized. These are retries of the exact same continuation payload,
+ * not new turns. Keep the budget configurable and bounded so an upstream
+ * queue cannot hold a client request forever.
+ */
+export function qwenAiChatInProgressRetryAttemptsFromEnv(): number {
+  return Math.min(
+    5,
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS', 3),
+  )
+}
+
+export function qwenAiChatInProgressRetryDelayMsFromEnv(): number {
+  return Math.min(
+    QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS', 1_000),
+  )
+}
+
+/**
+ * Wait for a retry while still honoring downstream cancellation. A boolean
+ * result avoids turning an abort into an ordinary upstream protocol error.
+ */
+export function waitForQwenAiRetry(delayMs: number, signal?: AbortSignal): Promise<boolean> {
+  const boundedDelay = Math.max(0, Math.min(QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS, delayMs))
+  if (signal?.aborted) return Promise.resolve(false)
+  if (boundedDelay === 0) return Promise.resolve(!signal?.aborted)
+
+  return new Promise<boolean>(resolve => {
+    let timer: NodeJS.Timeout | undefined
+    let settled = false
+
+    const finish = (result: boolean) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      resolve(result && !signal?.aborted)
+    }
+
+    const onAbort = () => finish(false)
+    timer = setTimeout(() => finish(true), boundedDelay)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /**
@@ -818,6 +866,42 @@ function isObjectValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
+/**
+ * Detect Qwen's admission response for a busy chat. The provider returns this
+ * as HTTP 200 JSON even though no SSE response branch was accepted. Restrict
+ * traversal to the response envelope and its documented error/data children
+ * so an arbitrary model payload cannot accidentally opt into retries.
+ */
+export function isQwenAiChatInProgressEnvelope(value: unknown): boolean {
+  const queue: unknown[] = [value]
+  const visited = new Set<object>()
+
+  while (queue.length > 0) {
+    const candidate = queue.shift()
+    if (Array.isArray(candidate)) {
+      queue.push(...candidate)
+      continue
+    }
+    if (!isObjectValue(candidate) || visited.has(candidate)) continue
+    visited.add(candidate)
+
+    const code = typeof candidate.code === 'string' ? candidate.code.trim() : ''
+    if (code.toUpperCase() === 'CHAT_IN_PROGRESS') return true
+
+    queue.push(candidate.error, candidate.errors, candidate.data)
+  }
+
+  return false
+}
+
+function parseJsonSafely(value: string): unknown {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
+
 export function describeErrorForLog(error: unknown): string {
   const record = isObjectValue(error) ? error : undefined
   const response = isObjectValue(record?.response) ? record.response : undefined
@@ -888,6 +972,15 @@ function createQwenAiSemanticIncompleteError(): QwenAiUpstreamError {
     'Qwen AI completed with a dangling answer while managed tools were available',
     'qwen_ai_semantic_incomplete',
   )
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiContinuationAbortError(): QwenAiUpstreamError {
+  const error = new Error('Qwen AI workflow continuation aborted because the client disconnected.') as QwenAiUpstreamError
+  error.status = 499
+  error.code = 'qwen_ai_client_cancelled'
+  error.retryable = false
   error.accountFault = false
   return error
 }
@@ -1593,9 +1686,13 @@ export class QwenAiAdapter {
     return isQwenAiRiskControlMessage(message)
   }
 
-  private async createInvalidStreamError(response: AxiosResponse, reason: string): Promise<Error> {
+  private async createInvalidStreamError(
+    response: AxiosResponse,
+    reason: string,
+    bodyPreview?: string,
+  ): Promise<Error> {
     const contentType = String(response.headers?.['content-type'] || 'unknown')
-    const body = await this.readStreamPreview(response.data)
+    const body = bodyPreview ?? await this.readStreamPreview(response.data)
     const upstreamMessage = this.extractUpstreamErrorMessage(body)
     const detail = upstreamMessage ? `: ${upstreamMessage}` : ''
 
@@ -1632,7 +1729,10 @@ export class QwenAiAdapter {
     return error
   }
 
-  private async assertChatCompletionStreamResponse(response: AxiosResponse): Promise<void> {
+  private async assertChatCompletionStreamResponse(
+    response: AxiosResponse,
+    options: { allowChatInProgress?: boolean } = {},
+  ): Promise<{ chatInProgress: boolean; error?: QwenAiUpstreamError }> {
     const contentType = String(response.headers?.['content-type'] || '').toLowerCase()
 
     if (response.status >= 400) {
@@ -1644,8 +1744,31 @@ export class QwenAiAdapter {
     }
 
     if (contentType.includes('application/json') || contentType.includes('text/html')) {
-      throw await this.createInvalidStreamError(response, 'returned a non-stream response instead of a chat event stream')
+      const body = await this.readStreamPreview(response.data)
+      const error = await this.createInvalidStreamError(
+        response,
+        'returned a non-stream response instead of a chat event stream',
+        body,
+      ) as QwenAiUpstreamError
+
+      // CHAT_IN_PROGRESS is an admission rejection, not an accepted response
+      // branch. Returning it to the continuation caller lets it wait and retry
+      // the exact same payload without creating a duplicate user turn.
+      if (
+        options.allowChatInProgress
+        && response.status < 400
+        && isQwenAiChatInProgressEnvelope(parseJsonSafely(body))
+      ) {
+        // A busy chat is provider state, not an invalid credential/account.
+        // Preserve that classification if the bounded retry budget is spent.
+        error.accountFault = false
+        return { chatInProgress: true, error }
+      }
+
+      throw error
     }
+
+    return { chatInProgress: false }
   }
 
   mapModel(openaiModel: string): string {
@@ -2070,7 +2193,7 @@ export class QwenAiAdapter {
       }
     }
 
-    const response = await this.postWithRefreshRetry(url, payload, () => ({
+    const createContinuationOptions = () => ({
       headers: {
         ...this.getHeaders(chatId),
         'x-accel-buffering': 'no',
@@ -2079,15 +2202,57 @@ export class QwenAiAdapter {
       timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
       signal: request.signal,
       validateStatus: () => true,
-    }))
+    })
 
-    if (QWEN_AI_DEBUG_REQUEST_LOGS) {
-      console.log('[QwenAI] Workflow continuation response status:', response.status)
-      console.log('[QwenAI] Workflow continuation response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers)))
+    const maxChatInProgressRetries = qwenAiChatInProgressRetryAttemptsFromEnv()
+    const baseRetryDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
+    let chatInProgressRetries = 0
+
+    while (true) {
+      const response = await this.postWithRefreshRetry(url, payload, createContinuationOptions)
+
+      if (QWEN_AI_DEBUG_REQUEST_LOGS) {
+        console.log('[QwenAI] Workflow continuation response status:', response.status)
+        console.log('[QwenAI] Workflow continuation response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers)))
+      }
+
+      const validation = (await this.assertChatCompletionStreamResponse(response, {
+        allowChatInProgress: true,
+      })) || { chatInProgress: false }
+      if (!validation.chatInProgress) {
+        return response
+      }
+
+      // The JSON admission response has been fully consumed by validation and
+      // cannot be attached to the SSE parser. Dispose of it before waiting so
+      // the retry does not leave a socket/listener behind.
+      destroyReadableStream(response.data)
+
+      if (request.signal?.aborted) {
+        throw createQwenAiContinuationAbortError()
+      }
+
+      if (chatInProgressRetries >= maxChatInProgressRetries) {
+        const exhausted = (validation.error || new Error('Qwen AI chat is still in progress')) as QwenAiUpstreamError
+        exhausted.retryable = false
+        throw exhausted
+      }
+
+      chatInProgressRetries += 1
+      const delayMs = Math.min(
+        QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
+        baseRetryDelayMs * (2 ** (chatInProgressRetries - 1)),
+      )
+      console.warn('[QwenAI] Workflow continuation was rejected because the chat is still in progress; waiting before retry', JSON.stringify({
+        retry: chatInProgressRetries,
+        maxRetries: maxChatInProgressRetries,
+        delayMs,
+      }))
+
+      if (!(await waitForQwenAiRetry(delayMs, request.signal))) {
+        throw createQwenAiContinuationAbortError()
+      }
     }
-
-    await this.assertChatCompletionStreamResponse(response)
-    return response
   }
 
   async startDirectFileUpload(input: QwenAiDirectUploadInput): Promise<QwenAiDirectUploadStartResult> {

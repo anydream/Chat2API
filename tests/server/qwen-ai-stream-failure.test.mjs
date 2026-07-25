@@ -2591,6 +2591,218 @@ test('Qwen AI workflow continuation posts only a new parented user turn', async 
   assert.equal(payload.messages.some(item => item.content === 'original request'), false)
 })
 
+test('Qwen AI retries a rejected workflow continuation with the same payload', async () => {
+  const {
+    QwenAiAdapter,
+    isQwenAiChatInProgressEnvelope,
+  } = loadQwenAiStreamHandler()
+  assert.equal(isQwenAiChatInProgressEnvelope({
+    code: 'CHAT_IN_PROGRESS',
+    message: 'The chat is in progress!',
+  }), true)
+  assert.equal(isQwenAiChatInProgressEnvelope({
+    message: 'The chat is in progress!',
+  }), false)
+
+  const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = '2'
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '0'
+
+  const busy = new PassThrough()
+  const accepted = new PassThrough()
+  const calls = []
+  busy.end(JSON.stringify({
+    code: 'CHAT_IN_PROGRESS',
+    message: 'The chat is in progress!',
+  }))
+  accepted.end('data: {"response.created":{"response_id":"accepted-response"}}\n\n')
+
+  try {
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.postWithRefreshRetry = async (url, payload, createOptions) => {
+      calls.push({ url, payload, options: createOptions() })
+      return calls.length === 1
+        ? { status: 200, headers: { 'content-type': 'application/json' }, data: busy }
+        : { status: 200, headers: { 'content-type': 'text/event-stream' }, data: accepted }
+    }
+
+    const response = await adapter.continueChatCompletion({
+      chatId: 'chat-busy',
+      parentId: 'parent-response',
+      model: 'qwen3.8-max-preview',
+      content: 'continue the workflow',
+    })
+
+    assert.equal(response.data, accepted)
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].payload.messages[0].fid, calls[1].payload.messages[0].fid)
+    assert.deepEqual(calls[0].payload.messages[0].childrenIds, calls[1].payload.messages[0].childrenIds)
+    assert.equal(calls[0].payload.parent_id, 'parent-response')
+    assert.equal(calls[1].payload.parent_id, 'parent-response')
+  } finally {
+    if (previousAttempts === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = previousAttempts
+    if (previousDelay === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
+    busy.destroy()
+    accepted.destroy()
+  }
+})
+
+test('Qwen AI bounds CHAT_IN_PROGRESS continuation retries and keeps ordinary JSON failures non-retryable', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = '1'
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '0'
+
+  try {
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    const calls = []
+    adapter.postWithRefreshRetry = async (url, payload, createOptions) => {
+      calls.push({ url, payload, options: createOptions() })
+      const busy = new PassThrough()
+      busy.end(JSON.stringify({
+        code: 'CHAT_IN_PROGRESS',
+        message: 'The chat is in progress!',
+      }))
+      return { status: 200, headers: { 'content-type': 'application/json' }, data: busy }
+    }
+
+    await assert.rejects(
+      adapter.continueChatCompletion({
+        chatId: 'chat-busy',
+        parentId: 'parent-response',
+        model: 'qwen3.8-max-preview',
+        content: 'continue the workflow',
+      }),
+      error => error.status === 502
+        && error.code === 'CHAT_IN_PROGRESS'
+        && error.retryable === false
+        && error.accountFault === false,
+    )
+    assert.equal(calls.length, 2, 'one initial submission plus one bounded retry')
+
+    const ordinary = new PassThrough()
+    ordinary.end(JSON.stringify({ success: false, message: 'ordinary upstream rejection' }))
+    calls.length = 0
+    adapter.postWithRefreshRetry = async () => {
+      calls.push({ ordinary: true })
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        data: ordinary,
+      }
+    }
+
+    await assert.rejects(
+      adapter.continueChatCompletion({
+        chatId: 'chat-ordinary',
+        parentId: 'parent-response',
+        model: 'qwen3.8-max-preview',
+        content: 'continue the workflow',
+      }),
+      error => error.status === 502 && error.retryable === false,
+    )
+    assert.equal(calls.length, 1, 'ordinary JSON must not enter the busy-chat retry loop')
+    ordinary.destroy()
+  } finally {
+    if (previousAttempts === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = previousAttempts
+    if (previousDelay === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
+  }
+})
+
+test('Qwen AI cancels a CHAT_IN_PROGRESS wait without issuing another retry', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = '3'
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '10000'
+
+  const controller = new AbortController()
+  const firstCall = new Promise(resolve => {
+    const busy = new PassThrough()
+    busy.end(JSON.stringify({ code: 'CHAT_IN_PROGRESS', message: 'The chat is in progress!' }))
+    resolve(busy)
+  })
+
+  try {
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    let calls = 0
+    let firstResponseReady
+    const firstResponse = new Promise(resolve => { firstResponseReady = resolve })
+    adapter.postWithRefreshRetry = async () => {
+      calls += 1
+      const busy = await firstCall
+      firstResponseReady()
+      return { status: 200, headers: { 'content-type': 'application/json' }, data: busy }
+    }
+
+    const continuation = adapter.continueChatCompletion({
+      chatId: 'chat-abort',
+      parentId: 'parent-response',
+      model: 'qwen3.8-max-preview',
+      content: 'continue the workflow',
+      signal: controller.signal,
+    })
+    await firstResponse
+    controller.abort()
+
+    await assert.rejects(continuation, error => error.status === 499)
+    assert.equal(calls, 1)
+  } finally {
+    if (previousAttempts === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = previousAttempts
+    if (previousDelay === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
+  }
+})
+
+test('Qwen AI keeps response-id resume separate from busy-chat workflow retries', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: { token: 'test-token' } },
+  )
+  adapter.refreshTokenIfNeeded = async () => {}
+  let getCalls = 0
+  const busy = new PassThrough()
+  busy.end(JSON.stringify({
+    code: 'CHAT_IN_PROGRESS',
+    message: 'The chat is in progress!',
+  }))
+  adapter.getWithRefreshRetry = async () => {
+    getCalls += 1
+    return {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+      data: busy,
+    }
+  }
+
+  await assert.rejects(
+    adapter.resumeChatCompletion('chat-resume', 'response-parent'),
+    error => error.status === 502 && error.code === 'CHAT_IN_PROGRESS',
+  )
+  assert.equal(getCalls, 1)
+  busy.destroy()
+})
+
 test('Qwen AI stream ignores a transport cancellation after terminal output', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
   const upstream = new PassThrough()

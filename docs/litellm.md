@@ -267,6 +267,13 @@ user turn in the same Qwen chat, parented to the latest response id. This path
 is bounded by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `1`),
 does not replay the original prompt or uploaded files, and can be disabled with
 `0`.
+Qwen can briefly reject that continuation with HTTP 200 and
+`code=CHAT_IN_PROGRESS` while it finalizes the parent response. The proxy then
+retries the exact same continuation payload in the same chat with bounded
+exponential backoff. `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS`
+defaults to `3`, and `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`
+defaults to `1000` ms. Set attempts to `0` to disable this recovery. Other JSON
+errors are not retried, and a client disconnect cancels the wait.
 The queue limit is applied per governor admission attempt; a logical request
 that opts into a provider recovery retry can have more than one attempt and a
 longer total wall-clock duration. A client abort during a later attempt is

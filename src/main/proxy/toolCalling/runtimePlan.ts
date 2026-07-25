@@ -43,6 +43,7 @@ export function buildToolCallingRuntimePlan(input: {
     shouldParseResponse,
     toolChoiceMode: input.clientRequest.toolChoice.mode,
     allowedToolNames,
+    workflowContinuation: false,
     forcedToolName: forcedName,
     diagnostics: {
       requestId: input.requestId,
@@ -59,6 +60,7 @@ export function buildToolCallingRuntimePlan(input: {
       toolChoiceMode: input.clientRequest.toolChoice.mode,
       forcedToolName: forcedName,
       allowedToolNames: [...allowedToolNames],
+      workflowContinuation: false,
     },
   }
 }

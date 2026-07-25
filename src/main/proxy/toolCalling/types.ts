@@ -53,6 +53,7 @@ export interface ToolCallDiagnostics {
   toolChoiceMode?: 'auto' | 'none' | 'required' | 'forced'
   forcedToolName?: string
   allowedToolNames?: string[]
+  workflowContinuation: boolean
 }
 
 export interface ToolCallingPlan {
@@ -65,6 +66,7 @@ export interface ToolCallingPlan {
   shouldParseResponse: boolean
   toolChoiceMode: 'auto' | 'none' | 'required' | 'forced'
   allowedToolNames: Set<string>
+  workflowContinuation: boolean
   forcedToolName?: string
   diagnostics: ToolCallDiagnostics
 }

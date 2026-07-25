@@ -144,6 +144,8 @@ test('tool result history receives a generic continuation without mutating the r
   })
 
   assert.deepEqual(messages, originalMessages)
+  assert.equal(result.plan.workflowContinuation, true)
+  assert.equal(result.plan.diagnostics.workflowContinuation, true)
   assert.equal(result.messages.at(-2)?.role, 'tool')
   assert.equal(result.messages.at(-1)?.role, 'user')
   assert.match(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
@@ -183,7 +185,63 @@ test('ordinary user turns without prior tool progress are not extended', () => {
   })
 
   assert.equal(result.messages.at(-1)?.content, 'read /tmp/a')
+  assert.equal(result.plan.workflowContinuation, false)
+  assert.equal(result.plan.diagnostics.workflowContinuation, false)
   assert.doesNotMatch(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
+})
+
+test('shape diagnostics are opt-in and omit message and tool values', () => {
+  const envName = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
+  const previousEnv = process.env[envName]
+  const originalInfo = console.info
+  const output: string[] = []
+  ;(console as any).info = (...args: unknown[]) => {
+    output.push(args.map((arg) => String(arg)).join(' '))
+  }
+  process.env[envName] = 'true'
+
+  try {
+    new ToolCallingEngine().transformRequest({
+      request: request({
+        messages: [
+          { role: 'system', content: 'TOP_SECRET_SYSTEM_BODY' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'TOP_SECRET_ASSISTANT_BODY' },
+              { type: 'tool_use', id: 'uuid-secret', name: 'TOP_SECRET_TOOL', input: { path: 'C:\\secret' } },
+            ] as any,
+            tool_calls: [{
+              id: 'uuid-secret',
+              type: 'function',
+              function: { name: 'TOP_SECRET_TOOL', arguments: '{"path":"C:\\secret"}' },
+            }],
+          },
+          {
+            role: 'tool',
+            tool_call_id: 'uuid-secret',
+            content: [{ type: 'tool_result', tool_use_id: 'uuid-secret', content: 'TOP_SECRET_RESULT_BODY' }] as any,
+          },
+        ],
+      }),
+      provider,
+      actualModel: 'deepseek-chat',
+    })
+  } finally {
+    console.info = originalInfo
+    if (previousEnv === undefined) delete process.env[envName]
+    else process.env[envName] = previousEnv
+  }
+
+  assert.equal(output.length, 1)
+  assert.match(output[0], /request-shape/)
+  assert.match(output[0], /"messageRoles":\["system","assistant","tool"\]/)
+  assert.match(output[0], /"contentPartTypes":\["text","tool_use"\]/)
+  assert.match(output[0], /"contentPartTypes":\["tool_result"\]/)
+  assert.match(output[0], /"rawToolCount":4/)
+  assert.match(output[0], /"normalizedToolCount":4/)
+  assert.match(output[0], /"workflowContinuation":true/)
+  assert.doesNotMatch(output[0], /TOP_SECRET|uuid-secret|C:\\\\secret|TOP_SECRET_TOOL/)
 })
 
 test('client prompt signatures do not override selected adapter', () => {

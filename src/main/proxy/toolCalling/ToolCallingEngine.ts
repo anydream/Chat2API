@@ -11,6 +11,8 @@ import { getToolClientAdapter } from './clientAdapters/index.ts'
 import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 
+const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
+
 const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'Complete the active user request using the available context and tool results.',
   'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
@@ -50,21 +52,30 @@ export class ToolCallingEngine {
       clientRequest,
     })
     const shouldInjectPrompt = plan.shouldInjectPrompt
+    const workflow = shouldInjectPrompt
+      ? appendToolWorkflowContinuation(request.messages)
+      : { messages: request.messages, appended: false }
+    const planWithWorkflow = withWorkflowContinuation(plan, workflow.appended)
+
+    emitToolCallingShapeDiagnostics({
+      messages: request.messages,
+      rawToolCount: Array.isArray(request.tools) ? request.tools.length : 0,
+      normalizedToolCount: clientRequest.tools.length,
+      workflowContinuation: workflow.appended,
+    })
 
     if (!shouldInjectPrompt) {
       return {
         messages: request.messages,
-        tools: plan.mode === 'disabled' ? request.tools : undefined,
-        plan,
+        tools: planWithWorkflow.mode === 'disabled' ? request.tools : undefined,
+        plan: planWithWorkflow,
       }
     }
 
-    const messages = appendToolWorkflowContinuation(request.messages)
-
     return {
-      messages: injectPrompt(messages, renderPrompt(plan, this.config)),
+      messages: injectPrompt(workflow.messages, renderPrompt(planWithWorkflow, this.config)),
       tools: undefined,
-      plan,
+      plan: planWithWorkflow,
     }
   }
 
@@ -110,9 +121,9 @@ export class ToolCallingEngine {
  * retry after the model returned only a progress update. The directive stays
  * conditional so completed workflows and ordinary answers can still finish.
  */
-function appendToolWorkflowContinuation(messages: ChatMessage[]): ChatMessage[] {
+function appendToolWorkflowContinuation(messages: ChatMessage[]): { messages: ChatMessage[]; appended: boolean } {
   const lastMessage = messages.at(-1)
-  if (!lastMessage) return messages
+  if (!lastMessage) return { messages, appended: false }
 
   const followsToolResult = lastMessage.role === 'tool'
   let lastToolResultIndex = -1
@@ -129,16 +140,112 @@ function appendToolWorkflowContinuation(messages: ChatMessage[]): ChatMessage[] 
       .some(candidate => candidate.role === 'assistant')
 
   if (!followsToolResult && !resumesAfterToolResult) {
-    return messages
+    return { messages, appended: false }
   }
 
-  return [
-    ...messages,
-    {
-      role: 'user',
-      content: TOOL_WORKFLOW_CONTINUATION_PROMPT,
+  return {
+    messages: [
+      ...messages,
+      {
+        role: 'user',
+        content: TOOL_WORKFLOW_CONTINUATION_PROMPT,
+      },
+    ],
+    appended: true,
+  }
+}
+
+function withWorkflowContinuation(plan: ToolCallingPlan, workflowContinuation: boolean): ToolCallingPlan {
+  return {
+    ...plan,
+    workflowContinuation,
+    diagnostics: {
+      ...plan.diagnostics,
+      workflowContinuation,
     },
-  ]
+  }
+}
+
+type ToolCallingShapeDiagnosticsInput = {
+  messages: ChatMessage[]
+  rawToolCount: number
+  normalizedToolCount: number
+  workflowContinuation: boolean
+}
+
+/**
+ * Emit a protocol-shape-only snapshot when explicitly enabled. The snapshot
+ * intentionally contains no values from message content, tool definitions, or
+ * tool-call identifiers so it can be enabled while investigating a live
+ * client/proxy bridge without exposing the request payload.
+ */
+function emitToolCallingShapeDiagnostics(input: ToolCallingShapeDiagnosticsInput): void {
+  if (!isToolCallingShapeDiagnosticsEnabled()) return
+
+  const messageShapes = input.messages.map((message) => ({
+    role: safeRole(message.role),
+    contentPartTypes: safeContentPartTypes(message.content),
+    hasToolCalls: Array.isArray(message.tool_calls)
+      ? message.tool_calls.length > 0
+      : Boolean(message.tool_calls),
+    hasToolCallId: typeof message.tool_call_id === 'string' && message.tool_call_id.length > 0,
+  }))
+
+  console.info('[ToolCalling] request-shape', JSON.stringify({
+    messageRoles: messageShapes.map((message) => message.role),
+    messageShapes,
+    rawToolCount: input.rawToolCount,
+    normalizedToolCount: input.normalizedToolCount,
+    workflowContinuation: input.workflowContinuation,
+  }))
+}
+
+function isToolCallingShapeDiagnosticsEnabled(): boolean {
+  const value = process.env[TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV]
+  return value !== undefined && /^(?:1|true|yes|on)$/i.test(value.trim())
+}
+
+const SAFE_ROLES = new Set(['system', 'user', 'assistant', 'tool'])
+
+function safeRole(role: unknown): string {
+  return typeof role === 'string' && SAFE_ROLES.has(role) ? role : 'other'
+}
+
+const SAFE_CONTENT_PART_TYPES = new Set([
+  'string',
+  'null',
+  'text',
+  'image',
+  'image_url',
+  'document',
+  'file',
+  'file_url',
+  'input_audio',
+  'video',
+  'video_url',
+  'tool_use',
+  'tool_result',
+  'server_tool_use',
+  'web_search_tool_result',
+  'web_search_result',
+  'thinking',
+  'redacted_thinking',
+  'computer_screenshot',
+  'bash_code_execution_tool_result',
+  'text_editor_code_execution_tool_result',
+  'code_execution_tool_result',
+])
+
+function safeContentPartTypes(content: ChatMessage['content']): string[] {
+  if (content === null) return ['null']
+  if (typeof content === 'string') return ['string']
+  if (!Array.isArray(content)) return ['other']
+
+  return content.map((part) => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return 'other'
+    const type = (part as { type?: unknown }).type
+    return typeof type === 'string' && SAFE_CONTENT_PART_TYPES.has(type) ? type : 'other'
+  })
 }
 
 function renderPrompt(

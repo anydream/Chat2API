@@ -748,7 +748,7 @@ type QwenAiErrorEnvelopeMetadata = {
 
 function createQwenAiStreamFailure(
   message: string,
-  code: 'qwen_ai_stream_incomplete' | 'qwen_ai_empty_stream' | 'qwen_ai_semantic_empty' = 'qwen_ai_stream_incomplete',
+  code: 'qwen_ai_stream_incomplete' | 'qwen_ai_empty_stream' | 'qwen_ai_semantic_empty' | 'qwen_ai_semantic_incomplete' = 'qwen_ai_stream_incomplete',
 ): QwenAiUpstreamError {
   const error = new Error(message) as QwenAiUpstreamError
   // The provider closed its SSE response without a usable completion. This
@@ -769,6 +769,26 @@ function createQwenAiSemanticEmptyError(): QwenAiUpstreamError {
   // that this account is invalid or rate limited.
   error.accountFault = false
   return error
+}
+
+function createQwenAiSemanticIncompleteError(): QwenAiUpstreamError {
+  const error = createQwenAiStreamFailure(
+    'Qwen AI completed with a dangling answer while managed tools were available',
+    'qwen_ai_semantic_incomplete',
+  )
+  error.accountFault = false
+  return error
+}
+
+function isDanglingManagedToolAnswer(
+  content: string,
+  plan?: ToolCallingPlan,
+): boolean {
+  if (!plan?.shouldParseResponse || plan.allowedToolNames.size === 0) {
+    return false
+  }
+
+  return /[:\uFF1A]\s*$/.test(content)
 }
 
 function createQwenAiToolValidationError(
@@ -2348,7 +2368,7 @@ export class QwenAiStreamHandler {
       // continuation own the next terminal marker instead of treating this
       // one as definitive.
       sawUpstreamCompletion = false
-      console.warn('[QwenAI] Recovering semantic-empty stream response')
+      console.warn('[QwenAI] Recovering semantically incomplete stream response:', error.code)
 
       const onResume = () => {
         semanticRecoveryInFlight = false
@@ -2496,6 +2516,11 @@ export class QwenAiStreamHandler {
       const undeclaredNativeToolNames = this.getUndeclaredNativeToolNames()
       if (undeclaredNativeToolNames.length > 0 && !hasAnswerOrTool) {
         failStream(createQwenAiUndeclaredNativeToolError(undeclaredNativeToolNames))
+        return
+      }
+
+      if (!emittedToolCall && isDanglingManagedToolAnswer(this.content, this.toolCallingPlan)) {
+        recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
         return
       }
 
@@ -2889,6 +2914,11 @@ export class QwenAiStreamHandler {
           return
         }
 
+        if (isDanglingManagedToolAnswer(answerText, this.toolCallingPlan)) {
+          recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+          return
+        }
+
         if (!answerText.trim() && finalReasoning.trim()) {
           recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
           return
@@ -2968,7 +2998,7 @@ export class QwenAiStreamHandler {
 
         semanticRecoveryInFlight = true
         sawUpstreamCompletion = false
-        console.warn('[QwenAI] Recovering semantic-empty non-stream response')
+        console.warn('[QwenAI] Recovering semantically incomplete non-stream response:', error.code)
 
         const onResume = () => {
           semanticRecoveryInFlight = false

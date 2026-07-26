@@ -571,9 +571,7 @@ export class RequestForwarder {
 
           const originalCount = modifiedRequest.messages.length
           const contextMessages: ContextChatMessage[] = modifiedRequest.messages.map(msg => ({
-            role: msg.role as 'user' | 'assistant' | 'system' | 'tool',
-            content: msg.content,
-            timestamp: Date.now(),
+            ...msg,
           }))
 
           const processResult = await contextService.process(contextMessages)
@@ -593,10 +591,7 @@ export class RequestForwarder {
 
             modifiedRequest = {
               ...modifiedRequest,
-              messages: processResult.messages.map(msg => ({
-                role: msg.role,
-                content: msg.content,
-              })),
+              messages: processResult.messages.map(msg => ({ ...msg })),
             }
           }
         } catch (error) {
@@ -1316,7 +1311,9 @@ export class RequestForwarder {
         && typeof (adapter as any).continueChatCompletion === 'function',
       )
       const workflowContinuationMessage = canContinueManagedWorkflow
-        ? createToolWorkflowContinuationMessage()
+        ? createToolWorkflowContinuationMessage({
+            failedToolResultPending: transformed.plan.failedToolResultPending,
+          })
         : undefined
       const workflowContinuationContent = typeof workflowContinuationMessage?.content === 'string'
         ? workflowContinuationMessage.content
@@ -1326,6 +1323,7 @@ export class RequestForwarder {
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
         getResponseId: () => handler.getResponseId(),
+        getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
         isComplete: () => handler.isComplete(),
         resume: responseId => adapter.resumeChatCompletion(chatId, responseId, context?.signal),
         ...(canContinueManagedWorkflow

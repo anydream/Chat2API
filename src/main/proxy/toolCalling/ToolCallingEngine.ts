@@ -21,16 +21,26 @@ const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOST
  */
 export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'Complete the active user request using the available context and tool results.',
+  'Use only the client-declared tools in the managed tool list; never invoke or rely on undeclared provider-side tools or capabilities.',
   'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
   'If a previous tool call was rejected or had schema validation errors, discard that malformed call and retry it using the declared JSON Schema exactly: include every required field, use only declared properties when the schema is strict, and preserve the declared value types.',
   'Treat progress updates and plans as incomplete.',
   'Return a final answer only after all requested operations are complete and verified by tool results.',
 ].join(' ')
 
-export function createToolWorkflowContinuationMessage(): ChatMessage {
+const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
+  'A previous tool result reported failure, so that operation is not complete.',
+  'Retry it with an appropriate declared tool or use another declared tool to complete and verify the operation.',
+].join(' ')
+
+export function createToolWorkflowContinuationMessage(options: {
+  failedToolResultPending?: boolean
+} = {}): ChatMessage {
   return {
     role: 'user',
-    content: TOOL_WORKFLOW_CONTINUATION_PROMPT,
+    content: options.failedToolResultPending
+      ? `${TOOL_WORKFLOW_CONTINUATION_PROMPT} ${FAILED_TOOL_RESULT_CONTINUATION_PROMPT}`
+      : TOOL_WORKFLOW_CONTINUATION_PROMPT,
   }
 }
 
@@ -66,16 +76,21 @@ export class ToolCallingEngine {
       clientRequest,
     })
     const shouldInjectPrompt = plan.shouldInjectPrompt
+    const failedToolResultPending = hasUnresolvedFailedToolResult(request.messages)
     const workflow = shouldInjectPrompt
-      ? appendToolWorkflowContinuation(request.messages)
+      ? appendToolWorkflowContinuation(request.messages, failedToolResultPending)
       : { messages: request.messages, appended: false }
-    const planWithWorkflow = withWorkflowContinuation(plan, workflow.appended)
+    const planWithWorkflow = withWorkflowState(plan, {
+      workflowContinuation: workflow.appended,
+      failedToolResultPending,
+    })
 
     emitToolCallingShapeDiagnostics({
       messages: request.messages,
       rawToolCount: Array.isArray(request.tools) ? request.tools.length : 0,
       normalizedToolCount: clientRequest.tools.length,
       workflowContinuation: workflow.appended,
+      failedToolResultPending,
     })
 
     if (!shouldInjectPrompt) {
@@ -139,7 +154,10 @@ export class ToolCallingEngine {
  * retry after the model returned only a progress update. The directive stays
  * conditional so completed workflows and ordinary answers can still finish.
  */
-function appendToolWorkflowContinuation(messages: ChatMessage[]): { messages: ChatMessage[]; appended: boolean } {
+function appendToolWorkflowContinuation(
+  messages: ChatMessage[],
+  failedToolResultPending: boolean,
+): { messages: ChatMessage[]; appended: boolean } {
   const lastMessage = messages.at(-1)
   if (!lastMessage) return { messages, appended: false }
 
@@ -164,21 +182,44 @@ function appendToolWorkflowContinuation(messages: ChatMessage[]): { messages: Ch
   return {
     messages: [
       ...messages,
-      createToolWorkflowContinuationMessage(),
+      createToolWorkflowContinuationMessage({ failedToolResultPending }),
     ],
     appended: true,
   }
 }
 
-function withWorkflowContinuation(plan: ToolCallingPlan, workflowContinuation: boolean): ToolCallingPlan {
+function withWorkflowState(
+  plan: ToolCallingPlan,
+  state: Pick<ToolCallingPlan, 'workflowContinuation' | 'failedToolResultPending'>,
+): ToolCallingPlan {
   return {
     ...plan,
-    workflowContinuation,
+    ...state,
     diagnostics: {
       ...plan.diagnostics,
-      workflowContinuation,
+      ...state,
     },
   }
+}
+
+function hasUnresolvedFailedToolResult(messages: ChatMessage[]): boolean {
+  let lastToolResultIndex = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'tool') {
+      lastToolResultIndex = index
+      break
+    }
+  }
+  if (lastToolResultIndex < 0) return false
+
+  let batchStartIndex = lastToolResultIndex
+  while (batchStartIndex > 0 && messages[batchStartIndex - 1].role === 'tool') {
+    batchStartIndex -= 1
+  }
+
+  return messages
+    .slice(batchStartIndex, lastToolResultIndex + 1)
+    .some(message => message.is_error === true)
 }
 
 type ToolCallingShapeDiagnosticsInput = {
@@ -186,6 +227,7 @@ type ToolCallingShapeDiagnosticsInput = {
   rawToolCount: number
   normalizedToolCount: number
   workflowContinuation: boolean
+  failedToolResultPending: boolean
 }
 
 /**
@@ -212,6 +254,7 @@ function emitToolCallingShapeDiagnostics(input: ToolCallingShapeDiagnosticsInput
     rawToolCount: input.rawToolCount,
     normalizedToolCount: input.normalizedToolCount,
     workflowContinuation: input.workflowContinuation,
+    failedToolResultPending: input.failedToolResultPending,
   }))
 }
 

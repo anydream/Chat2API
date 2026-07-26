@@ -11,6 +11,8 @@ export interface ChatMessage {
   content: string | ChatMessageContent[] | null
   name?: string
   tool_call_id?: string
+  /** Anthropic tool_result failure state preserved by protocol bridges. */
+  is_error?: boolean
   tool_calls?: ChatCompletionMessageToolCall[]
 }
 

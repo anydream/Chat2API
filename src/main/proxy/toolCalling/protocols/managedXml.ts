@@ -54,6 +54,7 @@ ${renderToolList(tools)}
 ${renderRequiredParameterTemplates(tools)}
 
 Tool-use requirements:
+- Use only tools from the Available Tools list, which is the client-declared managed tool set. Do not invoke or rely on undeclared provider-side tools or capabilities.
 - If the user asks you to inspect files, create or modify files, run commands, install dependencies, execute tests, or verify behavior in the environment, you must call the appropriate tool.
 - Do not claim that files were created, commands were run, tests passed, or behavior was verified unless the corresponding tool result shows it.
 - If a tool argument schema says a field is an array, provide a JSON array for that field, even when there is only one item.

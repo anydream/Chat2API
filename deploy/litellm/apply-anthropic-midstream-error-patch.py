@@ -15,6 +15,9 @@ MODULE_PATH = Path(
 RESPONSES_MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py"
 )
+ANTHROPIC_ADAPTER_MODULE_PATH = Path(
+    "litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py"
+)
 TOKEN_COUNTER_MODULE_PATH = Path("litellm/litellm_core_utils/token_counter.py")
 PROXY_SERVER_MODULE_PATH = Path("litellm/proxy/proxy_server.py")
 ANTHROPIC_ENDPOINTS_MODULE_PATH = Path("litellm/proxy/anthropic_endpoints/endpoints.py")
@@ -874,6 +877,36 @@ ANTHROPIC_ENDPOINTS_CALL_PATCH = '''        token_response = await internal_toke
         )
 '''
 
+ANTHROPIC_ADAPTER_TOOL_ERROR_MARKER = "tool_result_error_by_id: Dict[str, bool]"
+ANTHROPIC_ADAPTER_TOOL_ERROR_STATE_ANCHOR = '''            tool_message_list: List[ChatCompletionToolMessage] = []
+            new_user_content_list: List[Union[ChatCompletionTextObject, ChatCompletionImageObject]] = []
+'''
+ANTHROPIC_ADAPTER_TOOL_ERROR_STATE_PATCH = '''            tool_message_list: List[ChatCompletionToolMessage] = []
+            tool_result_error_by_id: Dict[str, bool] = {}
+            new_user_content_list: List[Union[ChatCompletionTextObject, ChatCompletionImageObject]] = []
+'''
+ANTHROPIC_ADAPTER_TOOL_ERROR_CAPTURE_ANCHOR = '''                        elif content.get("type") == "tool_result":
+                            if "content" not in content:
+'''
+ANTHROPIC_ADAPTER_TOOL_ERROR_CAPTURE_PATCH = '''                        elif content.get("type") == "tool_result":
+                            tool_use_id = str(content.get("tool_use_id", ""))
+                            is_error = content.get("is_error")
+                            if isinstance(is_error, bool):
+                                tool_result_error_by_id[tool_use_id] = is_error
+
+                            if "content" not in content:
+'''
+ANTHROPIC_ADAPTER_TOOL_ERROR_FORWARD_ANCHOR = '''            if len(tool_message_list) > 0:
+                new_messages.extend(tool_message_list)
+'''
+ANTHROPIC_ADAPTER_TOOL_ERROR_FORWARD_PATCH = '''            if len(tool_message_list) > 0:
+                for tool_message in tool_message_list:
+                    tool_call_id = str(tool_message.get("tool_call_id", ""))
+                    if tool_call_id in tool_result_error_by_id:
+                        cast(Dict[str, Any], tool_message)["is_error"] = tool_result_error_by_id[tool_call_id]
+                new_messages.extend(tool_message_list)
+'''
+
 
 def replace_exact(source: str, old: str, new: str, description: str) -> str:
     occurrences = source.count(old)
@@ -1081,6 +1114,35 @@ def patch_anthropic_endpoints_source(source: str) -> str:
     return patched
 
 
+def patch_anthropic_adapter_source(source: str) -> str:
+    if ANTHROPIC_ADAPTER_TOOL_ERROR_MARKER in source:
+        raise RuntimeError(
+            "LiteLLM already contains the Anthropic tool-result error bridge patch; "
+            "review the base image before removing this build patch."
+        )
+
+    patched = replace_exact(
+        source,
+        ANTHROPIC_ADAPTER_TOOL_ERROR_STATE_ANCHOR,
+        ANTHROPIC_ADAPTER_TOOL_ERROR_STATE_PATCH,
+        "Anthropic adapter tool-result error state anchor",
+    )
+    patched = replace_exact(
+        patched,
+        ANTHROPIC_ADAPTER_TOOL_ERROR_CAPTURE_ANCHOR,
+        ANTHROPIC_ADAPTER_TOOL_ERROR_CAPTURE_PATCH,
+        "Anthropic adapter tool-result error capture anchor",
+    )
+    patched = replace_exact(
+        patched,
+        ANTHROPIC_ADAPTER_TOOL_ERROR_FORWARD_ANCHOR,
+        ANTHROPIC_ADAPTER_TOOL_ERROR_FORWARD_PATCH,
+        "Anthropic adapter tool-result error forward anchor",
+    )
+    compile(patched, str(ANTHROPIC_ADAPTER_MODULE_PATH), "exec")
+    return patched
+
+
 def resolve_installed_target(relative_path: Path) -> Path:
     candidates = [Path(root) / relative_path for root in site.getsitepackages()]
     existing = [candidate for candidate in candidates if candidate.is_file()]
@@ -1101,6 +1163,7 @@ def resolve_targets() -> list[Path]:
     return [
         resolve_installed_target(MODULE_PATH),
         resolve_installed_target(RESPONSES_MODULE_PATH),
+        resolve_installed_target(ANTHROPIC_ADAPTER_MODULE_PATH),
         resolve_installed_target(TOKEN_COUNTER_MODULE_PATH),
         resolve_installed_target(PROXY_SERVER_MODULE_PATH),
         resolve_installed_target(ANTHROPIC_ENDPOINTS_MODULE_PATH),
@@ -1113,6 +1176,8 @@ def main() -> None:
         target_path = target.as_posix()
         if target_path.endswith(RESPONSES_MODULE_PATH.as_posix()):
             patched = patch_responses_source(source)
+        elif target_path.endswith(ANTHROPIC_ADAPTER_MODULE_PATH.as_posix()):
+            patched = patch_anthropic_adapter_source(source)
         elif target_path.endswith(TOKEN_COUNTER_MODULE_PATH.as_posix()):
             patched = patch_token_counter_source(source)
         elif target_path.endswith(PROXY_SERVER_MODULE_PATH.as_posix()):

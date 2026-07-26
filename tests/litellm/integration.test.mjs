@@ -71,6 +71,9 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /RESPONSES_MODULE_PATH/)
   assert.match(patcher, /responses_adapters/)
   assert.match(patcher, /RESPONSES_PATCHED_WRAPPER/)
+  assert.match(patcher, /ANTHROPIC_ADAPTER_MODULE_PATH/)
+  assert.match(patcher, /tool_result_error_by_id/)
+  assert.match(patcher, /\["is_error"\] = tool_result_error_by_id/)
   assert.match(patcher, /TOKEN_COUNTER_MODULE_PATH/)
   assert.match(patcher, /PROXY_SERVER_MODULE_PATH/)
   assert.match(patcher, /ANTHROPIC_ENDPOINTS_MODULE_PATH/)
@@ -1080,6 +1083,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
               type: 'tool_result',
               tool_use_id: toolUseId,
               content: 'Sunny, 25 C',
+              is_error: true,
             }],
           },
         ],
@@ -1115,6 +1119,58 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.ok(toolMessage, JSON.stringify(call.body.messages))
     assert.equal(toolMessage.tool_call_id, toolUseId)
     assert.equal(toolMessage.content, 'Sunny, 25 C')
+    assert.equal(toolMessage.is_error, true)
+  })
+
+  await t.test('preserves explicit Anthropic tool_result is_error booleans without inventing a default', async () => {
+    for (const isError of [true, false, undefined]) {
+      const toolUseId = `call_offline_error_state_${String(isError)}`
+      const toolResult = {
+        type: 'tool_result',
+        tool_use_id: toolUseId,
+        content: `tool result state ${String(isError)}`,
+        ...(isError === undefined ? {} : { is_error: isError }),
+      }
+      const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: anthropicHeaders(),
+        body: JSON.stringify(anthropicRequest({
+          messages: [
+            { role: 'user', content: 'Exercise the declared tool.' },
+            {
+              role: 'assistant',
+              content: [{
+                type: 'tool_use',
+                id: toolUseId,
+                name: 'get_weather',
+                input: { city: 'Shanghai' },
+              }],
+            },
+            { role: 'user', content: [toolResult] },
+          ],
+          tools: [{
+            name: 'get_weather',
+            description: 'Get the current weather for a city.',
+            input_schema: {
+              type: 'object',
+              properties: { city: { type: 'string' } },
+              required: ['city'],
+            },
+          }],
+        })),
+      })
+
+      assert.equal(result.response.status, 200, result.text)
+      const toolMessage = mock.calls.at(-1)?.body?.messages?.find((message) =>
+        message.role === 'tool' && message.tool_call_id === toolUseId
+      )
+      assert.ok(toolMessage, JSON.stringify(mock.calls.at(-1)?.body?.messages))
+      if (isError === undefined) {
+        assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
+      } else {
+        assert.equal(toolMessage.is_error, isError)
+      }
+    }
   })
 
   await t.test('counts Anthropic text, system, and tools locally without an upstream probe', async () => {

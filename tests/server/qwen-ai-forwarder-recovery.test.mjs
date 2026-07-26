@@ -33,7 +33,7 @@ function loadRequestForwarder(overrides = {}) {
     './status': { proxyStatusManager: {} },
     '../store/store': {
       storeManager: {
-        getConfig: () => ({
+        getConfig: () => overrides.storeConfig || ({
           retryCount: 3,
           contextManagement: { enabled: false },
           toolCallingConfig: {},
@@ -95,7 +95,14 @@ function loadRequestForwarder(overrides = {}) {
       sessionManager: { shouldDeleteAfterChat: () => true },
     },
     './services/contextManagementService': {
-      createContextManagementService: () => ({ process: async messages => ({ messages }) }),
+      createContextManagementService: () => ({
+        process: overrides.processContextMessages || (async messages => ({
+          messages,
+          originalCount: messages.length,
+          finalCount: messages.length,
+          strategyResults: [],
+        })),
+      }),
     },
   }
 
@@ -136,6 +143,67 @@ function createHarness(results) {
 
   return { attempts, execute }
 }
+
+test('context management preserves tool metadata while rebuilding a trimmed request', async () => {
+  let forwardedRequest
+  const RequestForwarder = loadRequestForwarder({
+    storeConfig: {
+      retryCount: 0,
+      contextManagement: { enabled: true },
+      toolCallingConfig: {},
+    },
+    processContextMessages: async messages => ({
+      messages: messages.slice(-3),
+      originalCount: messages.length,
+      finalCount: 3,
+      strategyResults: [],
+    }),
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.doForward = async request => {
+    forwardedRequest = request
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const request = {
+    model: 'model-1',
+    messages: [
+      { role: 'user', content: 'old context' },
+      {
+        role: 'assistant',
+        content: null,
+        name: 'assistant-name',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'write_file', arguments: '{"path":"a.png"}' },
+        }],
+      },
+      {
+        role: 'tool',
+        content: 'download failed',
+        tool_call_id: 'call_1',
+        is_error: true,
+        name: 'write_file',
+      },
+      { role: 'user', content: 'continue' },
+    ],
+  }
+  const originalMessages = structuredClone(request.messages)
+
+  const result = await forwarder.forwardChatCompletion(
+    request,
+    { id: 'account-1' },
+    { id: 'provider-1', apiEndpoint: 'https://provider.invalid' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.deepEqual(request.messages, originalMessages)
+  assert.notEqual(forwardedRequest.messages[0], request.messages[1])
+  assert.deepEqual(forwardedRequest.messages, originalMessages.slice(-3))
+})
 
 test('managed-tool buffered stream validation failure recovers once before bytes are committed', async () => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS

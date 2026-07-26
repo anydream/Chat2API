@@ -97,6 +97,8 @@ test('OpenAI tools plus DeepSeek choose managed prompt', () => {
   assert.equal(result.tools, undefined)
   assert.equal(result.plan.tools.length, 4)
   assert.match(result.messages[0].content as string, /<\|CHAT2API\|tool_calls>/)
+  assert.match(result.messages[0].content as string, /client-declared managed tool set/)
+  assert.match(result.messages[0].content as string, /undeclared provider-side tools or capabilities/)
   assert.match(result.messages[0].content as string, /Every required field must appear as its own/)
   assert.match(result.messages[0].content as string, /repeat the parameter tag once per argument/)
   assert.match(result.messages[0].content as string, /Required-parameter XML templates/)
@@ -150,6 +152,117 @@ test('tool result history receives a generic continuation without mutating the r
   assert.equal(result.messages.at(-1)?.role, 'user')
   assert.match(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
   assert.doesNotMatch(String(result.messages.at(-1)?.content), /image2-p|Skill/)
+})
+
+test('failed tool result state is preserved in the plan and continuation prompt', () => {
+  const messages = [
+    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }] },
+    {
+      role: 'tool' as const,
+      tool_call_id: 'call_1',
+      content: 'the operation failed',
+      is_error: true,
+    },
+  ]
+
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ messages }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.equal(result.plan.failedToolResultPending, true)
+  assert.equal(result.plan.diagnostics.failedToolResultPending, true)
+  assert.match(String(result.messages.at(-1)?.content), /previous tool result reported failure/)
+  assert.match(String(result.messages.at(-1)?.content), /appropriate declared tool/)
+  assert.match(String(result.messages.at(-1)?.content), /undeclared provider-side tools or capabilities/)
+})
+
+test('any failed result in the latest parallel tool-result batch keeps failure pending', () => {
+  const messages = [
+    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }, {
+      id: 'call_2',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/b"}' },
+    }] },
+    { role: 'tool' as const, tool_call_id: 'call_1', content: 'success', is_error: false },
+    { role: 'tool' as const, tool_call_id: 'call_2', content: 'failed', is_error: true },
+  ]
+
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ messages }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.equal(result.plan.failedToolResultPending, true)
+  assert.equal(result.plan.diagnostics.failedToolResultPending, true)
+  assert.match(String(result.messages.at(-1)?.content), /previous tool result reported failure/)
+})
+
+test('false and absent error flags do not mark a parallel tool-result batch as failed', () => {
+  const messages = [
+    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }, {
+      id: 'call_2',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/b"}' },
+    }] },
+    { role: 'tool' as const, tool_call_id: 'call_1', content: 'success', is_error: false },
+    { role: 'tool' as const, tool_call_id: 'call_2', content: 'legacy success' },
+  ]
+
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ messages }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.equal(result.plan.failedToolResultPending, false)
+  assert.equal(result.plan.diagnostics.failedToolResultPending, false)
+  assert.doesNotMatch(String(result.messages.at(-1)?.content), /previous tool result reported failure/)
+})
+
+test('a later successful tool-result batch clears pending failure state', () => {
+  const messages = [
+    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_1',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }] },
+    { role: 'tool' as const, tool_call_id: 'call_1', content: 'failed', is_error: true },
+    { role: 'assistant' as const, content: null, tool_calls: [{
+      id: 'call_2',
+      type: 'function' as const,
+      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+    }] },
+    { role: 'tool' as const, tool_call_id: 'call_2', content: 'success', is_error: false },
+  ]
+
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ messages }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.equal(result.plan.failedToolResultPending, false)
+  assert.equal(result.plan.diagnostics.failedToolResultPending, false)
+  assert.doesNotMatch(String(result.messages.at(-1)?.content), /previous tool result reported failure/)
 })
 
 test('a user retry after a progress-only tool turn receives the same generic continuation', () => {

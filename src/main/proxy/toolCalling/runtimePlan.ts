@@ -44,6 +44,7 @@ export function buildToolCallingRuntimePlan(input: {
     toolChoiceMode: input.clientRequest.toolChoice.mode,
     allowedToolNames,
     workflowContinuation: false,
+    failedToolResultPending: false,
     forcedToolName: forcedName,
     diagnostics: {
       requestId: input.requestId,
@@ -61,6 +62,7 @@ export function buildToolCallingRuntimePlan(input: {
       forcedToolName: forcedName,
       allowedToolNames: [...allowedToolNames],
       workflowContinuation: false,
+      failedToolResultPending: false,
     },
   }
 }

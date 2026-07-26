@@ -16,6 +16,7 @@ function plan(toolChoiceMode: ToolCallingPlan['toolChoiceMode']): ToolCallingPla
     toolChoiceMode,
     allowedToolNames: new Set(['workspace:read_file']),
     workflowContinuation: false,
+    failedToolResultPending: false,
     diagnostics: {
       clientAdapterId: 'standard-openai-tools',
       providerId: 'qwen-ai',
@@ -26,6 +27,7 @@ function plan(toolChoiceMode: ToolCallingPlan['toolChoiceMode']): ToolCallingPla
       injected: true,
       reason: 'test',
       workflowContinuation: false,
+      failedToolResultPending: false,
     },
   }
 }

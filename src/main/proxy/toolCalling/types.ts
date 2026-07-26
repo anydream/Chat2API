@@ -54,6 +54,7 @@ export interface ToolCallDiagnostics {
   forcedToolName?: string
   allowedToolNames?: string[]
   workflowContinuation: boolean
+  failedToolResultPending: boolean
 }
 
 export interface ToolCallingPlan {
@@ -67,6 +68,7 @@ export interface ToolCallingPlan {
   toolChoiceMode: 'auto' | 'none' | 'required' | 'forced'
   allowedToolNames: Set<string>
   workflowContinuation: boolean
+  failedToolResultPending: boolean
   forcedToolName?: string
   diagnostics: ToolCallDiagnostics
 }

@@ -35,12 +35,19 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
 
 export function createToolWorkflowContinuationMessage(options: {
   failedToolResultPending?: boolean
+  plan?: Pick<ToolCallingPlan, 'protocol' | 'tools'>
 } = {}): ChatMessage {
+  const recoveryPrompt = options.failedToolResultPending && options.plan
+    ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(options.plan.tools)
+    : undefined
+
   return {
     role: 'user',
-    content: options.failedToolResultPending
-      ? `${TOOL_WORKFLOW_CONTINUATION_PROMPT} ${FAILED_TOOL_RESULT_CONTINUATION_PROMPT}`
-      : TOOL_WORKFLOW_CONTINUATION_PROMPT,
+    content: [
+      TOOL_WORKFLOW_CONTINUATION_PROMPT,
+      options.failedToolResultPending ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT : undefined,
+      recoveryPrompt,
+    ].filter((part): part is string => Boolean(part)).join('\n\n'),
   }
 }
 
@@ -78,7 +85,7 @@ export class ToolCallingEngine {
     const shouldInjectPrompt = plan.shouldInjectPrompt
     const failedToolResultPending = hasUnresolvedFailedToolResult(request.messages)
     const workflow = shouldInjectPrompt
-      ? appendToolWorkflowContinuation(request.messages, failedToolResultPending)
+      ? appendToolWorkflowContinuation(request.messages, failedToolResultPending, plan)
       : { messages: request.messages, appended: false }
     const planWithWorkflow = withWorkflowState(plan, {
       workflowContinuation: workflow.appended,
@@ -157,6 +164,7 @@ export class ToolCallingEngine {
 function appendToolWorkflowContinuation(
   messages: ChatMessage[],
   failedToolResultPending: boolean,
+  plan: ToolCallingPlan,
 ): { messages: ChatMessage[]; appended: boolean } {
   const lastMessage = messages.at(-1)
   if (!lastMessage) return { messages, appended: false }
@@ -182,7 +190,7 @@ function appendToolWorkflowContinuation(
   return {
     messages: [
       ...messages,
-      createToolWorkflowContinuationMessage({ failedToolResultPending }),
+      createToolWorkflowContinuationMessage({ failedToolResultPending, plan }),
     ],
     appended: true,
   }

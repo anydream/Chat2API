@@ -548,6 +548,22 @@ export class QwenAiRequestGovernor {
       return result
     }
 
+    // Qwen can keep a completed response branch busy for a short period after
+    // the adapter has exhausted its same-payload continuation wait. This is
+    // account-neutral (the credentials are fine), but immediately selecting
+    // the account again reproduces the provider admission rejection. Apply a
+    // deployment-level cooldown without classifying the account as faulty.
+    if (result.errorCode?.toUpperCase() === 'CHAT_IN_PROGRESS') {
+      const config = this.getConfig()
+      const retryAfterMs = parseQwenAiRetryAfterMs(result.headers)
+      const cooldownMs = Math.max(config.accountMinIntervalMs, retryAfterMs ?? 0)
+      if (cooldownMs > 0) {
+        this.openCooldown(accountId, cooldownMs, 'qwen_ai_chat_in_progress')
+        return withRetryAfterHeader(result, cooldownMs)
+      }
+      return result
+    }
+
     if (result.accountFault === false) {
       return result
     }

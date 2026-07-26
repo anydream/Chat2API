@@ -73,6 +73,18 @@ Tool results will be provided as Chat2API XML result blocks:
 <|CHAT2API|tool_result tool_call_id="call_id"><![CDATA[result]]></|CHAT2API|tool_result>`
   },
 
+  renderRecoveryPrompt(tools) {
+    return `Your entire next response must be one managed tool-call XML block, with no reasoning, status update, plan, promise, or prose before or after it.
+Choose the appropriate tool from the client-declared list and include every required field from its schema.
+Declared tool names: ${tools.map(tool => tool.name).join(', ')}.
+
+${renderRequiredParameterTemplates(tools)}
+Exact syntax:
+<|CHAT2API|tool_calls><|CHAT2API|invoke name="exact_declared_tool_name"><|CHAT2API|parameter name="required_field"><![CDATA[replace with the actual argument value]]></|CHAT2API|parameter></|CHAT2API|invoke></|CHAT2API|tool_calls>
+
+Replace every placeholder with the actual tool name, field name, and argument value. For a tool with no required fields, omit parameter entries unless the tool schema accepts optional arguments.`
+  },
+
   detectStart(buffer) {
     return detectMarkers(buffer, [CHAT2API_START, XML_START, LOOSE_XML_START, QCML_START])
   },

@@ -32,7 +32,10 @@ services:
       CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1}
       # A busy-chat admission response retries the exact same continuation
       # payload; it never creates another user turn or switches accounts.
-      CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS:-5}
+      # Leave attempts blank by default so QWEN_AI_REQUEST_TIMEOUT_MS supplies
+      # the total deadline. Set a positive value for an explicit deployment cap,
+      # or 0 to disable busy-chat recovery.
+      CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS-}
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:-1000}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.

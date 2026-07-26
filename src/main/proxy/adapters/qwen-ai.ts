@@ -51,9 +51,9 @@ const QWEN_AI_DEBUG_PAYLOAD_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_PAYLOADS =
 const QWEN_AI_DEBUG_STREAM_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_STREAM === 'true'
 const QWEN_AI_DEBUG_REQUEST_LOGS = process.env.CHAT2API_QWEN_AI_DEBUG_REQUEST === 'true'
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS = 60_000
-const QWEN_AI_CHAT_IN_PROGRESS_MAX_RETRY_ATTEMPTS = 5
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS = 5
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS = 1_000
+const QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS = 1_000
 
 export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
@@ -202,9 +202,23 @@ export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
  * not new turns. Keep the budget configurable and bounded so an upstream
  * queue cannot hold a client request forever.
  */
-export function qwenAiChatInProgressRetryAttemptsFromEnv(): number {
+export function qwenAiChatInProgressRetryModeFromEnv(): 'attempts' | 'deadline' {
+  const explicitMode = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_MODE?.trim().toLowerCase()
+  if (explicitMode === 'deadline') return 'deadline'
+  if (explicitMode === 'attempts') return 'attempts'
+
+  // An omitted/blank attempts value is the deployment's opt-in to deadline
+  // mode. A non-blank value keeps the legacy explicit-attempt policy. This
+  // makes the default configurable without tying behavior to any client.
+  const rawAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  return rawAttempts === undefined || rawAttempts.trim() === '' ? 'deadline' : 'attempts'
+}
+
+export function qwenAiChatInProgressRetryAttemptsFromEnv(): number | undefined {
+  if (qwenAiChatInProgressRetryModeFromEnv() === 'deadline') return undefined
+
   return Math.min(
-    QWEN_AI_CHAT_IN_PROGRESS_MAX_RETRY_ATTEMPTS,
+    QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS,
     nonNegativeIntegerFromEnv(
       'CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS',
       QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_ATTEMPTS,
@@ -223,17 +237,21 @@ export function qwenAiChatInProgressRetryDelayMsFromEnv(): number {
 }
 
 /**
- * Return the maximum time spent sleeping between busy-chat attempts for the
- * current deployment settings. This excludes network request time, which is
- * bounded separately by QWEN_AI_REQUEST_TIMEOUT_MS.
+ * Return the effective busy-chat retry window for the current deployment.
+ * Deadline mode is bounded by QWEN_AI_REQUEST_TIMEOUT_MS; an explicit attempt
+ * cap reports the corresponding backoff budget (also bounded by that timeout).
  */
 export function qwenAiChatInProgressRetryBudgetMsFromEnv(): number {
   const attempts = qwenAiChatInProgressRetryAttemptsFromEnv()
+  if (attempts === undefined) {
+    return QWEN_AI_REQUEST_TIMEOUT_MS
+  }
+
   const baseDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
   return Array.from({ length: attempts }, (_, index) => Math.min(
     QWEN_AI_CHAT_IN_PROGRESS_MAX_DELAY_MS,
     baseDelayMs * (2 ** index),
-  )).reduce((total, delayMs) => total + delayMs, 0)
+  )).reduce((total, delayMs) => Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, total + delayMs), 0)
 }
 
 /**
@@ -2277,27 +2295,45 @@ export class QwenAiAdapter {
       }
     }
 
+    const maxChatInProgressRetries = qwenAiChatInProgressRetryAttemptsFromEnv()
+    const configuredRetryDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
+    // The default delay is one second. An explicit zero remains available for
+    // deployments that want immediate polling; the deadline still bounds the
+    // total work and prevents an unbounded wait.
+    const baseRetryDelayMs = configuredRetryDelayMs
+    const continuationDeadline = Date.now() + QWEN_AI_REQUEST_TIMEOUT_MS
+    let chatInProgressRetries = 0
+    let lastChatInProgressError: QwenAiUpstreamError | undefined
+
     const createContinuationOptions = () => ({
       headers: {
         ...this.getHeaders(chatId),
         'x-accel-buffering': 'no',
       },
       responseType: 'stream',
-      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      // Every admission attempt gets only the remaining continuation budget.
+      // This prevents a fresh Axios timeout from extending the overall wait
+      // past the request deadline after repeated busy-chat responses.
+      timeout: Math.max(1, continuationDeadline - Date.now()),
       signal: request.signal,
       validateStatus: () => true,
     })
 
-    const maxChatInProgressRetries = qwenAiChatInProgressRetryAttemptsFromEnv()
-    const baseRetryDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
-    const continuationDeadline = Date.now() + QWEN_AI_REQUEST_TIMEOUT_MS
-    let chatInProgressRetries = 0
-    let lastChatInProgressError: QwenAiUpstreamError | undefined
-
-    const createBusyContinuationExhaustedError = (validationError?: Error): QwenAiUpstreamError => {
+    const createBusyContinuationExhaustedError = (
+      validationError?: Error,
+      retryAfterMs = baseRetryDelayMs,
+    ): QwenAiUpstreamError => {
       const exhausted = (validationError || new Error('Qwen AI chat is still in progress')) as QwenAiUpstreamError
       exhausted.retryable = false
       exhausted.accountFault = false
+      const hasRetryAfter = Object.keys(exhausted.headers || {})
+        .some(key => key.toLowerCase() === 'retry-after')
+      if (!hasRetryAfter) {
+        exhausted.headers = {
+          ...(exhausted.headers || {}),
+          'Retry-After': String(Math.max(1, Math.ceil(Math.max(1_000, retryAfterMs) / 1_000))),
+        }
+      }
       return exhausted
     }
 
@@ -2330,7 +2366,10 @@ export class QwenAiAdapter {
         throw createQwenAiContinuationAbortError()
       }
 
-      if (chatInProgressRetries >= maxChatInProgressRetries) {
+      if (
+        maxChatInProgressRetries !== undefined
+        && chatInProgressRetries >= maxChatInProgressRetries
+      ) {
         throw createBusyContinuationExhaustedError(validation.error)
       }
 
@@ -2341,7 +2380,7 @@ export class QwenAiAdapter {
       )
       const remainingBudgetMs = Math.max(0, continuationDeadline - Date.now())
       if (remainingBudgetMs <= 0) {
-        throw createBusyContinuationExhaustedError(lastChatInProgressError)
+        throw createBusyContinuationExhaustedError(lastChatInProgressError, configuredDelayMs)
       }
       const delayMs = Math.min(configuredDelayMs, remainingBudgetMs)
       console.warn('[QwenAI] Workflow continuation was rejected because the chat is still in progress; waiting before retry', JSON.stringify({

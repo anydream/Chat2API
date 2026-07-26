@@ -2735,33 +2735,91 @@ test('Qwen AI retries a rejected workflow continuation with the same payload', a
   }
 })
 
-test('Qwen AI default busy-chat retry budget covers 31 seconds and remains bounded', () => {
+test('Qwen AI deadline mode continues past the legacy five-attempt budget', async () => {
   const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
   const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+  const previousRequestTimeout = process.env.QWEN_AI_REQUEST_TIMEOUT_MS
+  delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '0'
+  process.env.QWEN_AI_REQUEST_TIMEOUT_MS = '5000'
+
+  const calls = []
+  let accepted
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler()
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.postWithRefreshRetry = async (url, payload, createOptions) => {
+      calls.push({ url, payload, options: createOptions() })
+      if (calls.length <= 6) {
+        const busy = new PassThrough()
+        busy.end(JSON.stringify({
+          code: 'CHAT_IN_PROGRESS',
+          message: 'The chat is in progress!',
+        }))
+        return { status: 200, headers: { 'content-type': 'application/json' }, data: busy }
+      }
+      accepted = new PassThrough()
+      accepted.end('data: {"response.created":{"response_id":"accepted-response"}}\n\n')
+      return { status: 200, headers: { 'content-type': 'text/event-stream' }, data: accepted }
+    }
+
+    const response = await adapter.continueChatCompletion({
+      chatId: 'chat-busy',
+      parentId: 'parent-response',
+      model: 'qwen3.8-max-preview',
+      content: 'continue the workflow',
+    })
+
+    assert.equal(response.data, accepted)
+    assert.equal(calls.length, 7)
+    assert.ok(calls[0].options.timeout > calls.at(-1).options.timeout)
+    assert.equal(calls[0].payload.messages[0].fid, calls.at(-1).payload.messages[0].fid)
+  } finally {
+    if (previousAttempts === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = previousAttempts
+    if (previousDelay === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
+    if (previousRequestTimeout === undefined) delete process.env.QWEN_AI_REQUEST_TIMEOUT_MS
+    else process.env.QWEN_AI_REQUEST_TIMEOUT_MS = previousRequestTimeout
+    accepted?.destroy()
+  }
+})
+
+test('Qwen AI deadline-mode busy-chat retry budget follows the request timeout', () => {
+  const previousAttempts = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
+  const previousDelay = process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+  const previousRequestTimeout = process.env.QWEN_AI_REQUEST_TIMEOUT_MS
 
   try {
     delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
     delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
+    process.env.QWEN_AI_REQUEST_TIMEOUT_MS = '120000'
     const {
       qwenAiChatInProgressRetryAttemptsFromEnv,
       qwenAiChatInProgressRetryDelayMsFromEnv,
       qwenAiChatInProgressRetryBudgetMsFromEnv,
     } = loadQwenAiStreamHandler()
 
-    assert.equal(qwenAiChatInProgressRetryAttemptsFromEnv(), 5)
+    assert.equal(qwenAiChatInProgressRetryAttemptsFromEnv(), undefined)
     assert.equal(qwenAiChatInProgressRetryDelayMsFromEnv(), 1_000)
-    assert.equal(qwenAiChatInProgressRetryBudgetMsFromEnv(), 31_000)
+    assert.equal(qwenAiChatInProgressRetryBudgetMsFromEnv(), 120_000)
 
     process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = '999'
     process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = '999999'
-    assert.equal(qwenAiChatInProgressRetryAttemptsFromEnv(), 5)
+    assert.equal(qwenAiChatInProgressRetryAttemptsFromEnv(), 999)
     assert.equal(qwenAiChatInProgressRetryDelayMsFromEnv(), 60_000)
-    assert.equal(qwenAiChatInProgressRetryBudgetMsFromEnv(), 300_000)
+    assert.equal(qwenAiChatInProgressRetryBudgetMsFromEnv(), 120_000)
   } finally {
     if (previousAttempts === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS
     else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS = previousAttempts
     if (previousDelay === undefined) delete process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS
     else process.env.CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS = previousDelay
+    if (previousRequestTimeout === undefined) delete process.env.QWEN_AI_REQUEST_TIMEOUT_MS
+    else process.env.QWEN_AI_REQUEST_TIMEOUT_MS = previousRequestTimeout
   }
 })
 

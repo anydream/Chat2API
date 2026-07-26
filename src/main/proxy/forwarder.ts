@@ -1313,6 +1313,7 @@ export class RequestForwarder {
       const workflowContinuationMessage = canContinueManagedWorkflow
         ? createToolWorkflowContinuationMessage({
             failedToolResultPending: transformed.plan.failedToolResultPending,
+            plan: transformed.plan,
           })
         : undefined
       const workflowContinuationContent = typeof workflowContinuationMessage?.content === 'string'

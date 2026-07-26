@@ -5,6 +5,9 @@ import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import {
+  createToolWorkflowContinuationMessage as createRealToolWorkflowContinuationMessage,
+} from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 
@@ -617,6 +620,167 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
   output.destroy()
   initialUpstream.destroy()
   continuedUpstream.destroy()
+})
+
+test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat with full context', async () => {
+  const output = new PassThrough()
+  const initialUpstream = new PassThrough()
+  const restartedUpstream = new PassThrough()
+  const chatCalls = []
+  const deleteCalls = []
+  const bridgeOptions = []
+  const plan = {
+    protocol: 'managed_xml',
+    tools: [{
+      name: 'lookup',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+      source: 'openai',
+    }],
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['lookup']),
+    workflowContinuation: true,
+    failedToolResultPending: false,
+  }
+  const originallyInjectedContinuation = createRealToolWorkflowContinuationMessage({
+    failedToolResultPending: false,
+    plan,
+  })
+  const schemaDerivedRecovery = createRealToolWorkflowContinuationMessage({
+    failedToolResultPending: false,
+    requireManagedToolCall: true,
+    plan,
+  })
+  assert.notEqual(
+    originallyInjectedContinuation.content,
+    schemaDerivedRecovery.content,
+    'managed XML recovery must exercise the stricter prompt used by the forwarder',
+  )
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion(request) {
+      chatCalls.push(request)
+      const isRestart = chatCalls.length > 1
+      return {
+        response: {
+          status: 200,
+          data: isRestart ? restartedUpstream : initialUpstream,
+          headers: {},
+        },
+        chatId: isRestart ? 'fresh-recovery-chat' : 'initial-chat',
+        parentId: null,
+      }
+    }
+
+    async continueChatCompletion() {
+      throw new Error('semantic-empty workflow recovery must not use the busy chat')
+    }
+
+    async deleteChat(chatId) {
+      deleteCalls.push(chatId)
+      return true
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    getResponseId() { return 'semantic-empty-response' }
+    isComplete() { return false }
+    prepareForWorkflowContinuation() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter,
+    QwenAiStreamHandler,
+    createQwenAiResumableStream: (stream, options) => {
+      bridgeOptions.push(options)
+      return stream
+    },
+    createToolWorkflowContinuationMessage: createRealToolWorkflowContinuationMessage,
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: [
+      ...request.messages,
+      originallyInjectedContinuation,
+    ],
+    plan,
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    {
+      model: 'model-1',
+      messages: [
+        { role: 'user', content: 'create the requested artifact' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'inspect-call',
+            type: 'function',
+            function: { name: 'lookup', arguments: '{}' },
+          }],
+        },
+        { role: 'tool', tool_call_id: 'inspect-call', content: 'folder inspected' },
+      ],
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+
+  output.write('data: {"choices":[{"delta":{"content":""}}]}\n\n')
+  const result = await resultPromise
+  assert.equal(result.success, true)
+  assert.equal(chatCalls.length, 1)
+  assert.equal(bridgeOptions.length, 1)
+
+  const recoveryError = Object.assign(new Error('reasoning ended without a tool call'), {
+    code: 'qwen_ai_semantic_empty',
+  })
+  const restarted = await bridgeOptions[0].continueWorkflow('semantic-empty-response', recoveryError)
+  assert.equal(restarted.data, restartedUpstream)
+  assert.equal(chatCalls.length, 2)
+  assert.deepEqual(chatCalls[1].messages, [
+    {
+      role: 'user',
+      content: 'create the requested artifact',
+    },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'inspect-call',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{}' },
+      }],
+    },
+    { role: 'tool', tool_call_id: 'inspect-call', content: 'folder inspected' },
+    schemaDerivedRecovery,
+  ])
+  assert.equal(
+    chatCalls[1].messages.some(
+      message => message.content === originallyInjectedContinuation.content,
+    ),
+    false,
+    'fresh-chat replay must remove the superseded continuation prompt',
+  )
+
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(deleteCalls, ['initial-chat'])
+  output.destroy()
+  initialUpstream.destroy()
+  restartedUpstream.destroy()
 })
 
 test('Qwen AI preflight releases a quiet stream after the configured hold', async () => {

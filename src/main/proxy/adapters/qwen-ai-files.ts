@@ -1,4 +1,5 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'fs'
+import { createHash } from 'crypto'
 import axios, { type AxiosInstance, type AxiosResponse } from 'axios'
 import OSS from 'ali-oss'
 import mime from 'mime-types'
@@ -25,6 +26,27 @@ const DOCUMENT_EVIDENCE_MAX_TOTAL_CHARS = positiveIntegerFromEnv('QWEN_AI_DOCUME
 const DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS', 12000)
 const DOCUMENT_EVIDENCE_MAX_CANDIDATES = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_CANDIDATES', 256)
 const DOCUMENT_EVIDENCE_SNIPPET_CHARS = 1600
+
+// Qwen receives the complete conversation as one user prompt. Keep the
+// provider request below common gateway body limits while retaining the active
+// workflow. Deployments can tune these values for a different upstream limit.
+const QWEN_AI_TRANSCRIPT_MAX_BYTES = positiveIntegerFromEnv(
+  'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
+  512 * 1024,
+)
+const QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = positiveIntegerFromEnv(
+  'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
+  24 * 1024,
+)
+const QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = positiveIntegerFromEnv(
+  'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
+  128 * 1024,
+)
+const QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS = positiveIntegerFromEnv(
+  'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS',
+  32,
+)
+const QWEN_AI_TRANSCRIPT_OMISSION_MARKER = '[Earlier conversation omitted to fit the provider context budget.]'
 
 export const QWEN_AI_DOCUMENT_EVIDENCE_MARKER = '[Attached document evidence]'
 
@@ -975,6 +997,102 @@ function collectFileParts(content: ChatMessage['content']): ChatMessageContent[]
   return content.filter(part => ['image_url', 'file', 'input_audio', 'video_url'].includes(part.type))
 }
 
+type QwenNestedToolResult = {
+  toolCallId?: string
+  content: string
+  isError: boolean
+}
+
+function textFromUnknownContent(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+
+  return value
+    .filter(part => qwenContentPartType(part) === 'text' && isObjectRecord(part) && typeof part.text === 'string')
+    .map(part => (part as { text: string }).text)
+    .join('')
+}
+
+function boundUnknownToolResultContent(value: unknown, maxBytes: number): unknown {
+  if (typeof value === 'string') {
+    return truncateQwenTranscriptText(value, maxBytes)
+  }
+  if (!Array.isArray(value)) return value
+
+  let remainingBytes = Math.max(0, maxBytes)
+  return value.map(part => {
+    if (!isObjectRecord(part) || qwenContentPartType(part) !== 'text' || typeof part.text !== 'string') {
+      return part
+    }
+    const text = truncateQwenTranscriptText(part.text, remainingBytes)
+    remainingBytes = Math.max(0, remainingBytes - Buffer.byteLength(text, 'utf8'))
+    return { ...part, text }
+  })
+}
+
+function extractNestedQwenToolResults(content: ChatMessage['content']): QwenNestedToolResult[] {
+  if (!Array.isArray(content)) return []
+
+  return content
+    .filter(part => qwenContentPartType(part) === 'tool_result' && isObjectRecord(part))
+    .map(part => {
+      const record = part as unknown as Record<string, unknown>
+      const rawId = record.tool_call_id ?? record.tool_use_id
+      return {
+        toolCallId: typeof rawId === 'string' && rawId ? rawId : undefined,
+        content: textFromUnknownContent(record.content) || (typeof record.content === 'string' ? record.content : ''),
+        isError: record.is_error === true || record.isError === true,
+      }
+    })
+}
+
+function qwenFilePartIdentity(part: ChatMessageContent): string | undefined {
+  const source = part.local_path
+    || (part.type === 'input_audio'
+      ? part.input_audio?.data
+      : part.type === 'image_url'
+        ? part.image_url?.url
+        : part.type === 'file'
+          ? part.file_url?.url
+          : part.type === 'video_url'
+            ? part.video_url?.url
+            : undefined)
+  if (typeof source !== 'string' || !source) return undefined
+
+  // Avoid retaining very large data URLs as Set keys while keeping exact
+  // identity for ordinary remote/local/direct sources.
+  const sourceKey = source.length > 1024
+    ? `sha256:${createHash('sha256').update(source).digest('hex')}`
+    : source
+  return JSON.stringify([
+    part.type,
+    sourceKey,
+    part.type === 'input_audio' ? part.input_audio?.format || '' : '',
+    part.local_path || '',
+  ])
+}
+
+function limitAndDeduplicateQwenFileParts(
+  parts: ChatMessageContent[],
+  maxFileParts: number,
+): ChatMessageContent[] {
+  const limit = Math.max(1, Math.floor(maxFileParts))
+  const seen = new Set<string>()
+  const retained: ChatMessageContent[] = []
+
+  // Keep the most recent unique attachments so an old repeated file cannot
+  // consume the active request's attachment slots.
+  for (let index = parts.length - 1; index >= 0 && retained.length < limit; index -= 1) {
+    const part = parts[index]
+    const identity = qwenFilePartIdentity(part)
+    if (identity && seen.has(identity)) continue
+    if (identity) seen.add(identity)
+    retained.push(part)
+  }
+
+  return retained.reverse()
+}
+
 function formatRoleText(role: string, content: string): string {
   return content ? `${role}: ${content}` : `${role}:`
 }
@@ -995,29 +1113,631 @@ function nextLocalToolCallId(rawId: string, usedIds: Set<string>, fallbackIndex:
   return localId
 }
 
-function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
+export interface QwenAiTranscriptBudget {
+  maxBytes: number
+  toolResultMaxBytes: number
+  messageMaxBytes: number
+  maxFileParts: number
+}
+
+export function getQwenAiTranscriptBudget(): QwenAiTranscriptBudget {
+  return {
+    maxBytes: QWEN_AI_TRANSCRIPT_MAX_BYTES,
+    toolResultMaxBytes: QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES,
+    messageMaxBytes: QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES,
+    maxFileParts: QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS,
+  }
+}
+
+type IndexedQwenMessage = {
+  message: ChatMessage
+  index: number
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function qwenContentPartType(value: unknown): string | undefined {
+  if (!isObjectRecord(value) || typeof value.type !== 'string') {
+    return undefined
+  }
+  return value.type
+}
+
+/**
+ * Anthropic bridges can represent a tool result as either role=tool or a
+ * role=user content block. Treat both forms as part of the surrounding turn
+ * so trimming never separates an assistant tool call from its result.
+ */
+function isQwenToolResultMessage(message: ChatMessage): boolean {
+  if (message.role === 'tool' || Boolean(message.tool_call_id)) return true
+  if (!Array.isArray(message.content)) return false
+
+  return message.content.some(part => (
+    qwenContentPartType(part) === 'tool_result'
+  ))
+}
+
+function isQwenUserTurnMessage(message: ChatMessage): boolean {
+  return message.role === 'user' && !isQwenToolResultMessage(message)
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, 'utf8')
+  let end = Math.min(bytes.length, Math.max(0, maxBytes))
+  while (end > 0) {
+    const result = bytes.subarray(0, end).toString('utf8')
+    // A partial multi-byte sequence is decoded as U+FFFD, whose encoded size
+    // differs from the source slice. Move the boundary back until it is valid.
+    if (Buffer.byteLength(result, 'utf8') === end) {
+      return result
+    }
+    end -= 1
+  }
+  return ''
+}
+
+function utf8Suffix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, 'utf8')
+  let start = Math.max(0, bytes.length - Math.max(0, maxBytes))
+  while (start < bytes.length) {
+    const result = bytes.subarray(start).toString('utf8')
+    if (Buffer.byteLength(result, 'utf8') === bytes.length - start) {
+      return result
+    }
+    start += 1
+  }
+  return ''
+}
+
+function truncateQwenTranscriptText(value: string, maxBytes: number): string {
+  const totalBytes = Buffer.byteLength(value, 'utf8')
+  if (totalBytes <= maxBytes) return value
+  if (maxBytes <= 0) return ''
+
+  const marker = '\n[... truncated ...]\n'
+  const markerBytes = Buffer.byteLength(marker, 'utf8')
+  if (markerBytes >= maxBytes) return utf8Prefix(value, maxBytes)
+
+  const available = maxBytes - markerBytes
+  const headBytes = Math.ceil(available * 0.6)
+  const tailBytes = available - headBytes
+  return `${utf8Prefix(value, headBytes)}${marker}${utf8Suffix(value, tailBytes)}`
+}
+
+function boundQwenMessageContent(
+  message: ChatMessage,
+  messageMaxBytes: number,
+  toolResultMaxBytes: number,
+): ChatMessage['content'] {
+  const isToolResult = isQwenToolResultMessage(message)
+  const limit = Math.max(0, isToolResult ? toolResultMaxBytes : messageMaxBytes)
+  const content = message.content
+
+  if (typeof content === 'string') {
+    return truncateQwenTranscriptText(content, limit)
+  }
+
+  if (!Array.isArray(content)) return content
+
+  let remainingBytes = limit
+  return content.map(part => {
+    if (!isObjectRecord(part)) return part
+
+    const partType = qwenContentPartType(part)
+
+    if (partType === 'text' && typeof part.text === 'string') {
+      const text = truncateQwenTranscriptText(part.text, remainingBytes)
+      remainingBytes = Math.max(0, remainingBytes - Buffer.byteLength(text, 'utf8'))
+      return {
+        ...part,
+        text,
+      }
+    }
+
+    // Preserve nested Anthropic tool_result text when a bridge has not
+    // normalized it to role=tool yet.
+    if (partType === 'tool_result' && 'content' in part) {
+      const nestedLimit = Math.min(toolResultMaxBytes, remainingBytes)
+      const nestedContent = boundUnknownToolResultContent(part.content, nestedLimit)
+      const nestedTextBytes = Buffer.byteLength(textFromUnknownContent(nestedContent), 'utf8')
+      remainingBytes = Math.max(0, remainingBytes - nestedTextBytes)
+      return {
+        ...part,
+        content: nestedContent,
+      }
+    }
+
+    return { ...part }
+  }) as ChatMessage['content']
+}
+
+/**
+ * Tool arguments are structural transcript data rather than message text, so
+ * they need an explicit bound as well. Keep oversized arguments valid JSON
+ * when possible; a partial JSON fragment would otherwise make the next Qwen
+ * prompt look like a malformed tool call.
+ */
+function boundQwenToolArguments(value: unknown, maxBytes: number): string {
+  const text = typeof value === 'string' ? value : String(value ?? '')
+  const limit = Math.max(0, maxBytes)
+  if (Buffer.byteLength(text, 'utf8') <= limit) return text
+  if (limit < 2) return ''
+
+  const truncated = truncateQwenTranscriptText(text, limit)
+  try {
+    JSON.parse(truncated)
+    return truncated
+  } catch {
+    return '{}'
+  }
+}
+
+function serializedQwenBytes(value: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(value) || '', 'utf8')
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Bound the complete tool-call array, not only each argument string. A
+ * request can contain many small parallel calls whose JSON keys alone would
+ * exceed the provider budget. Preserve the newest calls first because they
+ * belong to the active workflow; older calls are already represented by the
+ * surrounding transcript/result history.
+ */
+function boundQwenToolCalls(
+  toolCalls: NonNullable<ChatMessage['tool_calls']>,
+  maxBytes: number,
+): NonNullable<ChatMessage['tool_calls']> {
+  const limit = Math.max(0, maxBytes)
+  if (toolCalls.length === 0 || limit === 0) return []
+
+  const boundAtScale = (scale: number) => toolCalls.map(toolCall => {
+    const fieldLimit = Math.floor(limit * scale)
+    return {
+      ...toolCall,
+      // IDs are the join key for assistant calls and tool results. Never
+      // truncate them independently: an over-sized call is dropped as a unit
+      // below instead of creating an unmatchable result.
+      id: toolCall.id || '',
+      function: {
+        ...toolCall.function,
+        // The declared name is a protocol join key just like the call ID.
+        // Preserve it exactly or omit the complete call below when its
+        // structural metadata cannot fit the aggregate budget.
+        name: toolCall.function.name || '',
+        arguments: boundQwenToolArguments(toolCall.function.arguments, fieldLimit),
+      },
+    }
+  })
+
+  // Start by preserving all calls, then progressively reduce their fields.
+  for (const scale of [1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
+    const candidate = boundAtScale(scale)
+    if (serializedQwenBytes(candidate) <= limit) return candidate
+  }
+
+  // Even empty fields have a JSON structural cost. Keep as many newest calls
+  // as can fit, and omit the rest rather than leaking an unbounded array. IDs
+  // remain byte-for-byte exact so their corresponding results can be retained.
+  const minimal = boundAtScale(0)
+  const retained: typeof minimal = []
+  for (let index = minimal.length - 1; index >= 0; index -= 1) {
+    const next = [minimal[index], ...retained]
+    if (serializedQwenBytes(next) > limit) continue
+    retained.unshift(minimal[index])
+  }
+  return retained
+}
+
+function boundQwenMessage(
+  message: ChatMessage,
+  budget: Pick<QwenAiTranscriptBudget, 'messageMaxBytes' | 'toolResultMaxBytes'> & {
+    aggregateMaxBytes?: number
+  },
+): ChatMessage {
+  const boundedContent = boundQwenMessageContent(message, budget.messageMaxBytes, budget.toolResultMaxBytes)
+  const contentBytes = serializedQwenBytes(boundedContent)
+  const metadataLimit = Math.max(0, budget.messageMaxBytes)
+  const boundedMetadata = {
+    ...message,
+    ...(typeof message.name === 'string'
+      ? { name: message.name }
+      : {}),
+    ...(typeof message.tool_call_id === 'string'
+      ? { tool_call_id: message.tool_call_id }
+      : {}),
+    content: undefined,
+    tool_calls: undefined,
+  }
+  const messageOverhead = serializedQwenBytes(boundedMetadata)
+  // messageMaxBytes primarily bounds prose/tool-result payloads. Tool-call
+  // arrays are structural workflow state and may need the aggregate budget to
+  // keep at least one valid call; the final aggregate fit pass still enforces
+  // the hard request limit.
+  const structuralBudget = Math.max(
+    budget.messageMaxBytes,
+    budget.aggregateMaxBytes ?? budget.messageMaxBytes,
+  )
+  const toolCallBudget = Math.max(0, structuralBudget - contentBytes - messageOverhead)
+  const boundedToolCalls = message.tool_calls
+    ? boundQwenToolCalls(message.tool_calls, toolCallBudget)
+    : undefined
+  return {
+    ...message,
+    ...(typeof message.name === 'string'
+      ? { name: message.name }
+      : {}),
+    ...(typeof message.tool_call_id === 'string'
+      ? { tool_call_id: message.tool_call_id }
+      : {}),
+    content: boundedContent,
+    tool_calls: boundedToolCalls && boundedToolCalls.length > 0 ? boundedToolCalls : undefined,
+  }
+}
+
+function estimateQwenMessageBytes(message: ChatMessage): number {
+  try {
+    const serialized = JSON.stringify(message)
+    return Buffer.byteLength(serialized || '', 'utf8')
+  } catch {
+    return Buffer.byteLength(String(message.content || ''), 'utf8')
+  }
+}
+
+function estimateQwenMessagesBytes(messages: ChatMessage[]): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(messages) || '', 'utf8')
+  } catch {
+    // Keep the fallback conservative by including the array delimiters and
+    // separators that a per-message sum would otherwise omit.
+    return 2
+      + Math.max(0, messages.length - 1)
+      + messages.reduce((total, message) => total + estimateQwenMessageBytes(message), 0)
+  }
+}
+
+function collectQwenTurns(messages: ChatMessage[]): IndexedQwenMessage[][] {
+  const turns: IndexedQwenMessage[][] = []
+  let current: IndexedQwenMessage[] = []
+
+  messages.forEach((message, index) => {
+    if (message.role === 'system') return
+
+    const currentHasResponse = current.some(item => !isQwenUserTurnMessage(item.message))
+    if (isQwenUserTurnMessage(message) && current.length > 0 && currentHasResponse) {
+      turns.push(current)
+      current = []
+    }
+    current.push({ message, index })
+  })
+
+  if (current.length > 0) turns.push(current)
+  return turns
+}
+
+/**
+ * Remove tool results whose assistant call was discarded by compaction. The
+ * provider-side transcript uses the raw OpenAI id as its join key, so keeping
+ * an orphan result (or independently truncating either id) makes the next
+ * workflow turn ambiguous. Repeated calls/results with the same raw id remain
+ * valid and are intentionally retained as a queue.
+ */
+function retainQwenToolCallPairs(messages: ChatMessage[]): ChatMessage[] {
+  const unmatchedCallCounts = new Map<string, number>()
+
+  const addCall = (rawId: string) => {
+    unmatchedCallCounts.set(rawId, (unmatchedCallCounts.get(rawId) || 0) + 1)
+  }
+
+  const consumeCall = (rawId: unknown): boolean => {
+    if (typeof rawId !== 'string' || !rawId) return true
+    const remaining = unmatchedCallCounts.get(rawId) || 0
+    if (remaining <= 0) return false
+    if (remaining === 1) unmatchedCallCounts.delete(rawId)
+    else unmatchedCallCounts.set(rawId, remaining - 1)
+    return true
+  }
+
+  return messages.flatMap(message => {
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        if (typeof call.id === 'string' && call.id) addCall(call.id)
+      }
+      return [message]
+    }
+
+    if (message.role === 'tool') {
+      // Consume one retained call per result. A Set would let one surviving
+      // duplicate raw ID keep arbitrarily many results after sibling calls
+      // were removed by compaction.
+      if (!consumeCall(message.tool_call_id)) return []
+      return [message]
+    }
+
+    if (message.role !== 'user' || !Array.isArray(message.content)) {
+      return [message]
+    }
+
+    const filteredContent = message.content.filter(part => {
+      if (qwenContentPartType(part) !== 'tool_result' || !isObjectRecord(part)) return true
+      const rawId = part.tool_call_id ?? part.tool_use_id
+      return consumeCall(rawId)
+    })
+
+    if (filteredContent.length === message.content.length) return [message]
+    if (filteredContent.length === 0) return []
+    return [{ ...message, content: filteredContent }]
+  })
+}
+
+/** Reduce parallel calls before dropping their containing workflow turn. */
+function trimQwenToolCallsForBudget(messages: ChatMessage[], maxBytes: number): ChatMessage[] {
+  let candidate = messages
+  while (candidate.length > 0 && estimateQwenMessagesBytes(candidate) > maxBytes) {
+    const assistantIndex = candidate.findIndex(message => (
+      message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+    ))
+    if (assistantIndex < 0) return candidate
+
+    const assistant = candidate[assistantIndex]
+    const calls = assistant.tool_calls || []
+    const removeCount = Math.max(1, Math.ceil(calls.length / 2))
+    const remainingCalls = calls.slice(removeCount)
+    candidate = candidate.map((message, index) => {
+      if (index !== assistantIndex) return message
+      return {
+        ...message,
+        tool_calls: remainingCalls.length > 0 ? remainingCalls : undefined,
+      }
+    })
+    candidate = retainQwenToolCallPairs(candidate)
+  }
+  return candidate
+}
+
+/**
+ * Apply a final serialized-message budget. A configured budget can be smaller
+ * than the JSON representation of one message (or even the empty array), so
+ * the only strict result in that case is an empty transcript. Whole turns are
+ * removed before individual messages to avoid separating call/result pairs.
+ */
+function fitQwenMessagesToByteBudget(
+  messages: ChatMessage[],
+  budget: QwenAiTranscriptBudget,
+): ChatMessage[] {
+  if (budget.maxBytes < 2) return []
+
+  let candidate = retainQwenToolCallPairs(messages)
+  candidate = trimQwenToolCallsForBudget(candidate, budget.maxBytes)
+  if (estimateQwenMessagesBytes(candidate) <= budget.maxBytes) return candidate
+
+  // First reduce text and arguments while preserving exact tool ids.
+  for (const scale of [0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
+    candidate = retainQwenToolCallPairs(candidate.map(message => boundQwenMessage(message, {
+      messageMaxBytes: Math.floor(budget.messageMaxBytes * scale),
+      toolResultMaxBytes: Math.floor(budget.toolResultMaxBytes * scale),
+      aggregateMaxBytes: budget.maxBytes,
+    })))
+    candidate = trimQwenToolCallsForBudget(candidate, budget.maxBytes)
+    if (estimateQwenMessagesBytes(candidate) <= budget.maxBytes) return candidate
+  }
+
+  // Remove oldest complete turns first. System preambles are removed last so
+  // a normal-sized budget still keeps the deployment's protocol instructions.
+  while (candidate.length > 0 && estimateQwenMessagesBytes(candidate) > budget.maxBytes) {
+    const turns = collectQwenTurns(candidate)
+    if (turns.length > 0) {
+      const drop = new Set(turns[0].map(item => item.index))
+      candidate = candidate.filter((_, index) => !drop.has(index))
+    } else {
+      candidate = candidate.slice(1)
+    }
+    candidate = retainQwenToolCallPairs(candidate)
+  }
+
+  return estimateQwenMessagesBytes(candidate) <= budget.maxBytes ? candidate : []
+}
+
+function addQwenTurnToSelection(
+  selected: Set<number>,
+  turn: IndexedQwenMessage[],
+): void {
+  for (const item of turn) selected.add(item.index)
+}
+
+function selectedQwenMessages(
+  messages: ChatMessage[],
+  bounded: ChatMessage[],
+  selected: Set<number>,
+): ChatMessage[] {
+  return messages
+    .map((_, index) => index)
+    .filter(index => selected.has(index))
+    .map(index => bounded[index])
+}
+
+function turnHasRealUserMessage(turn: IndexedQwenMessage[]): boolean {
+  return turn.some(item => isQwenUserTurnMessage(item.message))
+}
+
+function insertQwenOmissionMarker(messages: ChatMessage[]): ChatMessage[] {
+  const firstNonSystem = messages.findIndex(message => message.role !== 'system')
+  const insertionIndex = firstNonSystem < 0 ? messages.length : firstNonSystem
+  return [
+    ...messages.slice(0, insertionIndex),
+    { role: 'system', content: QWEN_AI_TRANSCRIPT_OMISSION_MARKER },
+    ...messages.slice(insertionIndex),
+  ]
+}
+
+/**
+ * Re-bound selected messages until their serialized representation fits the
+ * provider budget. Text is reduced first; structural tool fields are reduced
+ * only when their aggregate representation would otherwise exceed the cap.
+ */
+function shrinkQwenMessagesToBudget(
+  messages: ChatMessage[],
+  budget: QwenAiTranscriptBudget,
+): ChatMessage[] {
+  if (estimateQwenMessagesBytes(messages) <= budget.maxBytes) {
+    return retainQwenToolCallPairs(messages)
+  }
+
+  const scales = [0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0]
+  let candidate = messages
+  for (const scale of scales) {
+    const messageMaxBytes = Math.floor(budget.messageMaxBytes * scale)
+    const toolResultMaxBytes = Math.floor(budget.toolResultMaxBytes * scale)
+    candidate = messages.map(message => boundQwenMessage(message, {
+      messageMaxBytes,
+      toolResultMaxBytes,
+      aggregateMaxBytes: budget.maxBytes,
+    }))
+    if (estimateQwenMessagesBytes(candidate) <= budget.maxBytes) {
+      return candidate
+    }
+  }
+
+  // Clear any remaining content after all proportional bounds are exhausted,
+  // then remove complete turns until the serialized aggregate is truly within
+  // the configured limit. This can return [] for an impossible tiny budget.
+  return fitQwenMessagesToByteBudget(candidate, budget)
+}
+
+/**
+ * Bound Qwen's one-prompt transcript without changing the caller's messages.
+ * System messages, the first real user turn (task anchor), and the latest two
+ * complete turns are mandatory. The latest-two rule keeps a real task together
+ * with an internally appended workflow continuation without depending on any
+ * provider/client-specific prompt text. Older turns are admitted newest-first
+ * only while the configured byte budget permits them.
+ */
+export function compactQwenAiTranscriptMessages(
+  messages: ChatMessage[],
+  overrides: Partial<QwenAiTranscriptBudget> = {},
+): ChatMessage[] {
+  if (messages.length === 0) return messages
+
+  const configured = getQwenAiTranscriptBudget()
+  const budget: QwenAiTranscriptBudget = {
+    maxBytes: Math.max(1, overrides.maxBytes ?? configured.maxBytes),
+    toolResultMaxBytes: Math.max(1, overrides.toolResultMaxBytes ?? configured.toolResultMaxBytes),
+    messageMaxBytes: Math.max(1, overrides.messageMaxBytes ?? configured.messageMaxBytes),
+    maxFileParts: Math.max(1, overrides.maxFileParts ?? configured.maxFileParts),
+  }
+  const originalBytes = estimateQwenMessagesBytes(messages)
+  // Per-message limits are fallback tools for an over-budget transcript, not
+  // independent rewriting rules. Preserve every caller message byte-for-byte
+  // whenever the complete request already fits the provider budget.
+  if (originalBytes <= budget.maxBytes) {
+    return messages
+  }
+
+  const turns = collectQwenTurns(messages)
+  const bounded = messages.map(message => boundQwenMessage(message, {
+    ...budget,
+    aggregateMaxBytes: budget.maxBytes,
+  }))
+  const systemIndices = messages
+    .map((message, index) => message.role === 'system' ? index : -1)
+    .filter(index => index >= 0)
+  const selected = new Set<number>(systemIndices)
+  const mandatoryTurnIndexes = new Set<number>()
+  const anchorTurnIndex = turns.findIndex(turnHasRealUserMessage)
+  const activeTurnIndex = turns.length - 1
+  const previousTurnIndex = turns.length - 2
+
+  for (const turnIndex of [anchorTurnIndex, previousTurnIndex, activeTurnIndex]) {
+    if (turnIndex < 0 || turnIndex >= turns.length || mandatoryTurnIndexes.has(turnIndex)) {
+      continue
+    }
+    mandatoryTurnIndexes.add(turnIndex)
+    addQwenTurnToSelection(selected, turns[turnIndex])
+  }
+
+  const selectedBytes = (): number => estimateQwenMessagesBytes(
+    messages
+      .map((_, index) => index)
+      .filter(index => selected.has(index))
+      .map(index => bounded[index]),
+  )
+
+  // Admit older complete turns from newest to oldest. A turn is always added
+  // as a unit, preventing orphaned tool results or calls.
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    if (mandatoryTurnIndexes.has(turnIndex)) continue
+    const turn = turns[turnIndex]
+    const turnBytes = turn.reduce((total, item) => total + estimateQwenMessageBytes(bounded[item.index]), 0)
+    if (selectedBytes() + turnBytes > budget.maxBytes) continue
+    addQwenTurnToSelection(selected, turn)
+  }
+
+  let selectedMessages = selectedQwenMessages(messages, bounded, selected)
+  const droppedMessages = selected.size < messages.length
+  const selectedOriginalBytes = estimateQwenMessagesBytes(
+    messages.filter((_, index) => selected.has(index)),
+  )
+  const boundedBytes = estimateQwenMessagesBytes(selectedMessages)
+  const textWasBound = boundedBytes < selectedOriginalBytes
+  const needsCompaction = droppedMessages || textWasBound || boundedBytes > budget.maxBytes
+  if (needsCompaction) {
+    // If the marker itself would exceed the budget, discard optional turns
+    // first while retaining the anchor and latest workflow turns as a unit.
+    selectedMessages = insertQwenOmissionMarker(selectedMessages)
+    if (estimateQwenMessagesBytes(selectedMessages) > budget.maxBytes) {
+      for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
+        if (mandatoryTurnIndexes.has(turnIndex)) continue
+        for (const item of turns[turnIndex]) selected.delete(item.index)
+        selectedMessages = insertQwenOmissionMarker(selectedQwenMessages(messages, bounded, selected))
+        if (estimateQwenMessagesBytes(selectedMessages) <= budget.maxBytes) break
+      }
+    }
+  }
+
+  selectedMessages = shrinkQwenMessagesToBudget(selectedMessages, budget)
+  selectedMessages = fitQwenMessagesToByteBudget(selectedMessages, budget)
+
+  if (needsCompaction) {
+    console.warn('[QwenAI] Compacted transcript for provider context budget', JSON.stringify({
+      originalMessages: messages.length,
+      retainedMessages: selectedMessages.length,
+      originalBytes,
+      retainedBytes: estimateQwenMessagesBytes(selectedMessages),
+      maxBytes: budget.maxBytes,
+    }))
+  }
+  return selectedMessages
+}
+
+function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
+  const transcriptMessages = messages
   const toolProfile = getProviderToolProfile('qwen')
   const transcriptParts: string[] = []
   const fileParts: ChatMessageContent[] = []
   const usedLocalToolCallIds = new Set<string>()
   const pendingLocalIds = new Map<string, string[]>()
   // Qwen receives this transcript as one user prompt, so keep the system preamble near the active turn.
-  const leadingSystemCount = messages.findIndex(message => message.role !== 'system')
-  const systemPreambleCount = leadingSystemCount === -1 ? messages.length : leadingSystemCount
+  const leadingSystemCount = transcriptMessages.findIndex(message => message.role !== 'system')
+  const systemPreambleCount = leadingSystemCount === -1 ? transcriptMessages.length : leadingSystemCount
   let latestUserIndex = -1
-  for (let index = messages.length - 1; index >= systemPreambleCount; index -= 1) {
-    if (messages[index].role === 'user') {
+  for (let index = transcriptMessages.length - 1; index >= systemPreambleCount; index -= 1) {
+    if (transcriptMessages[index].role === 'user' && !isQwenToolResultMessage(transcriptMessages[index])) {
       latestUserIndex = index
       break
     }
   }
-  const systemPreambleInsertionIndex = messages.at(-1)?.role === 'tool'
-    ? messages.length
+  const systemPreambleInsertionIndex = isQwenToolResultMessage(transcriptMessages.at(-1) || ({} as ChatMessage))
+    ? transcriptMessages.length
     : latestUserIndex
   const relocateSystemPreamble = systemPreambleCount > 0
     && systemPreambleInsertionIndex >= systemPreambleCount
   const systemPreamble = relocateSystemPreamble
-    ? messages
+    ? transcriptMessages
         .slice(0, systemPreambleCount)
         .map(message => textFromContent(message.content))
         .filter(text => text.length > 0)
@@ -1025,8 +1745,30 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
     : []
   let fallbackCallIndex = 0
 
-  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
-    const msg = messages[messageIndex]
+  const appendToolResult = (rawToolCallId: string | undefined, resultText: string, isError: boolean) => {
+    if (!rawToolCallId) {
+      if (resultText) transcriptParts.push(formatRoleText('Tool', resultText))
+      return
+    }
+
+    const pending = pendingLocalIds.get(rawToolCallId) ?? []
+    const localId = pending[0] ?? rawToolCallId
+    pendingLocalIds.set(rawToolCallId, pending.slice(1))
+    const toolResultContent = isError
+      ? `Tool execution failed (is_error=true):\n${resultText}`
+      : resultText
+    transcriptParts.push([
+      `Tool result for ${localId} (already executed by the client):`,
+      toolProfile.formatToolResult({
+        toolCallId: localId,
+        content: toolResultContent,
+      }),
+      'Use this result to decide the next step.',
+    ].join('\n'))
+  }
+
+  for (let messageIndex = 0; messageIndex < transcriptMessages.length; messageIndex += 1) {
+    const msg = transcriptMessages[messageIndex]
     if (relocateSystemPreamble && messageIndex < systemPreambleCount) {
       continue
     }
@@ -1049,6 +1791,9 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
       fileParts.push(...messageFileParts)
       if (text || messageFileParts.length > 0) {
         transcriptParts.push(formatRoleText('User', text))
+      }
+      for (const nestedResult of extractNestedQwenToolResults(msg.content)) {
+        appendToolResult(nestedResult.toolCallId, nestedResult.content, nestedResult.isError)
       }
       continue
     }
@@ -1086,38 +1831,57 @@ function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; file
     }
 
     if (msg.role === 'tool') {
-      if (msg.tool_call_id) {
-        const pending = pendingLocalIds.get(msg.tool_call_id) ?? []
-        const localId = pending[0] ?? msg.tool_call_id
-        pendingLocalIds.set(msg.tool_call_id, pending.slice(1))
-        transcriptParts.push([
-          `Tool result for ${localId} (already executed by the client):`,
-          toolProfile.formatToolResult({
-            toolCallId: localId,
-            content: text,
-          }),
-          'Use this result to decide the next step.',
-        ].join('\n'))
-      } else if (text) {
-        transcriptParts.push(formatRoleText('Tool', text))
-      }
+      appendToolResult(msg.tool_call_id, text, msg.is_error === true)
     }
   }
 
-  if (relocateSystemPreamble && systemPreambleInsertionIndex === messages.length) {
+  if (relocateSystemPreamble && systemPreambleInsertionIndex === transcriptMessages.length) {
     transcriptParts.push(...systemPreamble)
   }
 
+  const filePartLimit = getQwenAiTranscriptBudget().maxFileParts
+
   return {
     content: transcriptParts.join('\n\n'),
-    fileParts,
+    fileParts: limitAndDeduplicateQwenFileParts(fileParts, filePartLimit),
   }
+}
+
+/**
+ * Build the provider prompt and enforce the same byte budget after role/tool
+ * rendering. XML tool wrappers are larger than their OpenAI JSON source, so a
+ * message-level cap alone cannot guarantee the actual Qwen content limit.
+ * Re-render progressively smaller, structurally valid histories; if even the
+ * smallest valid history cannot fit, send an empty prompt rather than a
+ * truncated XML document.
+ */
+function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
+  const budget = getQwenAiTranscriptBudget()
+  const initialMessages = compactQwenAiTranscriptMessages(messages)
+  let prepared = renderQwenAiTranscript(initialMessages)
+  if (Buffer.byteLength(prepared.content, 'utf8') <= budget.maxBytes) {
+    return prepared
+  }
+
+  for (const scale of [0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
+    const candidateMessages = compactQwenAiTranscriptMessages(messages, {
+      ...budget,
+      maxBytes: Math.floor(budget.maxBytes * scale),
+    })
+    prepared = renderQwenAiTranscript(candidateMessages)
+    if (Buffer.byteLength(prepared.content, 'utf8') <= budget.maxBytes) {
+      return prepared
+    }
+  }
+
+  return { content: '', fileParts: [] }
 }
 
 function validateSupportedParts(content: ChatMessageContent[]): void {
   for (const part of content) {
-    if (!['text', 'image_url', 'file', 'input_audio', 'video_url'].includes(part.type)) {
-      throw new Error(`Unsupported Qwen AI message content part type: ${part.type}`)
+    const partType = qwenContentPartType(part)
+    if (!['text', 'image_url', 'file', 'input_audio', 'video_url', 'tool_result'].includes(partType || '')) {
+      throw new Error(`Unsupported Qwen AI message content part type: ${partType || 'unknown'}`)
     }
   }
 }
@@ -1594,6 +2358,24 @@ function renderDocumentEvidence(evidences: QwenAiDocumentEvidence[]): string {
   ].join('\n')
 }
 
+function combineQwenTranscriptAndEvidence(
+  transcript: string,
+  evidence: string,
+  maxBytes: number,
+): string {
+  if (!evidence) return transcript
+
+  const separator = '\n\n'
+  const availableEvidenceBytes = maxBytes
+    - Buffer.byteLength(transcript, 'utf8')
+    - Buffer.byteLength(separator, 'utf8')
+  if (availableEvidenceBytes <= 0) {
+    return transcript
+  }
+
+  return `${transcript}${separator}${truncateQwenTranscriptText(evidence, availableEvidenceBytes)}`
+}
+
 export class QwenAiFileUploader {
   private readonly axiosInstance: AxiosInstance
   private readonly getHeaders: HeaderFactory
@@ -2001,10 +2783,14 @@ export async function prepareQwenAiMultimodalMessage(
   uploader: QwenAiFileUploader,
 ): Promise<PreparedQwenAiMessage> {
   const { content: userContent, fileParts } = buildQwenAiTranscript(messages)
+  const uniqueFileParts = limitAndDeduplicateQwenFileParts(
+    fileParts,
+    getQwenAiTranscriptBudget().maxFileParts,
+  )
 
   const files: any[] = []
   const evidences: QwenAiDocumentEvidence[] = []
-  for (const part of fileParts) {
+  for (const part of uniqueFileParts) {
     const uploaded = await uploader.uploadPart(part, userContent)
     files.push(uploaded.file)
     if (uploaded.evidence) {
@@ -2016,9 +2802,16 @@ export async function prepareQwenAiMultimodalMessage(
   const content = documentEvidence
     ? `${userContent}\n\n${documentEvidence}`
     : userContent
+  const boundedContent = documentEvidence
+    ? combineQwenTranscriptAndEvidence(
+        userContent,
+        documentEvidence,
+        getQwenAiTranscriptBudget().maxBytes,
+      )
+    : content
 
   return {
-    content,
+    content: boundedContent,
     files,
   }
 }

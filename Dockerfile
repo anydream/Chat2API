@@ -27,8 +27,17 @@ ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
-# Leave busy-chat attempts unset so the adapter uses the request deadline;
-# deployments may set an explicit cap when they need a shorter retry policy.
+# Response-id resumes and managed workflow continuations share this
+# no-progress budget; it pauses while a replacement stream is active.
+ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
+# Qwen receives chat history as one prompt. Compact only when the complete
+# serialized transcript exceeds this deployment-controlled budget.
+ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288
+ENV CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576
+ENV CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072
+ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32
+# Busy-chat admission is bounded separately from the long generation timeout.
+ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=120000
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 ENV CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000

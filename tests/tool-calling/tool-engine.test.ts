@@ -270,17 +270,17 @@ test('a later successful tool-result batch clears pending failure state', () => 
   assert.doesNotMatch(String(result.messages.at(-1)?.content), /previous tool result reported failure/)
 })
 
-test('a user retry after a progress-only tool turn receives the same generic continuation', () => {
+test('an independent user turn after prior tool history is not extended', () => {
   const messages = [
-    { role: 'user' as const, content: 'complete the requested workflow' },
+    { role: 'user' as const, content: 'complete the earlier workflow' },
     { role: 'assistant' as const, content: null, tool_calls: [{
       id: 'call_1',
       type: 'function' as const,
       function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
     }] },
     { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
-    { role: 'assistant' as const, content: 'I will perform the next operation now.' },
-    { role: 'user' as const, content: 'continue' },
+    { role: 'assistant' as const, content: 'The earlier workflow is complete.' },
+    { role: 'user' as const, content: 'start a separate task' },
   ]
   const originalMessages = [...messages]
   const result = new ToolCallingEngine().transformRequest({
@@ -290,9 +290,34 @@ test('a user retry after a progress-only tool turn receives the same generic con
   })
 
   assert.deepEqual(messages, originalMessages)
-  assert.equal(result.messages.at(-2)?.content, 'continue')
-  assert.equal(result.messages.at(-1)?.role, 'user')
-  assert.match(String(result.messages.at(-1)?.content), /Treat progress updates and plans as incomplete/)
+  assert.equal(result.messages.at(-1)?.content, 'start a separate task')
+  assert.equal(result.plan.workflowContinuation, false)
+  assert.equal(result.plan.failedToolResultPending, false)
+  assert.doesNotMatch(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
+})
+
+test('a new user turn also clears stale failed-result state from older history', () => {
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({
+      messages: [
+        { role: 'user', content: 'earlier task' },
+        { role: 'assistant', content: null, tool_calls: [{
+          id: 'failed-call',
+          type: 'function',
+          function: { name: 'default_api:read_file', arguments: '{}' },
+        }] },
+        { role: 'tool', tool_call_id: 'failed-call', content: 'failed', is_error: true },
+        { role: 'assistant', content: 'I could not finish the earlier task.' },
+        { role: 'user', content: 'do something unrelated' },
+      ],
+    }),
+    provider,
+    actualModel: 'deepseek-chat',
+  })
+
+  assert.equal(result.plan.workflowContinuation, false)
+  assert.equal(result.plan.failedToolResultPending, false)
+  assert.equal(result.messages.at(-1)?.content, 'do something unrelated')
 })
 
 test('ordinary user turns without prior tool progress are not extended', () => {

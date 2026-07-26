@@ -35,9 +35,10 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
 
 export function createToolWorkflowContinuationMessage(options: {
   failedToolResultPending?: boolean
+  requireManagedToolCall?: boolean
   plan?: Pick<ToolCallingPlan, 'protocol' | 'tools'>
 } = {}): ChatMessage {
-  const recoveryPrompt = options.failedToolResultPending && options.plan
+  const recoveryPrompt = (options.failedToolResultPending || options.requireManagedToolCall) && options.plan
     ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(options.plan.tools)
     : undefined
 
@@ -169,21 +170,12 @@ function appendToolWorkflowContinuation(
   const lastMessage = messages.at(-1)
   if (!lastMessage) return { messages, appended: false }
 
-  const followsToolResult = lastMessage.role === 'tool'
-  let lastToolResultIndex = -1
-  for (let index = messages.length - 2; index >= 0; index -= 1) {
-    if (messages[index].role === 'tool') {
-      lastToolResultIndex = index
-      break
-    }
-  }
-  const resumesAfterToolResult = lastMessage.role === 'user'
-    && lastToolResultIndex >= 0
-    && messages
-      .slice(lastToolResultIndex + 1, -1)
-      .some(candidate => candidate.role === 'assistant')
-
-  if (!followsToolResult && !resumesAfterToolResult) {
+  // A user message after an older tool exchange can be a completely new
+  // request. There is no protocol-safe way to infer that it is a retry from
+  // the message text, so only an actual trailing tool result opens a managed
+  // continuation turn. This keeps old tool history from contaminating new
+  // tasks while preserving the normal tool-result -> model turn boundary.
+  if (!isToolResultMessage(lastMessage)) {
     return { messages, appended: false }
   }
 
@@ -211,23 +203,45 @@ function withWorkflowState(
 }
 
 function hasUnresolvedFailedToolResult(messages: ChatMessage[]): boolean {
-  let lastToolResultIndex = -1
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === 'tool') {
-      lastToolResultIndex = index
-      break
-    }
-  }
-  if (lastToolResultIndex < 0) return false
+  const lastMessage = messages.at(-1)
+  if (!lastMessage || !isToolResultMessage(lastMessage)) return false
+
+  const lastToolResultIndex = messages.length - 1
 
   let batchStartIndex = lastToolResultIndex
-  while (batchStartIndex > 0 && messages[batchStartIndex - 1].role === 'tool') {
+  while (batchStartIndex > 0 && isToolResultMessage(messages[batchStartIndex - 1])) {
     batchStartIndex -= 1
   }
 
   return messages
     .slice(batchStartIndex, lastToolResultIndex + 1)
-    .some(message => message.is_error === true)
+    .some(message => hasToolResultError(message))
+}
+
+function isToolResultMessage(message: ChatMessage): boolean {
+  if (message.role === 'tool' || Boolean(message.tool_call_id)) return true
+  if (!Array.isArray(message.content)) return false
+
+  return message.content.some((part) => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return false
+    const type = (part as { type?: unknown }).type
+    return type === 'tool_result'
+      || type === 'web_search_tool_result'
+      || type === 'bash_code_execution_tool_result'
+      || type === 'text_editor_code_execution_tool_result'
+      || type === 'code_execution_tool_result'
+  })
+}
+
+function hasToolResultError(message: ChatMessage): boolean {
+  if (message.is_error === true) return true
+  if (!Array.isArray(message.content)) return false
+
+  return message.content.some((part) => {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return false
+    const record = part as { is_error?: unknown; isError?: unknown }
+    return record.is_error === true || record.isError === true
+  })
 }
 
 type ToolCallingShapeDiagnosticsInput = {

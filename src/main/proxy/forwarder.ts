@@ -1252,11 +1252,11 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     const adapter = new QwenAiAdapter(provider, account)
     let activeChatId: string | undefined
-    let cleanedChatId: string | undefined
+    const cleanedChatIds = new Set<string>()
 
     const cleanupChat = (chatId: string): void => {
-      if (cleanedChatId === chatId) return
-      cleanedChatId = chatId
+      if (!chatId || cleanedChatIds.has(chatId)) return
+      cleanedChatIds.add(chatId)
       adapter.deleteChat(chatId).catch(err => {
         console.error('[QwenAI] Failed to delete chat:', describeErrorForLog(err))
       })
@@ -1264,10 +1264,10 @@ export class RequestForwarder {
 
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
-      const { response, chatId, parentId } = await adapter.chatCompletion({
+      const createChatCompletionRequest = (messages: ChatCompletionRequest['messages']) => ({
         model: actualModel,
         originalModel: request.model,
-        messages: transformed.messages as any,
+        messages: messages as any,
         stream: request.stream,
         temperature: request.temperature,
         enable_thinking: request.enable_thinking !== undefined
@@ -1278,6 +1278,9 @@ export class RequestForwarder {
         thinking_budget: request.thinking_budget,
         signal: context?.signal,
       })
+      const { response, chatId, parentId } = await adapter.chatCompletion(
+        createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
+      )
       activeChatId = chatId
 
       let latency = Date.now() - startTime
@@ -1313,6 +1316,7 @@ export class RequestForwarder {
       const workflowContinuationMessage = canContinueManagedWorkflow
         ? createToolWorkflowContinuationMessage({
             failedToolResultPending: transformed.plan.failedToolResultPending,
+            requireManagedToolCall: true,
             plan: transformed.plan,
           })
         : undefined
@@ -1326,23 +1330,78 @@ export class RequestForwarder {
         getResponseId: () => handler.getResponseId(),
         getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
         isComplete: () => handler.isComplete(),
-        resume: responseId => adapter.resumeChatCompletion(chatId, responseId, context?.signal),
+        resume: (responseId, recoverySignal) => adapter.resumeChatCompletion(
+          activeChatId || chatId,
+          responseId,
+          recoverySignal || context?.signal,
+        ),
         ...(canContinueManagedWorkflow
           ? {
-              continueWorkflow: (responseId: string) => adapter.continueChatCompletion({
-                chatId,
-                parentId: responseId,
-                model: actualModel,
-                originalModel: request.model,
-                content: workflowContinuationContent,
-                enable_thinking: request.enable_thinking !== undefined
-                  ? request.enable_thinking
-                  : request.reasoning_effort !== undefined
-                    ? Boolean(request.reasoning_effort)
-                    : undefined,
-                thinking_budget: request.thinking_budget,
-                signal: context?.signal,
-              }),
+              continueWorkflow: async (
+                responseId: string,
+                recoveryError?: Error,
+                recoverySignal?: AbortSignal,
+              ) => {
+                const currentChatId = activeChatId || chatId
+
+                const recoveryCode = errorCodeFromError(recoveryError)
+                const restartFromFreshChat = recoveryCode === 'undeclared_native_tool_call'
+                  || (
+                    (recoveryCode === 'qwen_ai_semantic_incomplete'
+                      || recoveryCode === 'qwen_ai_semantic_empty')
+                    && transformed.plan.workflowContinuation
+                    && !transformed.plan.failedToolResultPending
+                  )
+
+                // A semantically completed Qwen branch can remain busy even
+                // after its response became unusable. Replay the complete,
+                // dynamically transformed history in a fresh temporary chat
+                // and append one schema-derived recovery turn. This keeps the
+                // active task and declared tool contract intact without
+                // relying on a provider-specific chat continuation endpoint.
+                if (restartFromFreshChat) {
+                  // workflowContinuation is set only when the tool engine
+                  // appended its own trailing user turn. The recovery prompt
+                  // below can be stricter than that original turn, so use the
+                  // structural plan state instead of comparing prompt text.
+                  const replayMessages = transformed.plan.workflowContinuation
+                    ? transformed.messages.slice(0, -1)
+                    : transformed.messages
+                  const restarted = await adapter.chatCompletion({
+                    ...createChatCompletionRequest([
+                      ...replayMessages,
+                      workflowContinuationMessage!,
+                    ] as ChatCompletionRequest['messages']),
+                    signal: recoverySignal || context?.signal,
+                  })
+                  if (restarted.response.status >= 400) {
+                    const restartError = new Error(
+                      this.extractErrorMessage(restarted.response) || `HTTP ${restarted.response.status}`,
+                    ) as Error & { status?: number }
+                    restartError.status = restarted.response.status
+                    throw restartError
+                  }
+                  activeChatId = restarted.chatId
+                  handler.setChatId(restarted.chatId)
+                  cleanupChat(currentChatId)
+                  return restarted.response
+                }
+
+                return adapter.continueChatCompletion({
+                  chatId: currentChatId,
+                  parentId: responseId,
+                  model: actualModel,
+                  originalModel: request.model,
+                  content: workflowContinuationContent,
+                  enable_thinking: request.enable_thinking !== undefined
+                    ? request.enable_thinking
+                    : request.reasoning_effort !== undefined
+                      ? Boolean(request.reasoning_effort)
+                      : undefined,
+                  thinking_budget: request.thinking_budget,
+                  signal: recoverySignal || context?.signal,
+                })
+              },
               onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
             }
           : {}),
@@ -1351,7 +1410,7 @@ export class RequestForwarder {
       if (request.stream) {
         let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
-          onFailure: () => cleanupChat(chatId),
+          onFailure: () => cleanupChat(activeChatId || chatId),
           recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
           recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
         })
@@ -1378,7 +1437,7 @@ export class RequestForwarder {
           const cleanupCompletedStream = () => {
             if (cleanupRequested) return
             cleanupRequested = true
-            cleanupChat(chatId)
+            cleanupChat(activeChatId || chatId)
           }
           const streamState = transformedStream as {
             readableEnded?: boolean
@@ -1408,7 +1467,7 @@ export class RequestForwarder {
           stream: transformedStream,
           skipTransform: true,
           latency,
-          providerSessionId: chatId,
+          providerSessionId: activeChatId || chatId,
         }
       }
 
@@ -1421,7 +1480,7 @@ export class RequestForwarder {
       this.applyToolCallsToResponse(result, transformed)
 
       if (shouldDeleteSession()) {
-        await adapter.deleteChat(chatId)
+        await adapter.deleteChat(activeChatId || chatId)
       }
 
       return {
@@ -1430,7 +1489,7 @@ export class RequestForwarder {
         headers: this.extractHeaders(response.headers),
         body: result,
         latency,
-        providerSessionId: chatId,
+        providerSessionId: activeChatId || chatId,
       }
     } catch (error) {
       if (activeChatId) {

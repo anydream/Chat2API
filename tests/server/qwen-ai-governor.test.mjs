@@ -104,9 +104,11 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(forwarderSource, /headers: lastHeaders/)
   assert.match(forwarderSource, /lastRetryable = result\.retryable/)
   assert.match(forwarderSource, /retryable: lastRetryable/)
-  assert.match(qwenAiForwarderSource, /createQwenAiResumableStream\(response\.data, \{[\s\S]*?resume: responseId => adapter\.resumeChatCompletion/)
-  assert.match(qwenAiForwarderSource, /handler\.handleStream\(resumableResponseStream, \{[\s\S]*?onFailure: \(\) => cleanupChat\(chatId\),[\s\S]*?recoverFromIdle: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?recoverFromSemanticEmpty: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?\}\)/)
+  assert.match(qwenAiForwarderSource, /createQwenAiResumableStream\(response\.data, \{[\s\S]*?resume: \(responseId, recoverySignal\) => adapter\.resumeChatCompletion/)
+  assert.match(qwenAiForwarderSource, /recoverySignal \|\| context\?\.signal/)
+  assert.match(qwenAiForwarderSource, /handler\.handleStream\(resumableResponseStream, \{[\s\S]*?onFailure: \(\) => cleanupChat\(activeChatId \|\| chatId\),[\s\S]*?recoverFromIdle: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?recoverFromSemanticEmpty: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?\}\)/)
   assert.match(qwenAiForwarderSource, /handler\.handleNonStream\(resumableResponseStream, \{[\s\S]*?signal: context\?\.signal,[\s\S]*?recoverFromIdle: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?recoverFromSemanticEmpty: \(error, onResume\) => resumableResponseStream\.recoverFromIdle\(error, onResume\),[\s\S]*?\}\)/)
+  assert.match(qwenAiForwarderSource, /const replayMessages = transformed\.plan\.workflowContinuation[\s\S]*?transformed\.messages\.slice\(0, -1\)[\s\S]*?workflowContinuationMessage/)
 
   assert.match(governorSource, /CHAT2API_QWEN_AI_MAX_CONCURRENT/)
   assert.match(governorSource, /CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS/)

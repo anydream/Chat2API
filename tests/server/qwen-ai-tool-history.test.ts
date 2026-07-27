@@ -464,11 +464,6 @@ test('Qwen AI caps the rendered prompt after tool XML expansion', async () => {
   process.env.CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = '10000'
 
   try {
-    // The query string loads a fresh module instance so the environment is
-    // sampled before its deployment constants are initialized.
-    const moduleUrl = new URL('../../src/main/proxy/adapters/qwen-ai-files.ts', import.meta.url).href
-      + `?render-budget-${Date.now()}`
-    const { prepareQwenAiMultimodalMessage } = await import(moduleUrl)
     const toolCalls = Array.from({ length: 20 }, (_, index) => ({
       id: `render-call-${index}`,
       type: 'function' as const,
@@ -554,6 +549,115 @@ test('Qwen AI deduplicates and bounds attachment uploads without mutating conten
   assert.equal(new Set(uploadedSources).size, uploadedSources.length)
   assert.equal(prepared.files.length, uploadedSources.length)
   assert.equal(uploadedSources.at(-1), 'https://example.test/image-34.png')
+})
+
+test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the text budget', async () => {
+  const systemInstruction = 'system-sentinel-4f9c2d'
+  const activeText = 'active-user-sentinel-a81e37'
+  const imageDataUrl = `data:image/png;base64,${'A'.repeat(600_000)}`
+  const messages = [
+    { role: 'system' as const, content: systemInstruction },
+    { role: 'user' as const, content: `earlier-user-sentinel ${'x'.repeat(5_000)}` },
+    { role: 'assistant' as const, content: `earlier-assistant-sentinel ${'y'.repeat(5_000)}` },
+    {
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: activeText },
+        { type: 'image_url' as const, image_url: { url: imageDataUrl } },
+      ],
+    },
+  ]
+  const snapshot = JSON.parse(JSON.stringify(messages))
+
+  const compacted = compactQwenAiTranscriptMessages(messages, {
+    maxBytes: 2_000,
+    toolResultMaxBytes: 500,
+    messageMaxBytes: 1_000,
+    maxFileParts: 4,
+  })
+
+  assert.ok(
+    compacted.some(message => message.role === 'system' && message.content === systemInstruction),
+    'the system instruction must survive image transcript compaction',
+  )
+  const activeTurn = compacted.find(message => (
+    message.role === 'user'
+    && Array.isArray(message.content)
+    && message.content.some(part => part.type === 'text' && part.text === activeText)
+  ))
+  assert.ok(activeTurn, 'the active user text must not be evicted by separately uploaded bytes')
+  assert.ok(
+    Array.isArray(activeTurn.content)
+      && activeTurn.content.some(part => part.type === 'image_url' && part.image_url?.url === imageDataUrl),
+    'the attachment reference must remain available to the uploader',
+  )
+  assert.deepEqual(messages, snapshot, 'transcript compaction must not mutate attachment content')
+
+  const uploadedSources: string[] = []
+  const prepared = await prepareQwenAiMultimodalMessage(compacted, {
+    uploadPart: async (part: any) => {
+      uploadedSources.push(part.image_url.url)
+      return { file: { id: 'uploaded-image-sentinel' } }
+    },
+  } as any)
+
+  assert.ok(prepared.content.includes(`System: ${systemInstruction}`))
+  assert.ok(prepared.content.includes(activeText))
+  assert.doesNotMatch(prepared.content, /data:image\/png;base64/)
+  assert.deepEqual(uploadedSources, [imageDataUrl])
+})
+
+test('Qwen AI excludes inline audio bytes from transcript budgeting', async () => {
+  const systemInstruction = 'system-sentinel-73bd10'
+  const activeText = 'active-user-sentinel-c6205a'
+  const audioData = 'B'.repeat(600_000)
+  const messages = [
+    { role: 'system' as const, content: systemInstruction },
+    { role: 'user' as const, content: `earlier-user-sentinel ${'x'.repeat(5_000)}` },
+    { role: 'assistant' as const, content: `earlier-assistant-sentinel ${'y'.repeat(5_000)}` },
+    {
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: activeText },
+        { type: 'input_audio' as const, input_audio: { data: audioData, format: 'wav' } },
+      ],
+    },
+  ]
+
+  const compacted = compactQwenAiTranscriptMessages(messages, {
+    maxBytes: 2_000,
+    toolResultMaxBytes: 500,
+    messageMaxBytes: 1_000,
+    maxFileParts: 2,
+  })
+
+  assert.ok(
+    compacted.some(message => message.role === 'system' && message.content === systemInstruction),
+    'the system instruction must survive audio transcript compaction',
+  )
+  const activeTurn = compacted.find(message => (
+    message.role === 'user'
+    && Array.isArray(message.content)
+    && message.content.some(part => part.type === 'text' && part.text === activeText)
+  ))
+  assert.ok(activeTurn)
+  assert.ok(
+    Array.isArray(activeTurn.content)
+      && activeTurn.content.some(part => part.type === 'input_audio' && part.input_audio?.data === audioData),
+  )
+
+  const uploadedSources: string[] = []
+  const prepared = await prepareQwenAiMultimodalMessage(compacted, {
+    uploadPart: async (part: any) => {
+      uploadedSources.push(part.input_audio.data)
+      return { file: { id: 'uploaded-audio-sentinel' } }
+    },
+  } as any)
+
+  assert.ok(prepared.content.includes(`System: ${systemInstruction}`))
+  assert.ok(prepared.content.includes(activeText))
+  assert.ok(!prepared.content.includes(audioData))
+  assert.deepEqual(uploadedSources, [audioData])
 })
 
 test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn', async () => {

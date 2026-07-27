@@ -346,118 +346,42 @@ test('an independent user turn after prior tool history is not extended', () => 
   assert.equal(result.messages.at(-1)?.content, 'start a separate task')
   assert.equal(result.plan.workflowContinuation, false)
   assert.equal(result.plan.failedToolResultPending, false)
-  assert.equal(result.plan.managedWorkflowActive, false)
   assert.doesNotMatch(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
 })
 
-test('a user continuation after assistant progress preserves active managed workflow state', () => {
-  const messages = [
-    { role: 'user' as const, content: 'complete the requested workflow' },
-    { role: 'assistant' as const, content: null, tool_calls: [{
-      id: 'call_1',
-      type: 'function' as const,
-      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
-    }] },
-    { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
-    {
-      role: 'assistant' as const,
-      content: 'Next I will update the implementation and run the tests.',
-    },
-    { role: 'user' as const, content: 'continue the work' },
+test('prose after a completed tool exchange is never interpreted as protocol state', () => {
+  const texts = [
+    'Understood. I will follow these instructions.',
+    'continue',
+    'Next I will update the implementation.',
+    'Next:',
+    '\u7ee7\u7eed\u5f53\u524d\u5de5\u4f5c',
+    '\u63a5\u4e0b\u6765\u6211\u4f1a\u8fd0\u884c\u6d4b\u8bd5\uff1a',
   ]
 
-  const result = new ToolCallingEngine().transformRequest({
-    request: request({ messages }),
-    provider,
-    actualModel: 'deepseek-chat',
-  })
+  for (const content of texts) {
+    const messages = [
+      { role: 'user' as const, content: 'complete the requested workflow' },
+      { role: 'assistant' as const, content: null, tool_calls: [{
+        id: 'call_1',
+        type: 'function' as const,
+        function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
+      }] },
+      { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
+      { role: 'assistant' as const, content },
+    ]
+    const result = new ToolCallingEngine().transformRequest({
+      request: request({ messages }),
+      provider,
+      actualModel: 'deepseek-chat',
+    })
 
-  assert.equal(result.plan.workflowContinuation, false)
-  assert.equal(result.plan.failedToolResultPending, false)
-  assert.equal(result.plan.managedWorkflowActive, true)
-  assert.equal(result.plan.diagnostics.managedWorkflowActive, true)
-  assert.equal(result.messages.at(-1)?.content, 'continue the work')
-})
-
-test('a response repair turn after an omitted empty assistant preserves active managed workflow state', () => {
-  const repair = 'The previous response had no visible output. Please continue with a visible response.'
-  const messages = [
-    { role: 'user' as const, content: 'complete the requested workflow' },
-    { role: 'assistant' as const, content: null, tool_calls: [{
-      id: 'call_1',
-      type: 'function' as const,
-      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
-    }] },
-    { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
-    { role: 'user' as const, content: repair },
-  ]
-
-  const result = new ToolCallingEngine().transformRequest({
-    request: request({ messages }),
-    provider,
-    actualModel: 'deepseek-chat',
-  })
-
-  assert.equal(result.plan.workflowContinuation, false)
-  assert.equal(result.plan.failedToolResultPending, false)
-  assert.equal(result.plan.managedWorkflowActive, true)
-  assert.equal(result.plan.diagnostics.managedWorkflowActive, true)
-  assert.equal(result.messages.at(-1)?.content, repair)
-})
-
-test('a direct same-work continuation after a matched tool result preserves workflow state', () => {
-  const messages = [
-    { role: 'user' as const, content: 'complete the requested workflow' },
-    { role: 'assistant' as const, content: null, tool_calls: [{
-      id: 'call_1',
-      type: 'function' as const,
-      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
-    }] },
-    { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
-    { role: 'user' as const, content: '\u3001\u7ee7\u7eed\u554a' },
-  ]
-
-  const result = new ToolCallingEngine().transformRequest({
-    request: request({ messages }),
-    provider,
-    actualModel: 'deepseek-chat',
-  })
-
-  assert.equal(result.plan.workflowContinuation, false)
-  assert.equal(result.plan.managedWorkflowActive, true)
-  assert.equal(result.messages.at(-1)?.content, '\u3001\u7ee7\u7eed\u554a')
-})
-
-test('repeated repair and continuation history remains active for the next user turn', () => {
-  const messages = [
-    { role: 'user' as const, content: 'complete the requested workflow' },
-    { role: 'assistant' as const, content: null, tool_calls: [{
-      id: 'call_1',
-      type: 'function' as const,
-      function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
-    }] },
-    { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
-    {
-      role: 'user' as const,
-      content: 'The previous response had no visible output. Please continue with a visible response.',
-    },
-    { role: 'assistant' as const, content: 'Next I will update the implementation.' },
-    { role: 'user' as const, content: '\u5361\u4f4f\u4e86\u5417\uff1f\u7ee7\u7eed stage 12' },
-    { role: 'assistant' as const, content: 'Next I will run the verification.' },
-    { role: 'user' as const, content: 'continue' },
-    { role: 'assistant' as const, content: 'Next I will inspect the remaining implementation.' },
-    { role: 'user' as const, content: '\u3001\u7ee7\u7eed\u554a' },
-  ]
-
-  const result = new ToolCallingEngine().transformRequest({
-    request: request({ messages }),
-    provider,
-    actualModel: 'deepseek-chat',
-  })
-
-  assert.equal(result.plan.workflowContinuation, false)
-  assert.equal(result.plan.managedWorkflowActive, true)
-  assert.equal(result.messages.at(-1)?.content, '\u3001\u7ee7\u7eed\u554a')
+    assert.equal(result.plan.workflowContinuation, false, content)
+    assert.equal(result.plan.failedToolResultPending, false, content)
+    assert.equal(result.messages.at(-1)?.content, content)
+    assert.equal('managedWorkflowActive' in result.plan, false)
+    assert.equal('initialProgressRecoveryEligible' in result.plan, false)
+  }
 })
 
 test('a new user turn also clears stale failed-result state from older history', () => {
@@ -494,34 +418,7 @@ test('ordinary user turns without prior tool progress are not extended', () => {
   assert.equal(result.messages.at(-1)?.content, 'read /tmp/a')
   assert.equal(result.plan.workflowContinuation, false)
   assert.equal(result.plan.diagnostics.workflowContinuation, false)
-  assert.equal(result.plan.managedWorkflowActive, false)
-  assert.equal(result.plan.diagnostics.managedWorkflowActive, false)
   assert.doesNotMatch(String(result.messages.at(-1)?.content), /next appropriate available tool call/)
-})
-
-test('next-step follow-up enables bounded initial progress recovery without appending a continuation turn', () => {
-  const result = new ToolCallingEngine().transformRequest({
-    request: request({
-      messages: [
-        { role: 'user', content: 'inspect the project' },
-        { role: 'assistant', content: null, tool_calls: [{
-          id: 'call_1',
-          type: 'function',
-          function: { name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
-        }] },
-        { role: 'tool', tool_call_id: 'call_1', content: '{"ok":true}' },
-        { role: 'assistant', content: 'The prior workflow is complete.' },
-        { role: 'user', content: '\u4e0b\u4e00\u6b65\u8981\u5e72\u561b \u6211\u8981\u7684\u662f\u6574\u4e2a\u5de5\u4f5c\u53ef\u7528' },
-      ],
-    }),
-    provider,
-    actualModel: 'deepseek-chat',
-  })
-
-  assert.equal(result.plan.initialProgressRecoveryEligible, true)
-  assert.equal(result.plan.diagnostics.initialProgressRecoveryEligible, true)
-  assert.equal(result.plan.workflowContinuation, false)
-  assert.equal(result.messages.at(-1)?.content, '\u4e0b\u4e00\u6b65\u8981\u5e72\u561b \u6211\u8981\u7684\u662f\u6574\u4e2a\u5de5\u4f5c\u53ef\u7528')
 })
 
 test('shape diagnostics are opt-in and omit message and tool values', () => {
@@ -575,7 +472,7 @@ test('shape diagnostics are opt-in and omit message and tool values', () => {
   assert.match(output[0], /"rawToolCount":4/)
   assert.match(output[0], /"normalizedToolCount":4/)
   assert.match(output[0], /"workflowContinuation":true/)
-  assert.match(output[0], /"managedWorkflowActive":false/)
+  assert.doesNotMatch(output[0], /managedWorkflowActive|initialProgressRecoveryEligible/)
   assert.doesNotMatch(output[0], /TOP_SECRET|uuid-secret|C:\\\\secret|TOP_SECRET_TOOL/)
 })
 

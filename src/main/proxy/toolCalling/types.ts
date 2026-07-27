@@ -55,10 +55,6 @@ export interface ToolCallDiagnostics {
   allowedToolNames?: string[]
   workflowContinuation: boolean
   failedToolResultPending: boolean
-  /** A managed exchange remains active through progress or response repair. */
-  managedWorkflowActive: boolean
-  /** Allows one bounded recovery for a next-step follow-up that starts with progress prose. */
-  initialProgressRecoveryEligible?: boolean
 }
 
 export interface ToolCallingPlan {
@@ -73,10 +69,6 @@ export interface ToolCallingPlan {
   allowedToolNames: Set<string>
   workflowContinuation: boolean
   failedToolResultPending: boolean
-  /** Enables bounded recovery when a model ends an active workflow prematurely. */
-  managedWorkflowActive: boolean
-  /** Allows one bounded recovery for a next-step follow-up that starts with progress prose. */
-  initialProgressRecoveryEligible?: boolean
   forcedToolName?: string
   diagnostics: ToolCallDiagnostics
 }

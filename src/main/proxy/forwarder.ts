@@ -93,7 +93,7 @@ function errorCodeFromError(error: unknown): string | undefined {
 function awaitQwenAiStreamPreflight(
   stream: QwenAiOutputStream,
   signal?: AbortSignal,
-  maxHoldMs: number = qwenAiStreamPreflightMaxHoldMsFromEnv(),
+  maxHoldMs: number | undefined = qwenAiStreamPreflightMaxHoldMsFromEnv(),
 ): Promise<void> {
   if (stream.qwenAiFailure) {
     return Promise.reject(stream.qwenAiFailure)
@@ -107,10 +107,17 @@ function awaitQwenAiStreamPreflight(
     destroyed?: boolean
     closed?: boolean
   }
+  const isTerminal = () => Boolean(
+    state.readableEnded
+    || state.writableEnded
+    || state.writableFinished
+    || state.destroyed
+    || state.closed
+  )
   if ((state.readableLength || 0) > 0) {
     return Promise.resolve()
   }
-  if (maxHoldMs <= 0) {
+  if (maxHoldMs === 0) {
     return Promise.resolve()
   }
 
@@ -154,13 +161,7 @@ function awaitQwenAiStreamPreflight(
         // emits `end` instead of waiting for a consumer to call read().
         stream.read(0)
       }
-      if (
-        state.readableEnded
-        || state.writableEnded
-        || state.writableFinished
-        || state.destroyed
-        || state.closed
-      ) {
+      if (isTerminal()) {
         onEnd()
       }
     }
@@ -201,30 +202,22 @@ function awaitQwenAiStreamPreflight(
     stream.once('end', onEnd)
     stream.once('close', onEnd)
     signal?.addEventListener('abort', onAbort, { once: true })
-    holdTimer = setTimeout(() => {
-      if (stream.qwenAiFailure) {
-        settle(stream.qwenAiFailure)
-        return
-      }
-      if (
-        (state.readableLength || 0) === 0
-        && (
-          state.readableEnded
-          || state.writableEnded
-          || state.writableFinished
-          || state.destroyed
-          || state.closed
-        )
-      ) {
-        onEnd()
-        return
-      }
-      // The upstream is still open but has not produced a visible event.
-      // Release the live response so downstream clients can observe later
-      // in-band errors instead of waiting indefinitely for HTTP headers.
-      settle()
-    }, maxHoldMs)
-    holdTimer.unref?.()
+    if (maxHoldMs !== undefined) {
+      holdTimer = setTimeout(() => {
+        if (stream.qwenAiFailure) {
+          settle(stream.qwenAiFailure)
+          return
+        }
+        if ((state.readableLength || 0) === 0 && isTerminal()) {
+          onEnd()
+          return
+        }
+        // An explicit deployment override can trade early status fidelity for
+        // a bounded wait before HTTP headers are committed.
+        settle()
+      }, maxHoldMs)
+      holdTimer.unref?.()
+    }
 
     if (stream.qwenAiFailure) {
       settle(stream.qwenAiFailure)
@@ -232,7 +225,7 @@ function awaitQwenAiStreamPreflight(
       settle()
     } else if (signal?.aborted) {
       onAbort()
-    } else if (state.readableEnded) {
+    } else if (isTerminal()) {
       onEnd()
     }
   })
@@ -259,13 +252,14 @@ function qwenAiValidatedStreamMaxBytesFromEnv(): number {
   return Number.isInteger(value) && value > 0 ? value : fallback
 }
 
-function qwenAiStreamPreflightMaxHoldMsFromEnv(): number {
-  const fallback = 15_000
+function qwenAiStreamPreflightMaxHoldMsFromEnv(): number | undefined {
   const raw = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
-  if (raw === undefined) return fallback
+  if (raw === undefined || raw.trim() === '') return undefined
 
   const value = Number(raw)
-  return Number.isInteger(value) && value >= 0 ? value : fallback
+  return Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647
+    ? value
+    : undefined
 }
 
 function validatedSseMaxHoldMsFromEnv(): number {
@@ -1349,9 +1343,7 @@ export class RequestForwarder {
                   || (
                     (recoveryCode === 'qwen_ai_semantic_incomplete'
                       || recoveryCode === 'qwen_ai_semantic_empty')
-                    && (transformed.plan.workflowContinuation
-                      || transformed.plan.managedWorkflowActive
-                      || transformed.plan.initialProgressRecoveryEligible)
+                    && transformed.plan.workflowContinuation
                     && !transformed.plan.failedToolResultPending
                   )
 
@@ -1410,8 +1402,11 @@ export class RequestForwarder {
       })
 
       if (request.stream) {
+        const bufferManagedStream = transformed.plan.shouldParseResponse
+          && qwenAiBufferManagedStreamsFromEnv()
         let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
+          bufferManagedBranch: bufferManagedStream,
           onFailure: () => cleanupChat(activeChatId || chatId),
           recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
           recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
@@ -1423,7 +1418,7 @@ export class RequestForwarder {
         // never replayed automatically.
         await awaitQwenAiStreamPreflight(transformedStream, context?.signal)
 
-        if (transformed.plan.shouldParseResponse && qwenAiBufferManagedStreamsFromEnv()) {
+        if (bufferManagedStream) {
           transformedStream = await bufferValidatedSseStream(transformedStream, {
             maxBytes: qwenAiValidatedStreamMaxBytesFromEnv(),
             maxHoldMs: validatedSseMaxHoldMsFromEnv(),

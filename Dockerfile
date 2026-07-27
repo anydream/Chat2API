@@ -22,7 +22,6 @@ ENV CHAT2API_DATA_DIR=/data
 ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
 # Managed-tool validation buffering is opt-in; the default preserves live SSE.
 ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
-ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3

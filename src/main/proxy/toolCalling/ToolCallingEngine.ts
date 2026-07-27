@@ -12,9 +12,7 @@ import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 import {
-  hasActiveManagedWorkflow,
   hasTrailingMatchedToolResultBatch,
-  isInitialProgressRecoveryCandidate,
   isToolResultMessage,
 } from './workflowHeuristics.ts'
 
@@ -91,18 +89,12 @@ export class ToolCallingEngine {
     })
     const shouldInjectPrompt = plan.shouldInjectPrompt
     const failedToolResultPending = hasUnresolvedFailedToolResult(request.messages)
-    const managedWorkflowActive = shouldInjectPrompt && hasActiveManagedWorkflow(request.messages)
-    const initialProgressRecoveryEligible = shouldInjectPrompt
-      && plan.allowedToolNames.size > 0
-      && isInitialProgressRecoveryCandidate(request.messages)
     const workflow = shouldInjectPrompt
       ? appendToolWorkflowContinuation(request.messages, failedToolResultPending, plan)
       : { messages: request.messages, appended: false }
     const planWithWorkflow = withWorkflowState(plan, {
       workflowContinuation: workflow.appended,
       failedToolResultPending,
-      managedWorkflowActive,
-      initialProgressRecoveryEligible,
     })
 
     emitToolCallingShapeDiagnostics({
@@ -111,8 +103,6 @@ export class ToolCallingEngine {
       normalizedToolCount: clientRequest.tools.length,
       workflowContinuation: workflow.appended,
       failedToolResultPending,
-      managedWorkflowActive,
-      initialProgressRecoveryEligible,
     })
 
     if (!shouldInjectPrompt) {
@@ -204,13 +194,7 @@ function appendToolWorkflowContinuation(
 
 function withWorkflowState(
   plan: ToolCallingPlan,
-  state: Pick<
-    ToolCallingPlan,
-    | 'workflowContinuation'
-    | 'failedToolResultPending'
-    | 'managedWorkflowActive'
-    | 'initialProgressRecoveryEligible'
-  >,
+  state: Pick<ToolCallingPlan, 'workflowContinuation' | 'failedToolResultPending'>,
 ): ToolCallingPlan {
   return {
     ...plan,
@@ -255,8 +239,6 @@ type ToolCallingShapeDiagnosticsInput = {
   normalizedToolCount: number
   workflowContinuation: boolean
   failedToolResultPending: boolean
-  managedWorkflowActive: boolean
-  initialProgressRecoveryEligible: boolean
 }
 
 /**
@@ -284,8 +266,6 @@ function emitToolCallingShapeDiagnostics(input: ToolCallingShapeDiagnosticsInput
     normalizedToolCount: input.normalizedToolCount,
     workflowContinuation: input.workflowContinuation,
     failedToolResultPending: input.failedToolResultPending,
-    managedWorkflowActive: input.managedWorkflowActive,
-    initialProgressRecoveryEligible: input.initialProgressRecoveryEligible,
   }))
 }
 

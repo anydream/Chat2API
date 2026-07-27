@@ -448,9 +448,16 @@ test('an explicit retry count does not enable ordinary Qwen stream retries', asy
   }
 })
 
-test('live managed-tool forwarding deletes its temporary chat only after stream termination', async () => {
+test('live managed-tool forwarding deletes its temporary chat only after stream termination', async (t) => {
+  const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  t.after(() => {
+    if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+    else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer
+  })
   const output = new PassThrough()
   const deleteCalls = []
+  const handlingOptions = []
 
   class QwenAiAdapter {
     static isQwenAiProvider() { return true }
@@ -471,7 +478,10 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
 
   class QwenAiStreamHandler {
     setChatId() {}
-    async handleStream() { return output }
+    async handleStream(_stream, options) {
+      handlingOptions.push(options)
+      return output
+    }
   }
 
   const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
@@ -501,6 +511,7 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
 
   assert.equal(result.success, true)
   assert.equal(result.stream, output)
+  assert.equal(handlingOptions[0]?.bufferManagedBranch, false)
   assert.deepEqual(deleteCalls, [])
 
   const received = []
@@ -518,13 +529,20 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
   assert.deepEqual(deleteCalls, ['temporary-chat-1'])
 })
 
-test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn', async () => {
+test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn', async (t) => {
+  const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
+  t.after(() => {
+    if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+    else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer
+  })
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
   const continuedUpstream = new PassThrough()
   const continuationCalls = []
   const resumeCalls = []
   const bridgeOptions = []
+  const handlingOptions = []
   let resetCalls = 0
 
   class QwenAiAdapter {
@@ -556,7 +574,10 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
     getResponseId() { return 'latest-response-id' }
     isComplete() { return false }
     prepareForWorkflowContinuation() { resetCalls += 1 }
-    async handleStream() { return output }
+    async handleStream(_stream, options) {
+      handlingOptions.push(options)
+      return output
+    }
   }
 
   const RequestForwarder = loadRequestForwarder({
@@ -598,6 +619,7 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
   const result = await resultPromise
   assert.equal(result.success, true)
   assert.equal(bridgeOptions.length, 1)
+  assert.equal(handlingOptions[0]?.bufferManagedBranch, true)
 
   const options = bridgeOptions[0]
   assert.equal(typeof options.continueWorkflow, 'function')
@@ -644,7 +666,6 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
     allowedToolNames: new Set(['lookup']),
     workflowContinuation: true,
     failedToolResultPending: false,
-    managedWorkflowActive: false,
   }
   const originallyInjectedContinuation = createRealToolWorkflowContinuationMessage({
     failedToolResultPending: false,
@@ -784,7 +805,7 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
   restartedUpstream.destroy()
 })
 
-test('Qwen AI forwarder replays an eligible initial progress workflow without dropping its user turn', async () => {
+test('Qwen AI forwarder does not fresh-replay prose without a structural continuation', async () => {
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
   const restartedUpstream = new PassThrough()
@@ -807,14 +828,7 @@ test('Qwen AI forwarder replays an eligible initial progress workflow without dr
     allowedToolNames: new Set(['lookup']),
     workflowContinuation: false,
     failedToolResultPending: false,
-    managedWorkflowActive: false,
-    initialProgressRecoveryEligible: true,
   }
-  const schemaDerivedRecovery = createRealToolWorkflowContinuationMessage({
-    failedToolResultPending: false,
-    requireManagedToolCall: true,
-    plan,
-  })
   const transformedMessages = [
     { role: 'user', content: 'implement the requested changes' },
     {
@@ -850,7 +864,7 @@ test('Qwen AI forwarder replays an eligible initial progress workflow without dr
 
     async continueChatCompletion(request) {
       continuationCalls.push(request)
-      throw new Error('active workflow recovery must replay in a fresh chat')
+      return { data: restartedUpstream }
     }
 
     async deleteChat(chatId) {
@@ -905,25 +919,18 @@ test('Qwen AI forwarder replays an eligible initial progress workflow without dr
   const recoveryError = Object.assign(new Error('progress text ended the managed branch'), {
     code: 'qwen_ai_semantic_incomplete',
   })
-  const restarted = await bridgeOptions[0].continueWorkflow(
+  const continued = await bridgeOptions[0].continueWorkflow(
     'active-workflow-response',
     recoveryError,
   )
-  assert.equal(restarted.data, restartedUpstream)
-  assert.equal(chatCalls.length, 2)
-  assert.deepEqual(chatCalls[1].messages, [
-    ...transformedMessages,
-    schemaDerivedRecovery,
-  ])
-  assert.equal(
-    chatCalls[1].messages.at(-2).content,
-    'What next? I need the implementation working.',
-    'fresh-chat replay must preserve the real trailing user turn',
-  )
-  assert.deepEqual(continuationCalls, [])
+  assert.equal(continued.data, restartedUpstream)
+  assert.equal(chatCalls.length, 1)
+  assert.equal(continuationCalls.length, 1)
+  assert.equal(continuationCalls[0].chatId, 'initial-active-chat')
+  assert.equal(continuationCalls[0].parentId, 'active-workflow-response')
 
   await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(deleteCalls, ['initial-active-chat'])
+  assert.deepEqual(deleteCalls, [])
   output.destroy()
   initialUpstream.destroy()
   restartedUpstream.destroy()
@@ -982,6 +989,186 @@ test('Qwen AI preflight releases a quiet stream after the configured hold', asyn
   }
 })
 
+test('Qwen AI preflight keeps a delayed pre-output capacity failure as HTTP 429 by default', async (t) => {
+  const previous = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  const originalSetTimeout = globalThis.setTimeout
+  const scheduledDelays = []
+  const output = new PassThrough()
+  const deleteCalls = []
+  delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    scheduledDelays.push(delay)
+    return originalSetTimeout(callback, delay, ...args)
+  }
+  t.after(() => {
+    output.destroy()
+    globalThis.setTimeout = originalSetTimeout
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+    else process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = previous
+  })
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-delayed-capacity',
+        parentId: null,
+      }
+    }
+
+    async deleteChat(chatId) {
+      deleteCalls.push(chatId)
+      return true
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: false },
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+  await new Promise(resolve => originalSetTimeout(resolve, 30))
+  const capacityError = Object.assign(new Error('Qwen AI capacity limit'), {
+    status: 429,
+    code: 'qwen_ai_capacity_limit',
+    retryable: false,
+  })
+  output.qwenAiFailure = capacityError
+  output.emit('qwen-ai-stream-failure', capacityError)
+  output.end()
+
+  const result = await resultPromise
+  assert.equal(result.success, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'qwen_ai_capacity_limit')
+  assert.equal(result.stream, undefined)
+  assert.deepEqual(deleteCalls, ['temporary-chat-delayed-capacity'])
+  assert.deepEqual(scheduledDelays, [], 'the default preflight must not create a release timer')
+  assert.equal(output.listenerCount('qwen-ai-stream-failure'), 0)
+})
+
+test('Qwen AI preflight preserves the explicit zero deadline override', async (t) => {
+  const previous = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  const output = new PassThrough()
+  process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = '0'
+  t.after(() => {
+    output.destroy()
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+    else process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = previous
+  })
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-zero-preflight',
+        parentId: null,
+      }
+    }
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: false },
+  })
+
+  const result = await forwarder.forwardQwenAi(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+  assert.equal(result.success, true)
+  assert.equal(result.stream, output)
+})
+
+test('Qwen AI preflight ignores blank and overflowing deadline overrides', async (t) => {
+  const previous = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  const originalSetTimeout = globalThis.setTimeout
+  const scheduledDelays = []
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    scheduledDelays.push(delay)
+    return originalSetTimeout(callback, delay, ...args)
+  }
+  t.after(() => {
+    globalThis.setTimeout = originalSetTimeout
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+    else process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = previous
+  })
+
+  for (const raw of ['', 'invalid', '2147483648']) {
+    process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = raw
+    const output = new PassThrough()
+
+    class QwenAiAdapter {
+      static isQwenAiProvider() { return true }
+      async chatCompletion() {
+        return {
+          response: { status: 200, data: new PassThrough(), headers: {} },
+          chatId: `temporary-chat-invalid-preflight-${raw}`,
+          parentId: null,
+        }
+      }
+      async deleteChat() { return true }
+    }
+
+    class QwenAiStreamHandler {
+      setChatId() {}
+      async handleStream() { return output }
+    }
+
+    const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+    const forwarder = new RequestForwarder()
+    forwarder.transformRequestForPromptToolUse = request => ({
+      messages: request.messages,
+      plan: { shouldParseResponse: false },
+    })
+    const resultPromise = forwarder.forwardQwenAi(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      Date.now(),
+      { signal: new AbortController().signal },
+    )
+    await new Promise(resolve => setImmediate(resolve))
+    output.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n')
+    const result = await resultPromise
+    assert.equal(result.success, true)
+    output.end('data: [DONE]\n\n')
+  }
+
+  assert.deepEqual(scheduledDelays, [], 'invalid overrides must behave like an unset deadline')
+})
+
 test('Qwen AI preflight does not treat an empty readable event as output', async () => {
   const output = new PassThrough()
   const deleteCalls = []
@@ -1031,6 +1218,61 @@ test('Qwen AI preflight does not treat an empty readable event as output', async
   assert.equal(result.errorCode, 'qwen_ai_stream_incomplete')
   assert.deepEqual(deleteCalls, ['temporary-chat-empty'])
   output.destroy()
+})
+
+test('Qwen AI preflight rejects a stream destroyed before listener registration', { timeout: 1000 }, async (t) => {
+  const previous = process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  const output = new PassThrough()
+  const deleteCalls = []
+  delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+  output.destroy()
+  await new Promise(resolve => setImmediate(resolve))
+  t.after(() => {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS
+    else process.env.CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS = previous
+  })
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-preflight-destroyed',
+        parentId: null,
+      }
+    }
+
+    async deleteChat(chatId) {
+      deleteCalls.push(chatId)
+      return true
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: false },
+  })
+
+  const result = await forwarder.forwardQwenAi(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+  assert.equal(result.success, false)
+  assert.equal(result.status, 502)
+  assert.equal(result.errorCode, 'qwen_ai_stream_incomplete')
+  assert.deepEqual(deleteCalls, ['temporary-chat-preflight-destroyed'])
 })
 
 test('Qwen AI forwarding returns a structured failure before the first visible stream event', async () => {

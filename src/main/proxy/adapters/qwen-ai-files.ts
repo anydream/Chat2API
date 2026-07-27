@@ -30,22 +30,10 @@ const DOCUMENT_EVIDENCE_SNIPPET_CHARS = 1600
 // Qwen receives the complete conversation as one user prompt. Keep the
 // provider request below common gateway body limits while retaining the active
 // workflow. Deployments can tune these values for a different upstream limit.
-const QWEN_AI_TRANSCRIPT_MAX_BYTES = positiveIntegerFromEnv(
-  'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
-  512 * 1024,
-)
-const QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = positiveIntegerFromEnv(
-  'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
-  24 * 1024,
-)
-const QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = positiveIntegerFromEnv(
-  'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
-  128 * 1024,
-)
-const QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS = positiveIntegerFromEnv(
-  'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS',
-  32,
-)
+const QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT = 512 * 1024
+const QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES_DEFAULT = 24 * 1024
+const QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES_DEFAULT = 128 * 1024
+const QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS_DEFAULT = 32
 const QWEN_AI_TRANSCRIPT_OMISSION_MARKER = '[Earlier conversation omitted to fit the provider context budget.]'
 
 export const QWEN_AI_DOCUMENT_EVIDENCE_MARKER = '[Attached document evidence]'
@@ -1122,10 +1110,22 @@ export interface QwenAiTranscriptBudget {
 
 export function getQwenAiTranscriptBudget(): QwenAiTranscriptBudget {
   return {
-    maxBytes: QWEN_AI_TRANSCRIPT_MAX_BYTES,
-    toolResultMaxBytes: QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES,
-    messageMaxBytes: QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES,
-    maxFileParts: QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS,
+    maxBytes: positiveIntegerFromEnv(
+      'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
+      QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT,
+    ),
+    toolResultMaxBytes: positiveIntegerFromEnv(
+      'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
+      QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES_DEFAULT,
+    ),
+    messageMaxBytes: positiveIntegerFromEnv(
+      'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
+      QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES_DEFAULT,
+    ),
+    maxFileParts: positiveIntegerFromEnv(
+      'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS',
+      QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS_DEFAULT,
+    ),
   }
 }
 
@@ -1282,6 +1282,35 @@ function serializedQwenBytes(value: unknown): number {
   }
 }
 
+const QWEN_TRANSCRIPT_FILE_PART_TYPES = new Set([
+  'image_url',
+  'file',
+  'input_audio',
+  'video_url',
+])
+
+/**
+ * File payloads are uploaded separately and are never rendered into Qwen's
+ * text prompt. Project them to their structural type for transcript budgeting
+ * so a large data URL cannot evict the active user turn that references it.
+ */
+function qwenTranscriptBudgetContent(content: ChatMessage['content']): unknown {
+  if (!Array.isArray(content)) return content
+
+  return content.map(part => {
+    const partType = qwenContentPartType(part)
+    if (!partType || !QWEN_TRANSCRIPT_FILE_PART_TYPES.has(partType)) return part
+    return { type: partType }
+  })
+}
+
+function qwenTranscriptBudgetMessage(message: ChatMessage): unknown {
+  return {
+    ...message,
+    content: qwenTranscriptBudgetContent(message.content),
+  }
+}
+
 /**
  * Bound the complete tool-call array, not only each argument string. A
  * request can contain many small parallel calls whose JSON keys alone would
@@ -1341,7 +1370,7 @@ function boundQwenMessage(
   },
 ): ChatMessage {
   const boundedContent = boundQwenMessageContent(message, budget.messageMaxBytes, budget.toolResultMaxBytes)
-  const contentBytes = serializedQwenBytes(boundedContent)
+  const contentBytes = serializedQwenBytes(qwenTranscriptBudgetContent(boundedContent))
   const metadataLimit = Math.max(0, budget.messageMaxBytes)
   const boundedMetadata = {
     ...message,
@@ -1382,7 +1411,7 @@ function boundQwenMessage(
 
 function estimateQwenMessageBytes(message: ChatMessage): number {
   try {
-    const serialized = JSON.stringify(message)
+    const serialized = JSON.stringify(qwenTranscriptBudgetMessage(message))
     return Buffer.byteLength(serialized || '', 'utf8')
   } catch {
     return Buffer.byteLength(String(message.content || ''), 'utf8')
@@ -1391,7 +1420,7 @@ function estimateQwenMessageBytes(message: ChatMessage): number {
 
 function estimateQwenMessagesBytes(messages: ChatMessage[]): number {
   try {
-    return Buffer.byteLength(JSON.stringify(messages) || '', 'utf8')
+    return Buffer.byteLength(JSON.stringify(messages.map(qwenTranscriptBudgetMessage)) || '', 'utf8')
   } catch {
     // Keep the fallback conservative by including the array delimiters and
     // separators that a per-message sum would otherwise omit.

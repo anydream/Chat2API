@@ -25,7 +25,6 @@ import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../uti
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { getToolProtocol } from '../toolCalling/protocols'
-import { isLikelyWorkflowProgressText } from '../toolCalling/workflowHeuristics'
 import {
   getToolArgumentValidationIssues,
   normalizeArguments,
@@ -107,6 +106,8 @@ type StreamHandlingOptions = {
   signal?: AbortSignal
   responseTimeoutMs?: number
   idleTimeoutMs?: number
+  /** Withhold managed-tool frames until the response branch passes validation. */
+  bufferManagedBranch?: boolean
   onFailure?: (error: Error) => void
   recoverFromIdle?: QwenAiRecoveryCallback
   recoverFromSemanticEmpty?: QwenAiRecoveryCallback
@@ -1260,21 +1261,10 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
-  // A successful tool result may legitimately be followed by a final text
-  // answer. A managed continuation followed by clearly forward-looking
-  // assistant progress prose is the bounded exception: Qwen has ended the
-  // branch, but the workflow still has an actionable next step. Both states
-  // are computed from message structure, never from a client/task identifier.
+  // A successful tool result may legitimately be followed by any final text.
+  // Only an explicit failed result keeps the operation structurally pending;
+  // ordinary prose and punctuation are not protocol continuation signals.
   return plan.failedToolResultPending === true
-    || /[:\uFF1A]\s*$/.test(content)
-    || (
-      (
-        plan.workflowContinuation === true
-        || plan.managedWorkflowActive === true
-        || plan.initialProgressRecoveryEligible === true
-      )
-      && isLikelyWorkflowProgressText(content)
-    )
 }
 
 function isQwenAiSemanticRecoveryError(error: unknown): boolean {
@@ -3119,7 +3109,9 @@ export class QwenAiStreamHandler {
     let idleTimer: NodeJS.Timeout | undefined
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
-    const bufferManagedBranch = this.toolCallingPlan?.shouldParseResponse === true
+    const bufferManagedBranch = options.bufferManagedBranch === true
+      && this.toolCallingPlan?.shouldParseResponse === true
+    let visibleFrameCommitted = false
     let managedBranchFrames: string[] = []
     let managedBranchBytes = 0
     let parser: ReturnType<typeof createParser>
@@ -3135,6 +3127,7 @@ export class QwenAiStreamHandler {
       for (const frame of managedBranchFrames) {
         transStream.write(frame)
       }
+      visibleFrameCommitted = true
       discardManagedBranchFrames()
     }
 
@@ -3280,6 +3273,7 @@ export class QwenAiStreamHandler {
         return true
       }
       transStream.write(frame)
+      visibleFrameCommitted = true
       // Upstream events, parser buffering, and protocol fragments are not
       // client-visible progress. Refresh only after a frame reached the
       // downstream stream.
@@ -3289,6 +3283,19 @@ export class QwenAiStreamHandler {
 
     const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
       if (finalChunkSent || semanticRecoveryInFlight) return
+
+      // A fresh provider branch may replace an invalid branch only while the
+      // response is still private to this handler. Once a live frame reaches
+      // the client, replay would splice two different generations into one
+      // SSE response; report the late failure in-band instead.
+      if (
+        this.toolCallingPlan?.shouldParseResponse === true
+        && !bufferManagedBranch
+        && visibleFrameCommitted
+      ) {
+        failStream(error)
+        return
+      }
 
       const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
       if (!recover) {

@@ -184,7 +184,6 @@ QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
-CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=15000
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
 CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288
@@ -265,18 +264,19 @@ admission budget, and an exhausted busy result briefly cools the account without
 invalidating its credentials. The response is recognized by the provider code
 only, so an ordinary JSON error remains a non-stream `502`, and cancellation
 stops the wait without another request.
-Qwen's early-error preflight is bounded by
-`CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS`. Once that window expires, the
-HTTP response switches to live SSE and later provider failures are reported
-in-band instead of withholding the response indefinitely.
+Qwen's early-error preflight keeps the HTTP status mutable until the first
+client-visible SSE frame or a terminal failure. This lets a provider rejection
+that arrives before output retain its HTTP status across protocol bridges.
+`CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS` is an optional deployment
+override: a positive integer releases a still-quiet stream after that many
+milliseconds, and `0` releases it immediately.
 Managed SSE validation is opt-in through
 `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true`. The normal value (`false`)
 forwards generated SSE immediately, so a long response does not wait for
 validation before sending its first byte. When validation is enabled,
-`CHAT2API_VALIDATED_SSE_MAX_HOLD_MS` bounds how long an active stream may be
-withheld before its buffered prefix is released. This is not a generation
-timeout; after release, later failures are reported in-band and are not
-retried.
+the managed branch is withheld until terminal validation completes, so this
+mode is intended for callers that explicitly accept a delayed first byte.
+`CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES` bounds that validation buffer.
 
 ## Upstream Update Flow
 

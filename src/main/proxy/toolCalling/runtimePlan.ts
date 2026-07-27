@@ -45,6 +45,8 @@ export function buildToolCallingRuntimePlan(input: {
     allowedToolNames,
     workflowContinuation: false,
     failedToolResultPending: false,
+    managedWorkflowActive: false,
+    initialProgressRecoveryEligible: false,
     forcedToolName: forcedName,
     diagnostics: {
       requestId: input.requestId,
@@ -63,6 +65,8 @@ export function buildToolCallingRuntimePlan(input: {
       allowedToolNames: [...allowedToolNames],
       workflowContinuation: false,
       failedToolResultPending: false,
+      managedWorkflowActive: false,
+      initialProgressRecoveryEligible: false,
     },
   }
 }

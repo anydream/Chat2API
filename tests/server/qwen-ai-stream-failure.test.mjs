@@ -59,6 +59,9 @@ function loadQwenAiStreamHandler(overrides = {}) {
         parse: () => ({ toolCalls: [] }),
       })),
     },
+    '../toolCalling/workflowHeuristics': {
+      isLikelyWorkflowProgressText: overrides.isLikelyWorkflowProgressText || (() => false),
+    },
     '../toolCalling/streamValidationPolicy': {
       getToolStreamValidationFailure: overrides.getToolStreamValidationFailure || (() => undefined),
     },
@@ -1137,9 +1140,10 @@ test('Qwen AI non-stream uses same-chat continuation after a failed tool result 
   assert.equal(result.choices[0].message.tool_calls[0].function.name, 'declared_tool')
 })
 
-test('Qwen AI accepts a text-only answer after a successful tool result', async () => {
+test('Qwen AI continues after a successful tool result produces progress-only text', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
+    isLikelyWorkflowProgressText: content => content.includes('inspect the folder'),
     normalizeNativeFunctionCallDelta: delta => delta.function_call
       ? [{
           key: 'native-workflow-retry-0',
@@ -1150,11 +1154,14 @@ test('Qwen AI accepts a text-only answer after a successful tool result', async 
       : [],
   })
   const initial = new PassThrough()
+  const continued = new PassThrough()
   initial.on('error', () => {})
+  continued.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
     shouldParseResponse: true,
     workflowContinuation: true,
     failedToolResultPending: false,
+    managedWorkflowActive: false,
     allowedToolNames: new Set(['declared_tool']),
     tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
     toolChoiceMode: 'auto',
@@ -1166,7 +1173,7 @@ test('Qwen AI accepts a text-only answer after a successful tool result', async 
     isComplete: () => handler.isComplete(),
     continueWorkflow: async parentId => {
       parents.push(parentId)
-      throw new Error('a successful tool result must not require a generic retry')
+      return { data: continued }
     },
     onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
     maxAttempts: 0,
@@ -1189,15 +1196,28 @@ test('Qwen AI accepts a text-only answer after a successful tool result', async 
     response_id: 'workflow-text-only',
     choices: [{ delta: { phase: 'answer', status: 'finished', content: 'I will inspect the folder and continue.' } }],
   })}\n\ndata: [DONE]\n\n`)
+  setImmediate(() => {
+    continued.end(`data: ${JSON.stringify({
+      'response.created': { response_id: 'workflow-tool-call', response_index: 0 },
+    })}\n\ndata: ${JSON.stringify({
+      response_id: 'workflow-tool-call',
+      choices: [{ delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: { name: 'declared_tool', arguments: '{}' },
+      } }],
+    })}\n\ndata: [DONE]\n\n`)
+  })
   await ended
   const body = Buffer.concat(chunks).toString()
-  assert.deepEqual(parents, [])
+  assert.deepEqual(parents, ['workflow-text-only'])
   assert.equal(failure, undefined)
-  assert.match(body, /I will inspect the folder and continue\./)
-  assert.doesNotMatch(body, /"name":"declared_tool"/)
+  assert.doesNotMatch(body, /I will inspect the folder and continue\./)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
 })
 
-test('Qwen AI does not replace a final text answer with a generic continuation', async () => {
+test('Qwen AI preserves a terminal final answer after a successful tool result', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
   const initial = new PassThrough()
   initial.on('error', () => {})
@@ -1205,6 +1225,7 @@ test('Qwen AI does not replace a final text answer with a generic continuation',
     shouldParseResponse: true,
     workflowContinuation: true,
     failedToolResultPending: false,
+    managedWorkflowActive: false,
     allowedToolNames: new Set(['declared_tool']),
     tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
     toolChoiceMode: 'auto',
@@ -1232,21 +1253,159 @@ test('Qwen AI does not replace a final text answer with a generic continuation',
     'response.created': { response_id: 'workflow-final-text-first', response_index: 0 },
   })}\n\ndata: ${JSON.stringify({
     response_id: 'workflow-final-text-first',
-    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'I will continue the operation.' } }],
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'The requested work is complete.' } }],
   })}\n\ndata: [DONE]\n\n`)
   const result = await resultPromise
   assert.deepEqual(parents, [])
-  assert.equal(result.choices[0].message.content, 'I will continue the operation.')
+  assert.equal(result.choices[0].message.content, 'The requested work is complete.')
+})
+
+test('Qwen AI non-stream continues an active managed workflow after progress-only text', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    isLikelyWorkflowProgressText: content => content.includes('integrate the component'),
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-active-workflow-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    workflowContinuation: false,
+    failedToolResultPending: false,
+    managedWorkflowActive: true,
+    allowedToolNames: new Set(['declared_tool']),
+    tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const parents = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async parentId => {
+      parents.push(parentId)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'active-progress-first', response_index: 0 },
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'active-progress-first',
+    choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'Next I will integrate the component into the application.',
+    } }],
+  })}\n\ndata: [DONE]\n\n`)
+  setImmediate(() => {
+    continued.end(`data: ${JSON.stringify({
+      'response.created': { response_id: 'active-progress-tool', response_index: 0 },
+    })}\n\ndata: ${JSON.stringify({
+      response_id: 'active-progress-tool',
+      choices: [{ delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: { name: 'declared_tool', arguments: '{}' },
+      } }],
+    })}\n\ndata: [DONE]\n\n`)
+  })
+
+  const result = await resultPromise
+  assert.deepEqual(parents, ['active-progress-first'])
+  assert.equal(result.choices[0].finish_reason, 'tool_calls')
+  assert.equal(result.choices[0].message.content, null)
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, 'declared_tool')
+})
+
+test('Qwen AI limits progress-only workflow continuation to the configured attempt count', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    isLikelyWorkflowProgressText: () => true,
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    workflowContinuation: true,
+    failedToolResultPending: false,
+    managedWorkflowActive: false,
+    allowedToolNames: new Set(['declared_tool']),
+    tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const parents = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async parentId => {
+      parents.push(parentId)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const failurePromise = once(output, QWEN_AI_STREAM_FAILURE_EVENT)
+  const ended = once(output, 'end')
+  output.resume()
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'bounded-progress-first', response_index: 0 },
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'bounded-progress-first',
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'Next I will inspect the module.' } }],
+  })}\n\ndata: [DONE]\n\n`)
+  setImmediate(() => {
+    continued.end(`data: ${JSON.stringify({
+      'response.created': { response_id: 'bounded-progress-second', response_index: 0 },
+    })}\n\ndata: ${JSON.stringify({
+      response_id: 'bounded-progress-second',
+      choices: [{ delta: { phase: 'answer', status: 'finished', content: 'Then I will update the module.' } }],
+    })}\n\ndata: [DONE]\n\n`)
+  })
+
+  const [failure] = await failurePromise
+  await ended
+  assert.deepEqual(parents, ['bounded-progress-first'])
+  assert.equal(failure.code, 'qwen_ai_semantic_incomplete')
 })
 
 test('Qwen AI does not start a workflow continuation for an initial auto request', async () => {
-  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    isLikelyWorkflowProgressText: () => true,
+  })
   const initial = new PassThrough()
   initial.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
     shouldParseResponse: true,
     workflowContinuation: false,
     failedToolResultPending: false,
+    managedWorkflowActive: false,
     allowedToolNames: new Set(['declared_tool']),
     tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
     toolChoiceMode: 'auto',
@@ -1272,6 +1431,85 @@ test('Qwen AI does not start a workflow continuation for an initial auto request
   const result = await resultPromise
   assert.deepEqual(parents, [])
   assert.equal(result.choices[0].message.content, 'A normal answer is valid here.')
+})
+
+test('Qwen AI recovers one initial progress-only answer for an eligible next-step follow-up', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    isLikelyWorkflowProgressText: content => content.includes('inspect the folder'),
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-initial-followup-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    workflowContinuation: false,
+    failedToolResultPending: false,
+    managedWorkflowActive: false,
+    initialProgressRecoveryEligible: true,
+    allowedToolNames: new Set(['declared_tool']),
+    tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+    toolChoiceMode: 'auto',
+  })
+  handler.setChatId('test-chat')
+  const parents = []
+  let failure
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async parentId => {
+      parents.push(parentId)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end(`data: ${JSON.stringify({
+    'response.created': { response_id: 'initial-followup-progress', response_index: 0 },
+  })}\n\ndata: ${JSON.stringify({
+    response_id: 'initial-followup-progress',
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'I will inspect the folder next.' } }],
+  })}\n\ndata: [DONE]\n\n`)
+  setImmediate(() => {
+    continued.end(`data: ${JSON.stringify({
+      'response.created': { response_id: 'initial-followup-tool', response_index: 0 },
+    })}\n\ndata: ${JSON.stringify({
+      response_id: 'initial-followup-tool',
+      choices: [{ delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: { name: 'declared_tool', arguments: '{}' },
+      } }],
+    })}\n\ndata: [DONE]\n\n`)
+  })
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(parents, ['initial-followup-progress'])
+  assert.equal(failure, undefined)
+  assert.doesNotMatch(body, /I will inspect the folder next\./)
+  assert.match(body, /"name":"declared_tool"/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
 })
 
 test('Qwen AI stream rejects a dangling managed-tool answer when continuation is unavailable', async () => {

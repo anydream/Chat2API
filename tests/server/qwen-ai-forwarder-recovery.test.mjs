@@ -644,6 +644,7 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
     allowedToolNames: new Set(['lookup']),
     workflowContinuation: true,
     failedToolResultPending: false,
+    managedWorkflowActive: false,
   }
   const originallyInjectedContinuation = createRealToolWorkflowContinuationMessage({
     failedToolResultPending: false,
@@ -778,6 +779,151 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
 
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(deleteCalls, ['initial-chat'])
+  output.destroy()
+  initialUpstream.destroy()
+  restartedUpstream.destroy()
+})
+
+test('Qwen AI forwarder replays an eligible initial progress workflow without dropping its user turn', async () => {
+  const output = new PassThrough()
+  const initialUpstream = new PassThrough()
+  const restartedUpstream = new PassThrough()
+  const chatCalls = []
+  const continuationCalls = []
+  const deleteCalls = []
+  const bridgeOptions = []
+  const plan = {
+    protocol: 'managed_xml',
+    tools: [{
+      name: 'lookup',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+      source: 'openai',
+    }],
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['lookup']),
+    workflowContinuation: false,
+    failedToolResultPending: false,
+    managedWorkflowActive: false,
+    initialProgressRecoveryEligible: true,
+  }
+  const schemaDerivedRecovery = createRealToolWorkflowContinuationMessage({
+    failedToolResultPending: false,
+    requireManagedToolCall: true,
+    plan,
+  })
+  const transformedMessages = [
+    { role: 'user', content: 'implement the requested changes' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [{
+        id: 'inspect-call',
+        type: 'function',
+        function: { name: 'lookup', arguments: '{}' },
+      }],
+    },
+    { role: 'tool', tool_call_id: 'inspect-call', content: 'folder inspected' },
+    { role: 'assistant', content: 'The previous workflow is complete.' },
+    { role: 'user', content: 'What next? I need the implementation working.' },
+  ]
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion(request) {
+      chatCalls.push(request)
+      const isRestart = chatCalls.length > 1
+      return {
+        response: {
+          status: 200,
+          data: isRestart ? restartedUpstream : initialUpstream,
+          headers: {},
+        },
+        chatId: isRestart ? 'fresh-active-chat' : 'initial-active-chat',
+        parentId: null,
+      }
+    }
+
+    async continueChatCompletion(request) {
+      continuationCalls.push(request)
+      throw new Error('active workflow recovery must replay in a fresh chat')
+    }
+
+    async deleteChat(chatId) {
+      deleteCalls.push(chatId)
+      return true
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    getResponseId() { return 'active-workflow-response' }
+    isComplete() { return false }
+    prepareForWorkflowContinuation() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter,
+    QwenAiStreamHandler,
+    createQwenAiResumableStream: (stream, options) => {
+      bridgeOptions.push(options)
+      return stream
+    },
+    createToolWorkflowContinuationMessage: createRealToolWorkflowContinuationMessage,
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = () => ({
+    messages: transformedMessages,
+    plan,
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    {
+      model: 'model-1',
+      messages: transformedMessages,
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+
+  output.write('data: {"choices":[{"delta":{"content":""}}]}\n\n')
+  const result = await resultPromise
+  assert.equal(result.success, true)
+  assert.equal(chatCalls.length, 1)
+  assert.equal(bridgeOptions.length, 1)
+
+  const recoveryError = Object.assign(new Error('progress text ended the managed branch'), {
+    code: 'qwen_ai_semantic_incomplete',
+  })
+  const restarted = await bridgeOptions[0].continueWorkflow(
+    'active-workflow-response',
+    recoveryError,
+  )
+  assert.equal(restarted.data, restartedUpstream)
+  assert.equal(chatCalls.length, 2)
+  assert.deepEqual(chatCalls[1].messages, [
+    ...transformedMessages,
+    schemaDerivedRecovery,
+  ])
+  assert.equal(
+    chatCalls[1].messages.at(-2).content,
+    'What next? I need the implementation working.',
+    'fresh-chat replay must preserve the real trailing user turn',
+  )
+  assert.deepEqual(continuationCalls, [])
+
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(deleteCalls, ['initial-active-chat'])
   output.destroy()
   initialUpstream.destroy()
   restartedUpstream.destroy()

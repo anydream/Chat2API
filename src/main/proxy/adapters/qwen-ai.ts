@@ -25,6 +25,7 @@ import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../uti
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { getToolProtocol } from '../toolCalling/protocols'
+import { isLikelyWorkflowProgressText } from '../toolCalling/workflowHeuristics'
 import {
   getToolArgumentValidationIssues,
   normalizeArguments,
@@ -1260,11 +1261,20 @@ function isDanglingManagedToolAnswer(
   }
 
   // A successful tool result may legitimately be followed by a final text
-  // answer. Only an explicitly failed result or a structurally dangling
-  // protocol fragment is incomplete; workflow history alone is not enough to
-  // classify arbitrary prose as a missing tool call.
+  // answer. A managed continuation followed by clearly forward-looking
+  // assistant progress prose is the bounded exception: Qwen has ended the
+  // branch, but the workflow still has an actionable next step. Both states
+  // are computed from message structure, never from a client/task identifier.
   return plan.failedToolResultPending === true
     || /[:\uFF1A]\s*$/.test(content)
+    || (
+      (
+        plan.workflowContinuation === true
+        || plan.managedWorkflowActive === true
+        || plan.initialProgressRecoveryEligible === true
+      )
+      && isLikelyWorkflowProgressText(content)
+    )
 }
 
 function isQwenAiSemanticRecoveryError(error: unknown): boolean {

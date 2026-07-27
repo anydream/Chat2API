@@ -1349,7 +1349,9 @@ export class RequestForwarder {
                   || (
                     (recoveryCode === 'qwen_ai_semantic_incomplete'
                       || recoveryCode === 'qwen_ai_semantic_empty')
-                    && transformed.plan.workflowContinuation
+                    && (transformed.plan.workflowContinuation
+                      || transformed.plan.managedWorkflowActive
+                      || transformed.plan.initialProgressRecoveryEligible)
                     && !transformed.plan.failedToolResultPending
                   )
 

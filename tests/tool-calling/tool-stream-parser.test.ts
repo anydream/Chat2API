@@ -20,6 +20,7 @@ function plan(protocol: ToolCallingPlan['protocol'] = 'managed_xml'): ToolCallin
     allowedToolNames: new Set(['default_api:read_file']),
     workflowContinuation: false,
     failedToolResultPending: false,
+    managedWorkflowActive: false,
     diagnostics: {
       clientAdapterId: 'standard-openai-tools',
       providerId: 'deepseek',
@@ -33,6 +34,7 @@ function plan(protocol: ToolCallingPlan['protocol'] = 'managed_xml'): ToolCallin
       reason: 'test',
       workflowContinuation: false,
       failedToolResultPending: false,
+      managedWorkflowActive: false,
     },
   }
 }

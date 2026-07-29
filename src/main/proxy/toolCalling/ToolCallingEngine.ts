@@ -15,8 +15,14 @@ import {
   hasTrailingMatchedToolResultBatch,
   isToolResultMessage,
 } from './workflowHeuristics.ts'
+import { MANAGED_WORKFLOW_COMPLETE_MARKER } from './workflowCompletion.ts'
 
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
+
+const MANAGED_WORKFLOW_COMPLETION_PROMPT = [
+  'If no further tool operation is needed and the user request is fully complete, end the final answer with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + '.',
+  'Do not emit the completion marker in a progress update or alongside a tool call.',
+].join(' ')
 
 /**
  * Generic instruction used when a managed-tool turn needs another model
@@ -29,7 +35,8 @@ export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
   'If a previous tool call was rejected or had schema validation errors, discard that malformed call and retry it using the declared JSON Schema exactly: include every required field, use only declared properties when the schema is strict, and preserve the declared value types.',
   'Treat progress updates and plans as incomplete.',
-  'Return a final answer only after all requested operations are complete and verified by tool results.',
+  `Return a final answer only after all requested operations are complete and verified by tool results, and end that final answer with the exact marker ${MANAGED_WORKFLOW_COMPLETE_MARKER}.`,
+  'Do not emit the completion marker in a progress update or alongside a tool call.',
 ].join(' ')
 
 const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
@@ -323,7 +330,10 @@ function renderPrompt(
 ): string {
   const protocolPrompt = getToolProtocol(plan.protocol).renderPrompt(plan.tools)
   const policyPrompt = renderToolChoicePolicyPrompt(plan)
-  const prompt = policyPrompt ? `${protocolPrompt}\n\n${policyPrompt}` : protocolPrompt
+  const completionPrompt = plan.providerId === 'qwen-ai' && plan.allowedToolNames.size > 0
+    ? MANAGED_WORKFLOW_COMPLETION_PROMPT
+    : ''
+  const prompt = [protocolPrompt, policyPrompt, completionPrompt].filter(Boolean).join('\n\n')
   const customPromptTemplate = config.diagnosticsEnabled
     ? config.advanced.customPromptTemplate
     : undefined

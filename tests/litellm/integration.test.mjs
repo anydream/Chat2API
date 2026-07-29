@@ -26,6 +26,8 @@ const MOCK_UPSTREAM_MODEL = 'mock-model'
 const MOCK_UPSTREAM_KEY = 'sk-mock-upstream-not-real'
 const MIDSTREAM_ERROR_MODEL = 'litellm-midstream-error-mock'
 const ONE_PIXEL_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+const GENERATED_IMAGE_URL = 'https://images.example.invalid/qwen-generated.png'
+const GENERATED_IMAGE_MARKDOWN = `![Generated image 1](${GENERATED_IMAGE_URL})`
 
 test('bundled LiteLLM configuration keeps client probe and protocol bridge configurable', () => {
   const config = fs.readFileSync('deploy/litellm/config.yaml', 'utf8')
@@ -43,12 +45,13 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(config, /model_name:\s*["']\*["']/)
   assert.match(config, /model:\s*["']openai\/\*["']/)
   assert.match(config, /allowed_openai_params:\s*\[["']reasoning_effort["']\]/)
+  assert.match(config, /model_info:\s*\r?\n(?:\s*#.*\r?\n)*\s+supports_native_streaming:\s*true\b/)
   assert.doesNotMatch(config, /api\.anthropic\.com|claude-[\w-]+/i)
 
   assert.doesNotMatch(config, /CHAT2API_CONNECTIVITY_MODEL/)
   assert.doesNotMatch(compose, /CHAT2API_CONNECTIVITY_MODEL/)
   assert.doesNotMatch(compose, /Qwen3\.8-Max-Preview/)
-  assert.match(compose, /LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:\s*"\$\{LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true\}"/)
+  assert.match(compose, /LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:\s*"\$\{LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-false\}"/)
   assert.match(compose, /REQUEST_TIMEOUT:\s*"\$\{LITELLM_REQUEST_TIMEOUT:-900\}"/)
   assert.match(compose, /LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:\s*"\$\{LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000\}"/)
   assert.match(compose, /LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:\s*"\$\{LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:-true\}"/)
@@ -62,6 +65,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:-524288\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:-32768\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:-24576\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:-131072\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:-32\}/)
@@ -72,6 +76,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES=32768/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32/)
@@ -83,8 +88,13 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /event: error\\\\ndata:/)
   assert.match(patcher, /event: ping\\\\ndata: \{\"type\":\"ping\"\}/)
   assert.match(patcher, /RESPONSES_MODULE_PATH/)
+  assert.match(patcher, /RESPONSES_MAIN_MODULE_PATH/)
   assert.match(patcher, /responses_adapters/)
   assert.match(patcher, /RESPONSES_PATCHED_WRAPPER/)
+  assert.match(patcher, /_anthropic_responses_error_event/)
+  assert.match(patcher, /_queue_terminal_error/)
+  assert.match(patcher, /Upstream Responses stream ended before response\.completed/)
+  assert.match(patcher, /supports_native_streaming/)
   assert.match(patcher, /ANTHROPIC_ADAPTER_MODULE_PATH/)
   assert.match(patcher, /tool_result_error_by_id/)
   assert.match(patcher, /\["is_error"\] = tool_result_error_by_id/)
@@ -224,7 +234,24 @@ function messageText(messages = []) {
   }).join('\n')
 }
 
-function openAiResponse(model, content) {
+function responsesInputText(input = []) {
+  if (typeof input === 'string') return input
+  if (!Array.isArray(input)) return ''
+  return input.flatMap((item) => {
+    if (typeof item === 'string') return [item]
+    if (!item || typeof item !== 'object') return []
+    const directText = [item.text, item.output]
+      .filter((value) => typeof value === 'string')
+    const contentText = Array.isArray(item.content)
+      ? item.content
+          .filter((part) => part && typeof part === 'object' && typeof part.text === 'string')
+          .map((part) => part.text)
+      : []
+    return [...directText, ...contentText]
+  }).join('\n')
+}
+
+function openAiResponse(model, content, images = undefined) {
   return {
     id: 'chatcmpl-offline-mock',
     object: 'chat.completion',
@@ -232,7 +259,11 @@ function openAiResponse(model, content) {
     model,
     choices: [{
       index: 0,
-      message: { role: 'assistant', content },
+      message: {
+        role: 'assistant',
+        content,
+        ...(images ? { images } : {}),
+      },
       finish_reason: 'stop',
     }],
     usage: {
@@ -406,6 +437,150 @@ function writeOpenAiResponsesDelayedStream(response, model, delayMs = 450) {
   }, delayMs).unref()
 }
 
+function writeOpenAiResponsesMidstreamError(response, model) {
+  const writeEvent = (event) => {
+    response.write(`data: ${JSON.stringify(event)}\n\n`)
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'close',
+  })
+  writeEvent({
+    type: 'response.created',
+    response: {
+      id: 'resp-offline-midstream-error',
+      object: 'response',
+      model,
+      status: 'in_progress',
+      output: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_item.added',
+    output_index: 0,
+    item: {
+      type: 'message',
+      id: 'msg_offline_midstream_error',
+      status: 'in_progress',
+      role: 'assistant',
+      content: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_text.delta',
+    item_id: 'msg_offline_midstream_error',
+    output_index: 0,
+    content_index: 0,
+    delta: 'partial reply',
+  })
+  writeEvent({
+    type: 'error',
+    code: 'server_error',
+    message: 'synthetic upstream ECONNRESET aborted',
+    param: null,
+  })
+  response.end()
+}
+
+function writeOpenAiResponsesFailed(response, model) {
+  const writeEvent = (event) => {
+    response.write(`data: ${JSON.stringify(event)}\n\n`)
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'close',
+  })
+  writeEvent({
+    type: 'response.created',
+    response: {
+      id: 'resp-offline-failed-event',
+      object: 'response',
+      model,
+      status: 'in_progress',
+      output: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_item.added',
+    output_index: 0,
+    item: {
+      type: 'message',
+      id: 'msg_offline_failed_event',
+      status: 'in_progress',
+      role: 'assistant',
+      content: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_text.delta',
+    item_id: 'msg_offline_failed_event',
+    output_index: 0,
+    content_index: 0,
+    delta: 'partial reply',
+  })
+  writeEvent({
+    type: 'response.failed',
+    response: {
+      id: 'resp-offline-failed-event',
+      object: 'response',
+      model,
+      status: 'failed',
+      output: [],
+      error: {
+        code: 'server_error',
+        message: 'synthetic response.failed terminal',
+      },
+      usage: null,
+    },
+  })
+  response.end()
+}
+
+function writeOpenAiResponsesTransportFailure(response, model) {
+  const writeEvent = (event) => {
+    response.write(`data: ${JSON.stringify(event)}\n\n`)
+  }
+
+  response.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'close',
+  })
+  writeEvent({
+    type: 'response.created',
+    response: {
+      id: 'resp-offline-transport-error',
+      object: 'response',
+      model,
+      status: 'in_progress',
+      output: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_item.added',
+    output_index: 0,
+    item: {
+      type: 'message',
+      id: 'msg_offline_transport_error',
+      status: 'in_progress',
+      role: 'assistant',
+      content: [],
+    },
+  })
+  writeEvent({
+    type: 'response.output_text.delta',
+    item_id: 'msg_offline_transport_error',
+    output_index: 0,
+    content_index: 0,
+    delta: 'partial reply',
+  })
+  setTimeout(() => response.socket?.destroy(), 25).unref()
+}
+
 function writeOpenAiMidstreamError(response, model) {
   const base = {
     id: 'chatcmpl-offline-midstream-error',
@@ -481,6 +656,34 @@ async function startMockUpstream() {
     }
 
     if (request.url === '/v1/responses') {
+      const text = responsesInputText(body.input)
+      if (text.includes('UPSTREAM_ERROR')) {
+        response.writeHead(429, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({
+          error: {
+            message: 'synthetic offline rate limit',
+            type: 'rate_limit_error',
+            code: 'rate_limit',
+          },
+        }))
+        return
+      }
+
+      if (body.stream && text.includes('RESPONSES_FAILED_EVENT')) {
+        writeOpenAiResponsesFailed(response, body.model || MIDSTREAM_ERROR_MODEL)
+        return
+      }
+
+      if (body.stream && text.includes('RESPONSES_TRANSPORT_ERROR')) {
+        writeOpenAiResponsesTransportFailure(response, body.model || MIDSTREAM_ERROR_MODEL)
+        return
+      }
+
+      if (body.stream && text.includes('MIDSTREAM_ERROR')) {
+        writeOpenAiResponsesMidstreamError(response, body.model || MIDSTREAM_ERROR_MODEL)
+        return
+      }
+
       if (body.stream) {
         writeOpenAiResponsesDelayedStream(response, body.model || MOCK_UPSTREAM_MODEL)
         return
@@ -528,10 +731,80 @@ async function startMockUpstream() {
 
     const responseBody = text.includes('TOOL_CASE')
       ? openAiToolResponse(body.model || MOCK_UPSTREAM_MODEL)
-      : openAiResponse(body.model || MOCK_UPSTREAM_MODEL, 'offline non-stream reply')
+      : text.includes('IMAGE_MARKDOWN_CASE')
+        ? openAiResponse(
+            body.model || MOCK_UPSTREAM_MODEL,
+            GENERATED_IMAGE_MARKDOWN,
+            [{
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${ONE_PIXEL_PNG_BASE64}` },
+              source: 'qwen-ai',
+            }],
+          )
+        : openAiResponse(body.model || MOCK_UPSTREAM_MODEL, 'offline non-stream reply')
 
     response.writeHead(200, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify(responseBody))
+  })
+
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+
+  return { server, port: address.port, calls }
+}
+
+async function startRecordingProxy(targetPort) {
+  const calls = []
+  const server = http.createServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const rawBody = Buffer.concat(chunks)
+
+    let body = rawBody.toString('utf8')
+    try {
+      body = body ? JSON.parse(body) : null
+    } catch {
+      // Preserve malformed or non-JSON request bodies for diagnostics.
+    }
+
+    calls.push({
+      method: request.method,
+      url: request.url,
+      headers: { ...request.headers },
+      body,
+    })
+
+    const headers = { ...request.headers, host: `127.0.0.1:${targetPort}` }
+    delete headers.connection
+    delete headers['proxy-connection']
+
+    const upstreamRequest = http.request({
+      host: '127.0.0.1',
+      port: targetPort,
+      method: request.method,
+      path: request.url,
+      headers,
+    }, (upstreamResponse) => {
+      const responseHeaders = { ...upstreamResponse.headers }
+      delete responseHeaders.connection
+      response.writeHead(upstreamResponse.statusCode || 502, responseHeaders)
+      upstreamResponse.pipe(response)
+    })
+
+    upstreamRequest.on('error', (error) => {
+      if (response.headersSent) {
+        response.destroy(error)
+        return
+      }
+      response.writeHead(502, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify({ error: { message: error.message } }))
+    })
+    response.on('close', () => {
+      if (!response.writableEnded) upstreamRequest.destroy()
+    })
+    upstreamRequest.end(rawBody)
   })
 
   server.listen(0, '127.0.0.1')
@@ -601,6 +874,8 @@ function createLiteLlmConfig(chat2ApiPort, chat2ApiKey, mockPort) {
     '      num_retries: 0',
     '      allowed_openai_params: ["reasoning_effort"]',
     '      timeout: 20',
+    '    model_info:',
+    '      supports_native_streaming: true',
     'general_settings:',
     `  master_key: ${JSON.stringify(LITELLM_MASTER_KEY)}`,
     '  cancel_on_disconnect: true',
@@ -609,9 +884,8 @@ function createLiteLlmConfig(chat2ApiPort, chat2ApiKey, mockPort) {
     'litellm_settings:',
     '  drop_params: false',
     '  set_verbose: false',
-    // LiteLLM 1.93.0 routes openai/* deployments to /v1/responses by default.
-    // Chat2API exposes Chat Completions, so opt into the documented fallback.
-    '  use_chat_completions_url_for_anthropic_messages: true',
+    // Exercise the same Responses route enabled by docker-compose.litellm.yml.
+    '  use_chat_completions_url_for_anthropic_messages: false',
     '',
   ].join('\n')
 }
@@ -659,6 +933,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
   const [chat2ApiPort, liteLlmPort] = await reservePorts(2)
   const containerName = `chat2api-litellm-test-${process.pid}-${Date.now()}`
   let mock
+  let chat2ApiIngress
   let chat2ApiChild
   let liteLlmChild
 
@@ -674,6 +949,9 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
 
     await stopChild(liteLlmChild)
     await stopChild(chat2ApiChild)
+    if (chat2ApiIngress?.server.listening) {
+      await new Promise((resolve) => chat2ApiIngress.server.close(resolve))
+    }
     if (mock?.server.listening) {
       await new Promise((resolve) => mock.server.close(resolve))
     }
@@ -781,9 +1059,11 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
   })
   assert.equal(configResult.response.status, 200, configResult.text)
 
+  chat2ApiIngress = await startRecordingProxy(chat2ApiPort)
+
   fs.writeFileSync(
     liteLlmConfigPath,
-    createLiteLlmConfig(chat2ApiPort, chat2ApiKey, mock.port),
+    createLiteLlmConfig(chat2ApiIngress.port, chat2ApiKey, mock.port),
     'utf8',
   )
 
@@ -877,6 +1157,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
   })
 
   await t.test('converts a non-streaming Anthropic message through both proxies', async () => {
+    const ingressCallsBefore = chat2ApiIngress.calls.length
     const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
       method: 'POST',
       headers: anthropicHeaders(),
@@ -896,6 +1177,18 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(result.body.usage?.input_tokens, 11)
     assert.equal(result.body.usage?.output_tokens, 5)
 
+    const ingressCalls = chat2ApiIngress.calls
+      .slice(ingressCallsBefore)
+      .filter((candidate) => candidate.url === '/v1/responses')
+    assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+    const ingressCall = ingressCalls[0]
+    assert.equal(ingressCall.method, 'POST')
+    assert.equal(ingressCall.headers.authorization, `Bearer ${chat2ApiKey}`)
+    assert.equal(ingressCall.body.model, MOCK_MODEL_ALIAS)
+    assert.notEqual(ingressCall.body.stream, true)
+    assert.equal(ingressCall.body.instructions, 'You are an offline integration test.')
+    assert.match(JSON.stringify(ingressCall.body.input), /NON_STREAM_CASE/)
+
     const call = mock.calls.at(-1)
     assert.equal(call.url, '/v1/chat/completions')
     assert.equal(call.headers.authorization, `Bearer ${MOCK_UPSTREAM_KEY}`)
@@ -905,7 +1198,36 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.ok(call.body.messages.some((message) => message.role === 'system'))
   })
 
+  await t.test('keeps generated-image Markdown visible to Anthropic clients', async () => {
+    const ingressCallsBefore = chat2ApiIngress.calls.length
+    const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify(anthropicRequest({
+        messages: [{ role: 'user', content: 'IMAGE_MARKDOWN_CASE' }],
+      })),
+    })
+
+    assert.equal(result.response.status, 200, result.text)
+    const text = result.body.content
+      ?.filter((block) => block.type === 'text')
+      .map((block) => block.text || '')
+      .join('')
+    assert.equal(text, GENERATED_IMAGE_MARKDOWN)
+
+    const ingressCalls = chat2ApiIngress.calls
+      .slice(ingressCallsBefore)
+      .filter((candidate) => candidate.url === '/v1/responses')
+    assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+    assert.match(JSON.stringify(ingressCalls[0].body.input), /IMAGE_MARKDOWN_CASE/)
+
+    const upstreamCall = mock.calls.at(-1)
+    assert.equal(upstreamCall.url, '/v1/chat/completions')
+    assert.match(messageText(upstreamCall.body.messages), /IMAGE_MARKDOWN_CASE/)
+  })
+
   await t.test('emits Anthropic streaming SSE events', async () => {
+    const ingressCallsBefore = chat2ApiIngress.calls.length
     const response = await fetch(`${liteLlmBaseUrl}/v1/messages`, {
       method: 'POST',
       headers: anthropicHeaders(),
@@ -925,12 +1247,23 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.ok(eventTypes.includes('content_block_delta'), text)
     assert.ok(eventTypes.includes('message_delta'), text)
     assert.ok(eventTypes.includes('message_stop'), text)
+    assert.equal(eventTypes.filter((type) => type === 'message_start').length, 1, text)
+    assert.equal(eventTypes.at(-1), 'message_stop', text)
+
+    const ingressCalls = chat2ApiIngress.calls
+      .slice(ingressCallsBefore)
+      .filter((candidate) => candidate.url === '/v1/responses')
+    assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+    assert.equal(ingressCalls[0].body.stream, true, JSON.stringify(ingressCalls[0]))
+    assert.match(JSON.stringify(ingressCalls[0].body.input), /STREAM_CASE/)
+    const upstreamCall = mock.calls.at(-1)
+    assert.equal(upstreamCall.body.stream, true, JSON.stringify(upstreamCall))
 
     const streamedText = events
       .filter((event) => (event.event || event.data?.type) === 'content_block_delta')
       .map((event) => event.data?.delta?.text || '')
       .join('')
-    assert.equal(streamedText, 'offline stream reply')
+    assert.equal(streamedText, 'offline stream reply', JSON.stringify(upstreamCall))
   })
 
   await t.test('emits Anthropic ping events while an upstream stream is quiet', async () => {
@@ -950,7 +1283,8 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(response.status, 200, text)
 
     const call = mock.calls.at(-1)
-    assert.equal(call?.url, '/v1/chat/completions', JSON.stringify(call))
+    assert.equal(call?.url, '/v1/responses', JSON.stringify(call))
+    assert.equal(call?.body?.reasoning?.effort, 'high', JSON.stringify(call))
 
     const events = parseSse(text)
     const pingEvents = events.filter((event) => event.event === 'ping')
@@ -961,7 +1295,14 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       .filter((event) => (event.event || event.data?.type) === 'content_block_delta')
       .map((event) => event.data?.delta?.text || '')
       .join('')
-    assert.equal(streamedText, 'before pause after pause')
+    assert.equal(streamedText, 'after pause')
+    assert.ok(
+      events.some((event) => (
+        event.event === 'content_block_delta'
+        && event.data?.delta?.type === 'thinking_delta'
+      )),
+      text,
+    )
     assert.ok(
       events.findIndex((event) => event.event === 'ping')
         < events.findIndex((event) => (event.event || event.data?.type) === 'message_stop'),
@@ -1009,37 +1350,62 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(events.at(-1)?.event, 'message_stop', text)
   })
 
-  await t.test('terminates mid-stream provider failures with an Anthropic error event', async () => {
-    const response = await fetch(`${liteLlmBaseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: anthropicHeaders(),
-      body: JSON.stringify(anthropicRequest({
-        model: MIDSTREAM_ERROR_MODEL,
-        stream: true,
-        messages: [{ role: 'user', content: 'MIDSTREAM_ERROR' }],
-      })),
-      signal: AbortSignal.timeout(10_000),
-    })
-    const text = await response.text()
-    assert.equal(response.status, 200, text)
+  await t.test('terminates every Responses failure mode with an Anthropic error event', async (failureTest) => {
+    const cases = [
+      {
+        name: 'type:error event',
+        prompt: 'MIDSTREAM_ERROR',
+        messagePattern: /Response API in-stream error|MidStreamFallbackError/i,
+      },
+      {
+        name: 'response.failed event',
+        prompt: 'RESPONSES_FAILED_EVENT',
+        messagePattern: /Response API in-stream error|MidStreamFallbackError/i,
+      },
+      {
+        name: 'transport failure',
+        prompt: 'RESPONSES_TRANSPORT_ERROR',
+        messagePattern: /transport|connection|complete|ended|closed/i,
+      },
+    ]
 
-    const events = parseSse(text)
-    const errorEvents = events.filter((event) => event.event === 'error')
-    assert.equal(errorEvents.length, 1, text)
-    assert.equal(events.at(-1)?.event, 'error', text)
-    assert.equal(errorEvents[0].data?.type, 'error', text)
-    assert.equal(errorEvents[0].data?.error?.type, 'api_error', text)
-    assert.match(errorEvents[0].data?.error?.message || '', /ECONNRESET|aborted/i)
-    assert.ok(
-      events.some((event) => (
-        event.event === 'content_block_delta'
-        && event.data?.delta?.text === 'partial reply'
-      )),
-      text,
-    )
+    for (const failureCase of cases) {
+      await failureTest.test(failureCase.name, async () => {
+        const response = await fetch(`${liteLlmBaseUrl}/v1/messages`, {
+          method: 'POST',
+          headers: anthropicHeaders(),
+          body: JSON.stringify(anthropicRequest({
+            model: MIDSTREAM_ERROR_MODEL,
+            stream: true,
+            messages: [{ role: 'user', content: failureCase.prompt }],
+          })),
+          signal: AbortSignal.timeout(10_000),
+        })
+        const text = await response.text()
+        assert.equal(response.status, 200, text)
+
+        const events = parseSse(text)
+        const errorEvents = events.filter((event) => event.event === 'error')
+        assert.equal(errorEvents.length, 1, text)
+        assert.equal(events.at(-1)?.event, 'error', text)
+        assert.equal(errorEvents[0].data?.type, 'error', text)
+        assert.equal(errorEvents[0].data?.error?.type, 'api_error', text)
+        assert.match(errorEvents[0].data?.error?.message || '', failureCase.messagePattern)
+        assert.equal(events.filter((event) => event.event === 'message_start').length, 1, text)
+        assert.equal(events.some((event) => event.event === 'message_stop'), false, text)
+        assert.ok(
+          events.some((event) => (
+            event.event === 'content_block_delta'
+            && event.data?.delta?.text === 'partial reply'
+          )),
+          text,
+        )
+      })
+    }
   })
 
   await t.test('maps tools and a forced tool_choice to Anthropic tool_use', async () => {
+    const ingressCallsBefore = chat2ApiIngress.calls.length
     const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
       method: 'POST',
       headers: anthropicHeaders(),
@@ -1066,6 +1432,18 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(toolUse.name, 'get_weather')
     assert.deepEqual(toolUse.input, { city: 'Shanghai' })
 
+    const ingressCalls = chat2ApiIngress.calls
+      .slice(ingressCallsBefore)
+      .filter((candidate) => candidate.url === '/v1/responses')
+    assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+    const ingressCall = ingressCalls[0]
+    assert.equal(ingressCall.body.tools?.[0]?.type, 'function')
+    assert.equal(ingressCall.body.tools?.[0]?.name, 'get_weather')
+    assert.deepEqual(ingressCall.body.tool_choice, {
+      type: 'function',
+      name: 'get_weather',
+    })
+
     const call = mock.calls.at(-1)
     assert.equal(call.body.tools?.[0]?.function?.name, 'get_weather')
     assert.deepEqual(call.body.tool_choice, {
@@ -1076,6 +1454,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
 
   await t.test('maps Anthropic tool_result continuation messages to OpenAI tool messages', async () => {
     const toolUseId = 'call_offline_weather_previous'
+    const ingressCallsBefore = chat2ApiIngress.calls.length
     const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
       method: 'POST',
       headers: anthropicHeaders(),
@@ -1116,6 +1495,21 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(result.response.status, 200, result.text)
     assert.equal(result.body.content?.[0]?.text, 'offline non-stream reply')
 
+    const ingressCalls = chat2ApiIngress.calls
+      .slice(ingressCallsBefore)
+      .filter((candidate) => candidate.url === '/v1/responses')
+    assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+    const ingressInput = ingressCalls[0].body.input
+    const functionCall = ingressInput.find((item) => item.type === 'function_call')
+    assert.ok(functionCall, JSON.stringify(ingressInput))
+    assert.equal(functionCall.call_id, toolUseId)
+    assert.equal(functionCall.name, 'get_weather')
+    assert.deepEqual(JSON.parse(functionCall.arguments || '{}'), { city: 'Shanghai' })
+    const functionOutput = ingressInput.find((item) => item.type === 'function_call_output')
+    assert.ok(functionOutput, JSON.stringify(ingressInput))
+    assert.equal(functionOutput.call_id, toolUseId)
+    assert.equal(functionOutput.output, 'Sunny, 25 C')
+
     const call = mock.calls.at(-1)
     const assistantMessage = call.body.messages.find((message) =>
       message.role === 'assistant' && Array.isArray(message.tool_calls)
@@ -1133,18 +1527,20 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.ok(toolMessage, JSON.stringify(call.body.messages))
     assert.equal(toolMessage.tool_call_id, toolUseId)
     assert.equal(toolMessage.content, 'Sunny, 25 C')
-    assert.equal(toolMessage.is_error, true)
+    assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
   })
 
-  await t.test('preserves explicit Anthropic tool_result is_error booleans without inventing a default', async () => {
+  await t.test('preserves tool_result call IDs and contents through Responses', async () => {
     for (const isError of [true, false, undefined]) {
       const toolUseId = `call_offline_error_state_${String(isError)}`
+      const expectedOutput = `tool result state ${String(isError)}`
       const toolResult = {
         type: 'tool_result',
         tool_use_id: toolUseId,
-        content: `tool result state ${String(isError)}`,
+        content: expectedOutput,
         ...(isError === undefined ? {} : { is_error: isError }),
       }
+      const ingressCallsBefore = chat2ApiIngress.calls.length
       const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
         method: 'POST',
         headers: anthropicHeaders(),
@@ -1175,15 +1571,22 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       })
 
       assert.equal(result.response.status, 200, result.text)
+      const ingressCalls = chat2ApiIngress.calls
+        .slice(ingressCallsBefore)
+        .filter((candidate) => candidate.url === '/v1/responses')
+      assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+      const functionOutput = ingressCalls[0].body.input.find((item) => (
+        item.type === 'function_call_output' && item.call_id === toolUseId
+      ))
+      assert.ok(functionOutput, JSON.stringify(ingressCalls[0].body.input))
+      assert.equal(functionOutput.output, expectedOutput)
+
       const toolMessage = mock.calls.at(-1)?.body?.messages?.find((message) =>
         message.role === 'tool' && message.tool_call_id === toolUseId
       )
       assert.ok(toolMessage, JSON.stringify(mock.calls.at(-1)?.body?.messages))
-      if (isError === undefined) {
-        assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
-      } else {
-        assert.equal(toolMessage.is_error, isError)
-      }
+      assert.equal(toolMessage.content, expectedOutput)
+      assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
     }
   })
 

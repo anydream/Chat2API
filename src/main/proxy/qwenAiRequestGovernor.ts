@@ -7,7 +7,11 @@ import type {
   QwenAiGovernorConfig,
 } from '../store/types'
 import { normalizeQwenAiGovernorConfig } from '../store/types'
-import type { QwenAiGovernorEffectiveConfig, QwenAiGovernorStatus } from '../../shared/types'
+import type {
+  QwenAiAccountFailoverRecord,
+  QwenAiGovernorEffectiveConfig,
+  QwenAiGovernorStatus,
+} from '../../shared/types'
 import {
   calculateQwenAiAdaptiveLimits,
   calculateQwenAiRequestReadyAt,
@@ -234,6 +238,7 @@ export class QwenAiRequestGovernor {
   private activeByAccount: Map<string, number> = new Map()
   private globalCooldown: CooldownState | undefined
   private riskEvents: RiskEvent[] = []
+  private recentFailovers: ReadonlyMap<string, QwenAiAccountFailoverRecord> = new Map()
   private nextQueueItemId = 1
 
   run(accountId: string, run: () => Promise<ForwardResult>, options: QwenAiGovernorRunOptions = {}): Promise<ForwardResult> {
@@ -311,7 +316,9 @@ export class QwenAiRequestGovernor {
       success: false,
       status: 499,
       error: message,
+      errorCode: 'qwen_ai_client_cancelled',
       retryable: false,
+      accountFault: false,
     }
   }
 
@@ -324,7 +331,9 @@ export class QwenAiRequestGovernor {
         'Retry-After': String(retryAfterSeconds),
       },
       error: `Qwen AI request waited in queue for more than ${retryAfterSeconds}s.`,
+      errorCode: 'qwen_ai_queue_timeout',
       retryable: true,
+      accountFault: false,
     }
   }
 
@@ -682,6 +691,9 @@ export class QwenAiRequestGovernor {
         'Retry-After': String(retryAfterSeconds),
       },
       error: `Qwen AI global risk circuit is open; retry after ${retryAfterSeconds}s`,
+      errorCode: 'qwen_ai_global_risk_circuit',
+      retryable: false,
+      accountFault: false,
     }
   }
 
@@ -738,6 +750,7 @@ export class QwenAiRequestGovernor {
     count: number
     lastFailTime: number
     cooldownUntil?: number
+    recoveryUntil?: number
     reason?: string
   }> = {}): {
     accountCount: number
@@ -813,6 +826,7 @@ export class QwenAiRequestGovernor {
     count: number
     lastFailTime: number
     cooldownUntil?: number
+    recoveryUntil?: number
     reason?: string
   }>): QwenAiGovernorEffectiveConfig {
     const config = this.getConfig()
@@ -847,6 +861,7 @@ export class QwenAiRequestGovernor {
       count: number
       lastFailTime: number
       cooldownUntil?: number
+      recoveryUntil?: number
       reason?: string
     }> = {},
   ): QwenAiGovernorStatus {
@@ -867,6 +882,8 @@ export class QwenAiRequestGovernor {
       this.expireCooldown(account.id, now)
       const governorCooldown = this.accountCooldowns.get(account.id)
       const loadBalancerFailure = loadBalancerFailures[account.id]
+      const loadBalancerFailuresCount = loadBalancerFailure?.count || 0
+      const recentFailover = this.recentFailovers.get(account.id)
       const accountNextAvailableAt = this.accountNextAvailableAt.get(account.id) || 0
       const readyAt = Math.max(
         globalNextAvailableAt,
@@ -895,8 +912,15 @@ export class QwenAiRequestGovernor {
             ? loadBalancerFailure.cooldownUntil
             : undefined,
         loadBalancerCooldownInMs: Math.max(0, (loadBalancerFailure?.cooldownUntil || 0) - now),
-        loadBalancerReason: loadBalancerFailure?.reason,
-        loadBalancerFailures: loadBalancerFailure?.count || 0,
+        loadBalancerRecoveryUntil:
+          loadBalancerFailure?.recoveryUntil && loadBalancerFailure.recoveryUntil > now
+            ? loadBalancerFailure.recoveryUntil
+            : undefined,
+        loadBalancerRecoveryInMs: Math.max(0, (loadBalancerFailure?.recoveryUntil || 0) - now),
+        loadBalancerReason:
+          loadBalancerFailure?.reason || (loadBalancerFailuresCount > 0 ? 'request_failure' : undefined),
+        loadBalancerFailures: loadBalancerFailuresCount,
+        recentFailover: recentFailover ? { ...recentFailover } : undefined,
       }
     })
 
@@ -916,6 +940,19 @@ export class QwenAiRequestGovernor {
       recentRiskAccounts,
       accounts: accountStatuses,
     }
+  }
+
+  reportAccountFailover(
+    accountId: string,
+    record: Omit<QwenAiAccountFailoverRecord, 'timestamp'> & { timestamp?: number },
+  ): void {
+    const nextRecord: QwenAiAccountFailoverRecord = {
+      ...record,
+      timestamp: record.timestamp ?? Date.now(),
+    }
+    const nextFailovers = new Map(this.recentFailovers)
+    nextFailovers.set(accountId, nextRecord)
+    this.recentFailovers = nextFailovers
   }
 
   clearAccountCooldown(accountId: string): void {

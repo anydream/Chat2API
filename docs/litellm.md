@@ -1,16 +1,17 @@
 # Anthropic Compatibility with LiteLLM
 
-Chat2API exposes OpenAI-compatible endpoints. LiteLLM provides the Anthropic-compatible `/v1/messages` boundary and converts requests to Chat2API's `/v1/chat/completions` endpoint.
+Chat2API exposes OpenAI-compatible endpoints. LiteLLM provides the Anthropic-compatible `/v1/messages` boundary and converts requests to Chat2API's `/v1/responses` endpoint.
 
 ```text
 Anthropic client -> LiteLLM :4000 -> Chat2API :8080 -> configured provider
 ```
 
 The Compose file builds a small derived image from LiteLLM `1.93.0`. The build
-applies the upstream-compatible Anthropic mid-stream error fix and emits
-standard Anthropic `ping` events during quiet upstream periods. Provider
-failures therefore terminate with a valid `event: error`, while a healthy but
-temporarily quiet stream continues producing transport bytes. Its wildcard
+applies the Anthropic mid-stream error fix to both Chat Completions and
+Responses translations, and emits standard Anthropic `ping` events during
+quiet upstream periods. A Responses `type:error`, `response.failed`, transport
+exception, or premature EOF therefore terminates with a valid `event: error`,
+while a healthy but temporarily quiet stream ends with `message_stop`. Its wildcard
 route preserves the incoming model name, so a request for `client-model`
 reaches Chat2API as `client-model`.
 Configure that name in Chat2API's model mappings when the provider uses a
@@ -23,7 +24,7 @@ Start the Chat2API proxy on `127.0.0.1:8080` first. This can be the desktop appl
 ```powershell
 # Interactive streams should use the defaults below. Early provider failures
 # retain their HTTP status until the first client-visible SSE frame.
-$env:CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
+$env:CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
 $env:CHAT2API_SSE_KEEPALIVE_INTERVAL_MS = '15000'
 
 npm run build:server
@@ -161,18 +162,26 @@ provider selection.
 
 ## Compatibility Details
 
-LiteLLM 1.93.0 normally sends Anthropic Messages requests for an OpenAI target to the OpenAI Responses API. Chat2API does not expose `/v1/responses`, so the Compose service enables the protocol bridge through the configurable environment value:
+LiteLLM 1.93.0 normally sends Anthropic Messages requests for an OpenAI target to the OpenAI Responses API. Chat2API exposes that endpoint, so the Compose service keeps the native Responses bridge enabled through the configurable environment value:
 
 ```text
-LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=true
+LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES=false
 ```
 
-Keep this enabled when the selected Chat2API target only exposes Chat
-Completions; override it only when the target also supports the Responses API.
-The supplied config reads the value from the environment so it does not encode
-a client-specific model or request path. It also strips the non-Anthropic
-`usage.total_tokens` extension and drops parameters that cannot be represented
-by the selected OpenAI-compatible provider.
+Keep the default for current Chat2API releases. Set the value to `true` only
+when the LiteLLM deployment is intentionally pointed at an older compatible
+target that exposes Chat Completions but not Responses. The supplied config
+reads the value from the environment so it does not encode a client-specific
+model or request path. It also strips the non-Anthropic `usage.total_tokens`
+extension and drops parameters that cannot be represented by the selected
+OpenAI-compatible provider.
+
+The wildcard deployment explicitly declares `supports_native_streaming: true`.
+Without that declaration LiteLLM cannot infer streaming support for its
+internal `openai/*` model id and buffers a non-streaming Responses request into
+synthetic SSE. Chat2API's `/v1/responses` stream is native SSE, so the explicit
+capability keeps first-byte and incremental output behavior intact for Claude
+Code.
 
 Anthropic `count_tokens` requests use the local LiteLLM tokenizer by default:
 
@@ -180,8 +189,8 @@ Anthropic `count_tokens` requests use the local LiteLLM tokenizer by default:
 LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY=true
 ```
 
-This avoids probing the OpenAI Responses token-counting endpoint when the
-Chat2API target only exposes Chat Completions. The bundled image patch counts
+This avoids probing the separate OpenAI Responses token-counting endpoint,
+which Chat2API does not currently expose. The bundled image patch counts
 Anthropic `system`, `tools`, and `image`/`source` content in the same local
 path. Set the value to `false` only when the configured target provides a
 compatible `/responses/input_tokens` endpoint.
@@ -206,18 +215,16 @@ after Chat2API returns a queue `429` or a client cancellation. Configure
 retries in a separately managed LiteLLM route only when the upstream operation
 is known to be idempotent.
 
-The adapter covers regular messages, streaming SSE, Anthropic tool use, tool results, and token counting. Actual support for thinking, images, tools, and other model features still depends on the provider selected by Chat2API.
+The adapter covers regular messages, streaming SSE, Anthropic tool use, tool results, and token counting. Actual support for thinking, images, tools, and other model features still depends on the provider selected by Chat2API. When a provider such as Qwen returns generated-image URLs, Chat2API includes stable Markdown image links in the assistant text; those links survive the Responses-to-Anthropic conversion and are visible to Claude and Claude Code. Structured `image_generation_call` items are additional Responses metadata and should not be the only representation relied on by Anthropic clients.
 
-For Qwen AI managed-tool requests, live SSE forwarding is the default. This
-keeps the first generated bytes visible to the downstream client even when a
-generation lasts several minutes. Deployments that explicitly need atomic
-validation can set `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true`; in that mode
-Chat2API withholds the managed branch until terminal validation completes.
+For Qwen AI managed-tool requests, atomic SSE validation is the default.
+Chat2API withholds the managed branch until terminal validation completes, and
+LiteLLM emits Anthropic ping events while the upstream response is quiet.
 Validation failures can then be retried before any bytes are committed. Set
 `CHAT2API_QWEN_AI_RETRY_COUNT=0` to disable the opt-in recovery retry or use an
 integer from `1` to `10` to override its count.
-Do not enable full buffering for an interactive client unless the delayed first
-byte is explicitly acceptable.
+Set `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false` only when delayed first-byte
+delivery is less acceptable than losing transparent recovery after output.
 
 Before live forwarding, Chat2API waits for the first client-visible SSE frame
 or a terminal provider failure. This preserves a pre-output failure's HTTP
@@ -271,6 +278,10 @@ to `0` to disable recovery and return the original upstream failure.
 Qwen transcript compaction is controlled by
 `CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES` (default `524288`). Requests within the
 aggregate budget are preserved unchanged. Only over-budget requests apply the
+provider-envelope reserve `CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES`
+(default `32768`); rendered prompts are measured after JSON serialization so
+escaping and fixed request fields do not consume the upstream limit silently.
+Over-budget requests then apply the
 retained-message and tool-result limits
 `CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES` (default `131072`) and
 `CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES` (default `24576`), plus the
@@ -278,7 +289,7 @@ deduplicated attachment limit `CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS`
 (default `32`).
 For managed-tool semantic terminals, the proxy submits a generic continuation
 user turn in the same Qwen chat, parented to the latest response id. This path
-is bounded by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `1`),
+is bounded by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `3`),
 does not replay the original prompt or uploaded files, and can be disabled with
 `0`.
 Qwen can briefly reject that continuation with HTTP 200 and

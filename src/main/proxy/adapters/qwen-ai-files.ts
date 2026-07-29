@@ -31,6 +31,7 @@ const DOCUMENT_EVIDENCE_SNIPPET_CHARS = 1600
 // provider request below common gateway body limits while retaining the active
 // workflow. Deployments can tune these values for a different upstream limit.
 const QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT = 512 * 1024
+const QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES_DEFAULT = 32 * 1024
 const QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES_DEFAULT = 24 * 1024
 const QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES_DEFAULT = 128 * 1024
 const QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS_DEFAULT = 32
@@ -322,6 +323,16 @@ function positiveIntegerFromEnv(name: string, fallback: number): number {
 
   const parsed = Number(raw)
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
+}
+
+function nonNegativeIntegerFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw === undefined || raw.trim() === '') {
+    return fallback
+  }
+
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback
 }
 
 function boundedPositiveIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
@@ -1103,17 +1114,30 @@ function nextLocalToolCallId(rawId: string, usedIds: Set<string>, fallbackIndex:
 
 export interface QwenAiTranscriptBudget {
   maxBytes: number
+  requestReserveBytes: number
   toolResultMaxBytes: number
   messageMaxBytes: number
   maxFileParts: number
 }
 
 export function getQwenAiTranscriptBudget(): QwenAiTranscriptBudget {
-  return {
-    maxBytes: positiveIntegerFromEnv(
-      'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
-      QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT,
+  const maxBytes = positiveIntegerFromEnv(
+    'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
+    QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT,
+  )
+  // Keep the reserve proportional for deliberately small test/deployment
+  // budgets while retaining the normal 32 KiB provider-envelope allowance.
+  const requestReserveBytes = Math.min(
+    Math.max(0, Math.floor(maxBytes / 4)),
+    nonNegativeIntegerFromEnv(
+      'CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES',
+      QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES_DEFAULT,
     ),
+  )
+
+  return {
+    maxBytes,
+    requestReserveBytes,
     toolResultMaxBytes: positiveIntegerFromEnv(
       'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
       QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES_DEFAULT,
@@ -1655,6 +1679,13 @@ export function compactQwenAiTranscriptMessages(
   const configured = getQwenAiTranscriptBudget()
   const budget: QwenAiTranscriptBudget = {
     maxBytes: Math.max(1, overrides.maxBytes ?? configured.maxBytes),
+    requestReserveBytes: Math.max(
+      0,
+      Math.min(
+        Math.floor(Math.max(1, overrides.maxBytes ?? configured.maxBytes) / 4),
+        overrides.requestReserveBytes ?? configured.requestReserveBytes,
+      ),
+    ),
     toolResultMaxBytes: Math.max(1, overrides.toolResultMaxBytes ?? configured.toolResultMaxBytes),
     messageMaxBytes: Math.max(1, overrides.messageMaxBytes ?? configured.messageMaxBytes),
     maxFileParts: Math.max(1, overrides.maxFileParts ?? configured.maxFileParts),
@@ -1884,21 +1915,46 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
  * smallest valid history cannot fit, send an empty prompt rather than a
  * truncated XML document.
  */
+function estimateQwenPromptWireBytes(content: string): number {
+  return Buffer.byteLength(JSON.stringify(content), 'utf8')
+}
+
+function qwenPromptWireLimit(budget: QwenAiTranscriptBudget): number {
+  return Math.max(2, budget.maxBytes - budget.requestReserveBytes)
+}
+
 function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
   const budget = getQwenAiTranscriptBudget()
-  const initialMessages = compactQwenAiTranscriptMessages(messages)
-  let prepared = renderQwenAiTranscript(initialMessages)
-  if (Buffer.byteLength(prepared.content, 'utf8') <= budget.maxBytes) {
+  const wireLimit = qwenPromptWireLimit(budget)
+  let candidateMaxBytes = budget.maxBytes
+  let prepared = renderQwenAiTranscript(compactQwenAiTranscriptMessages(messages, {
+    ...budget,
+    maxBytes: candidateMaxBytes,
+  }))
+  let wireBytes = estimateQwenPromptWireBytes(prepared.content)
+  if (wireBytes <= wireLimit) {
     return prepared
   }
 
-  for (const scale of [0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
+  const initialWireBytes = wireBytes
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const proportionalTarget = Math.floor(candidateMaxBytes * (wireLimit / Math.max(1, wireBytes)) * 0.98)
+    const nextMaxBytes = Math.max(1, Math.min(candidateMaxBytes - 1, proportionalTarget))
+    if (nextMaxBytes >= candidateMaxBytes) break
+    candidateMaxBytes = nextMaxBytes
     const candidateMessages = compactQwenAiTranscriptMessages(messages, {
       ...budget,
-      maxBytes: Math.floor(budget.maxBytes * scale),
+      maxBytes: candidateMaxBytes,
     })
     prepared = renderQwenAiTranscript(candidateMessages)
-    if (Buffer.byteLength(prepared.content, 'utf8') <= budget.maxBytes) {
+    wireBytes = estimateQwenPromptWireBytes(prepared.content)
+    if (wireBytes <= wireLimit) {
+      console.warn('[QwenAI] Compacted rendered prompt for provider request budget', JSON.stringify({
+        initialWireBytes,
+        retainedWireBytes: wireBytes,
+        wireLimit,
+        requestReserveBytes: budget.requestReserveBytes,
+      }))
       return prepared
     }
   }
@@ -2390,19 +2446,33 @@ function renderDocumentEvidence(evidences: QwenAiDocumentEvidence[]): string {
 function combineQwenTranscriptAndEvidence(
   transcript: string,
   evidence: string,
-  maxBytes: number,
+  maxWireBytes: number,
 ): string {
   if (!evidence) return transcript
 
   const separator = '\n\n'
-  const availableEvidenceBytes = maxBytes
-    - Buffer.byteLength(transcript, 'utf8')
-    - Buffer.byteLength(separator, 'utf8')
-  if (availableEvidenceBytes <= 0) {
+  const fullContent = `${transcript}${separator}${evidence}`
+  if (estimateQwenPromptWireBytes(fullContent) <= maxWireBytes) {
+    return fullContent
+  }
+  if (estimateQwenPromptWireBytes(`${transcript}${separator}`) > maxWireBytes) {
     return transcript
   }
 
-  return `${transcript}${separator}${truncateQwenTranscriptText(evidence, availableEvidenceBytes)}`
+  let low = 0
+  let high = Buffer.byteLength(evidence, 'utf8')
+  let retained = transcript
+  while (low <= high) {
+    const midpoint = Math.floor((low + high) / 2)
+    const candidate = `${transcript}${separator}${truncateQwenTranscriptText(evidence, midpoint)}`
+    if (estimateQwenPromptWireBytes(candidate) <= maxWireBytes) {
+      retained = candidate
+      low = midpoint + 1
+    } else {
+      high = midpoint - 1
+    }
+  }
+  return retained
 }
 
 export class QwenAiFileUploader {
@@ -2828,6 +2898,7 @@ export async function prepareQwenAiMultimodalMessage(
   }
 
   const documentEvidence = renderDocumentEvidence(evidences)
+  const transcriptBudget = getQwenAiTranscriptBudget()
   const content = documentEvidence
     ? `${userContent}\n\n${documentEvidence}`
     : userContent
@@ -2835,7 +2906,7 @@ export async function prepareQwenAiMultimodalMessage(
     ? combineQwenTranscriptAndEvidence(
         userContent,
         documentEvidence,
-        getQwenAiTranscriptBudget().maxBytes,
+        qwenPromptWireLimit(transcriptBudget),
       )
     : content
 

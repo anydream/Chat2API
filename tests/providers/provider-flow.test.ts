@@ -216,6 +216,8 @@ test('Kimi K2.6 and K3 model mappings reach current web chat payloads', () => {
   assert.equal(normalizeProviderModelForMatch('kimi-k2.6'), 'Kimi-K2.6')
   assert.equal(normalizeProviderModelForMatch('k2d5'), 'Kimi-K2.6')
   assert.equal(normalizeProviderModelForMatch('k2d6'), 'Kimi-K2.6')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max-Preview[1m]'), 'Qwen3.8-Max-Preview')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max-Preview-thinking[1m]'), 'Qwen3.8-Max-Preview')
 
   const k2Payload = createKimiChatPayload({
     model: 'k2d5',

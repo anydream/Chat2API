@@ -12,7 +12,11 @@ import { Account, Provider } from '../../store/types'
 import type { ChatMessage } from '../types'
 import type { ProviderModelCapability } from '../../../shared/types'
 import { hasToolUse, parseToolUse } from '../promptToolUse'
-import { QwenAiTokenRefresher } from './qwen-ai-token-refresh'
+import {
+  hasQwenAiSessionCookie,
+  QwenAiTokenRefresher,
+  resolveQwenAiAuthHeaders,
+} from './qwen-ai-token-refresh'
 import {
   QwenAiFileUploader,
   QWEN_AI_DOCUMENT_EVIDENCE_MARKER,
@@ -25,6 +29,11 @@ import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../uti
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { getToolProtocol } from '../toolCalling/protocols'
+import {
+  hasManagedWorkflowCompletionMarker,
+  requiresManagedWorkflowCompletionMarker,
+  stripManagedWorkflowCompletionMarker,
+} from '../toolCalling/workflowCompletion'
 import {
   getToolArgumentValidationIssues,
   normalizeArguments,
@@ -157,6 +166,15 @@ interface ChatCompletionRequest {
   temperature?: number
   enable_thinking?: boolean
   thinking_budget?: number
+  /** Internal hint set by an OpenAI Responses image_generation tool request. */
+  image_generation?: {
+    enabled: true
+    size?: string
+    model?: string
+    quality?: string
+    format?: string
+    action?: 'auto' | 'generate' | 'edit'
+  }
   chatId?: string
   signal?: AbortSignal
 }
@@ -210,7 +228,7 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
 export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
   return Math.min(
     3,
-    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS', 1),
+    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS', 3),
   )
 }
 
@@ -363,6 +381,9 @@ function isMeaningfulQwenAiEvent(
 
     const content = delta.content
     const reasoning = delta.reasoning_content
+    const generatedImages = isQwenAiImageGenerationPhase(delta.phase)
+      ? extractQwenAiGeneratedImages(delta.extra)
+      : []
     const summaryText = isObjectValue(delta.extra)
       && isObjectValue(delta.extra.summary_thought)
       && Array.isArray(delta.extra.summary_thought.content)
@@ -373,6 +394,7 @@ function isMeaningfulQwenAiEvent(
 
     return (typeof content === 'string' && content.length > 0)
       || (typeof reasoning === 'string' && reasoning.length > 0)
+      || generatedImages.length > 0
       || (delta.phase === 'thinking_summary' && summaryText.length > previousSummaryLength)
       || (delta.status === 'finished' && (delta.phase === 'answer' || delta.phase === null))
       || (typeof choice.finish_reason === 'string' && Boolean(choice.finish_reason))
@@ -1078,6 +1100,282 @@ function isObjectValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
+export type QwenAiGeneratedImage = {
+  type: 'image_url'
+  image_url: { url: string }
+  source: 'qwen-ai'
+}
+
+export type QwenAiImageGenerationOptions = {
+  chatType: 't2i'
+  size: string
+  model: string
+}
+
+const QWEN_AI_DEFAULT_IMAGE_SIZE = '1:1'
+const QWEN_AI_DEFAULT_IMAGE_MODEL = 'qwen-image-2.0-pro'
+const QWEN_AI_IMAGE_EXTRA_MAX_DEPTH = 6
+const QWEN_AI_IMAGE_EXTRA_MAX_NODES = 512
+const QWEN_AI_IMAGE_EXTRA_MAX_RESULTS = 32
+const QWEN_AI_IMAGE_JSON_MAX_BYTES = 64 * 1024 * 1024
+const QWEN_AI_IMAGE_MAX_ENCODED_BYTES = 16 * 1024 * 1024
+const QWEN_AI_IMAGE_MAX_TOTAL_ENCODED_BYTES = 32 * 1024 * 1024
+const QWEN_AI_IMAGE_CONTAINER_KEYS = [
+  'images',
+  'image_list',
+  'result',
+  'results',
+  'output',
+  'outputs',
+  'tool_result',
+  'data',
+] as const
+const QWEN_AI_IMAGE_VALUE_KEYS = [
+  'image',
+  'image_url',
+  'b64_json',
+  'base64',
+] as const
+
+function isQwenAiImageGenerationPhase(phase: unknown): boolean {
+  return phase === 'image_gen_tool' || phase === 'image_generation'
+}
+
+/**
+ * Translate the OpenAI image size vocabulary into ratios accepted by Qwen's
+ * web image-generation mode. Unknown values use the deterministic default so
+ * a client-specific spelling never leaks into the provider payload.
+ */
+export function resolveQwenAiImageGenerationOptions(
+  value: ChatCompletionRequest['image_generation'],
+): QwenAiImageGenerationOptions | undefined {
+  if (value?.enabled !== true) return undefined
+
+  const requestedSize = typeof value.size === 'string' ? value.size.trim().toLowerCase() : ''
+  const sizeAliases: Record<string, string> = {
+    auto: QWEN_AI_DEFAULT_IMAGE_SIZE,
+    '1024x1024': '1:1',
+    '1536x1024': '4:3',
+    '1024x1536': '3:4',
+    '1792x1024': '16:9',
+    '1024x1792': '9:16',
+  }
+  const allowedSizes = new Set(['1:1', '3:4', '4:3', '16:9', '9:16'])
+  const size = sizeAliases[requestedSize]
+    ?? (allowedSizes.has(requestedSize) ? requestedSize : QWEN_AI_DEFAULT_IMAGE_SIZE)
+  const requestedModel = typeof value.model === 'string' ? value.model.trim() : ''
+
+  return {
+    chatType: 't2i',
+    size,
+    model: requestedModel || QWEN_AI_DEFAULT_IMAGE_MODEL,
+  }
+}
+
+function inferBase64ImageMimeType(value: string): string | undefined {
+  const prefix = Buffer.from(value.slice(0, 128), 'base64')
+  if (prefix.length >= 8 && prefix.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return 'image/png'
+  }
+  if (prefix.length >= 3 && prefix[0] === 0xff && prefix[1] === 0xd8 && prefix[2] === 0xff) {
+    return 'image/jpeg'
+  }
+  if (prefix.length >= 6) {
+    const signature = prefix.subarray(0, 6).toString('ascii')
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif'
+  }
+  if (
+    prefix.length >= 12
+    && prefix.subarray(0, 4).toString('ascii') === 'RIFF'
+    && prefix.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    return 'image/webp'
+  }
+  if (prefix.length >= 2 && prefix[0] === 0x42 && prefix[1] === 0x4d) {
+    return 'image/bmp'
+  }
+  if (prefix.length >= 12 && prefix.subarray(4, 12).toString('ascii').includes('ftypavif')) {
+    return 'image/avif'
+  }
+  return undefined
+}
+
+function normalizeBase64Image(value: string): { encoded: string; mimeType: string } | undefined {
+  if (!value || value.length > QWEN_AI_IMAGE_MAX_ENCODED_BYTES || /\s/.test(value)) return undefined
+
+  const firstPadding = value.indexOf('=')
+  const base = firstPadding >= 0 ? value.slice(0, firstPadding) : value
+  const padding = firstPadding >= 0 ? value.slice(firstPadding) : ''
+  if (!/^[a-z0-9+/]+$/i.test(base) || !/^={0,2}$/.test(padding)) return undefined
+
+  const remainder = base.length % 4
+  if (remainder === 1) return undefined
+  const expectedPadding = remainder === 0 ? 0 : 4 - remainder
+  if (padding.length > 0 && padding.length !== expectedPadding) return undefined
+
+  const encoded = `${base}${'='.repeat(expectedPadding)}`
+  if (encoded.length > QWEN_AI_IMAGE_MAX_ENCODED_BYTES) return undefined
+  const mimeType = inferBase64ImageMimeType(encoded)
+  return mimeType ? { encoded, mimeType } : undefined
+}
+
+function qwenAiInlineImageEncodedBytes(url: string): number {
+  const separator = url.indexOf(',')
+  return url.startsWith('data:image/') && separator >= 0 ? url.length - separator - 1 : 0
+}
+
+function normalizeQwenAiImageReference(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > QWEN_AI_IMAGE_MAX_ENCODED_BYTES + 64) return undefined
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed)
+      return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? trimmed : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const dataUrlMatch = trimmed.match(
+    /^data:(image\/(?:png|jpe?g|gif|webp|bmp|avif));base64,([a-z0-9+/=]+)$/i,
+  )
+  if (dataUrlMatch) {
+    const normalized = normalizeBase64Image(dataUrlMatch[2])
+    return normalized
+      ? `data:${normalized.mimeType};base64,${normalized.encoded}`
+      : undefined
+  }
+
+  if (trimmed.length < 16) return undefined
+  const normalized = normalizeBase64Image(trimmed)
+  return normalized
+    ? `data:${normalized.mimeType};base64,${normalized.encoded}`
+    : undefined
+}
+
+/**
+ * Extract only image-bearing fields used by Qwen's image_gen_tool. The web
+ * client currently reads `extra.image_list || extra.tool_result`; accepting a
+ * few documented wrapper shapes keeps this parser tolerant without exposing
+ * arbitrary tool-result text to downstream clients.
+ */
+export function extractQwenAiGeneratedImages(extra: unknown): QwenAiGeneratedImage[] {
+  if (!isObjectValue(extra)) return []
+
+  const roots = [extra.image_list, extra.tool_result]
+  const images: QwenAiGeneratedImage[] = []
+  const imageKeys = new Set<string>()
+  const visited = new Set<object>()
+  let visitedNodes = 0
+  let inlineEncodedBytes = 0
+
+  const appendImage = (candidate: unknown) => {
+    if (images.length >= QWEN_AI_IMAGE_EXTRA_MAX_RESULTS) return
+    const url = normalizeQwenAiImageReference(candidate)
+    if (!url || imageKeys.has(url)) return
+    const encodedBytes = qwenAiInlineImageEncodedBytes(url)
+    if (inlineEncodedBytes + encodedBytes > QWEN_AI_IMAGE_MAX_TOTAL_ENCODED_BYTES) return
+    imageKeys.add(url)
+    inlineEncodedBytes += encodedBytes
+    images.push({
+      type: 'image_url',
+      image_url: { url },
+      source: 'qwen-ai',
+    })
+  }
+
+  const visit = (value: unknown, depth: number, directImageValue = false): void => {
+    if (
+      value === undefined
+      || value === null
+      || depth > QWEN_AI_IMAGE_EXTRA_MAX_DEPTH
+      || visitedNodes >= QWEN_AI_IMAGE_EXTRA_MAX_NODES
+      || images.length >= QWEN_AI_IMAGE_EXTRA_MAX_RESULTS
+    ) {
+      return
+    }
+    visitedNodes += 1
+
+    if (typeof value === 'string') {
+      if (directImageValue) appendImage(value)
+      const trimmed = value.trim()
+      if (
+        (trimmed.startsWith('{') || trimmed.startsWith('['))
+        && Buffer.byteLength(trimmed) <= QWEN_AI_IMAGE_JSON_MAX_BYTES
+      ) {
+        const parsed = parseJsonSafely(trimmed)
+        if (parsed !== undefined) visit(parsed, depth + 1)
+      }
+      return
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (
+          visitedNodes >= QWEN_AI_IMAGE_EXTRA_MAX_NODES
+          || images.length >= QWEN_AI_IMAGE_EXTRA_MAX_RESULTS
+        ) {
+          break
+        }
+        visit(item, depth + 1, true)
+      }
+      return
+    }
+
+    if (!isObjectValue(value) || visited.has(value)) return
+    visited.add(value)
+
+    for (const key of QWEN_AI_IMAGE_VALUE_KEYS) {
+      const candidate = value[key]
+      if (candidate === undefined) continue
+      if (key === 'image_url' && isObjectValue(candidate)) {
+        visit(candidate.url, depth + 1, true)
+      } else {
+        visit(candidate, depth + 1, true)
+      }
+    }
+    for (const key of QWEN_AI_IMAGE_CONTAINER_KEYS) {
+      const candidate = value[key]
+      if (candidate !== undefined) visit(candidate, depth + 1)
+    }
+  }
+
+  for (const root of roots) visit(root, 0, true)
+  return images
+}
+
+function escapeQwenAiMarkdownImageDestination(value: string): string {
+  return value.replace(/</g, '%3C').replace(/>/g, '%3E').replace(/[\r\n]/g, '')
+}
+
+export function formatQwenAiGeneratedImages(
+  images: QwenAiGeneratedImage[],
+  startingIndex = 0,
+): string {
+  return images
+    .map((image, index) => (
+      `![Generated image ${startingIndex + index + 1}](<${escapeQwenAiMarkdownImageDestination(image.image_url.url)}>)`
+    ))
+    .join('\n\n')
+}
+
+function qwenAiGeneratedImageContentDelta(
+  existingContent: string,
+  images: QwenAiGeneratedImage[],
+  startingIndex: number,
+): string {
+  const markdown = formatQwenAiGeneratedImages(images, startingIndex)
+  if (!existingContent) return markdown
+  const separator = existingContent.endsWith('\n\n')
+    ? ''
+    : existingContent.endsWith('\n')
+      ? '\n'
+      : '\n\n'
+  return `${separator}${markdown}`
+}
+
 /**
  * Detect Qwen's admission response for a busy chat. The provider returns this
  * as HTTP 200 JSON even though no SSE response branch was accepted. Restrict
@@ -1144,6 +1442,7 @@ type QwenAiUpstreamError = Error & {
   headers?: Record<string, string>
   retryable?: boolean
   accountFault?: boolean
+  retryScope?: 'next-account'
 }
 
 type QwenAiErrorEnvelopeMetadata = {
@@ -1152,6 +1451,25 @@ type QwenAiErrorEnvelopeMetadata = {
   param?: string
   code?: string
   retryable?: boolean
+}
+
+function markQwenAiNextAccountFailure(error: QwenAiUpstreamError): QwenAiUpstreamError {
+  error.accountFault = true
+  error.retryScope = 'next-account'
+  return error
+}
+
+function isQwenAiReplayableUpstreamStatus(status: unknown): status is number {
+  return typeof status === 'number'
+    && status >= 500
+    && status <= 599
+    && status !== 504
+}
+
+function markQwenAiNextAccountReplay(error: QwenAiUpstreamError): QwenAiUpstreamError {
+  error.accountFault = false
+  error.retryScope = 'next-account'
+  return error
 }
 
 function createQwenAiStreamFailure(
@@ -1196,6 +1514,8 @@ type QwenAiNativeToolArgumentIssue = {
   toolName: string
   missingRequired: string[]
   unexpected: string[]
+  typeMismatches: string[]
+  valueMismatches: string[]
 }
 
 function createQwenAiInvalidNativeToolArgumentsError(
@@ -1210,6 +1530,12 @@ function createQwenAiInvalidNativeToolArgumentsError(
           : []),
         ...(issue.unexpected.length > 0
           ? [`unexpected fields: ${issue.unexpected.join(', ')}`]
+          : []),
+        ...(issue.typeMismatches.length > 0
+          ? [`invalid field types: ${issue.typeMismatches.join(', ')}`]
+          : []),
+        ...(issue.valueMismatches.length > 0
+          ? [`invalid field values: ${issue.valueMismatches.join(', ')}`]
           : []),
       ]
       return `${issue.toolName}${problems.length > 0 ? ` (${problems.join('; ')})` : ''}`
@@ -1261,10 +1587,38 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
-  // A successful tool result may legitimately be followed by any final text.
-  // Only an explicit failed result keeps the operation structurally pending;
-  // ordinary prose and punctuation are not protocol continuation signals.
-  return plan.failedToolResultPending === true
+  if (plan.failedToolResultPending === true) {
+    return true
+  }
+
+  return requiresManagedWorkflowCompletionMarker(plan)
+    && !hasManagedWorkflowCompletionMarker(content)
+}
+
+function stripManagedWorkflowMarkerFromSseFrames(frames: string[]): string[] {
+  const parsedFrames = frames.map((frame) => {
+    const match = /^data: ([^\r\n]+)/m.exec(frame)
+    if (!match) return { frame }
+    let parsed: any
+    try {
+      parsed = JSON.parse(match[1])
+    } catch {
+      return { frame }
+    }
+    const content = parsed?.choices?.[0]?.delta?.content
+    return { frame, parsed, content: typeof content === 'string' ? content : undefined }
+  })
+  const combinedContent = parsedFrames.map(item => item.content ?? '').join('')
+  const strippedContent = stripManagedWorkflowCompletionMarker(combinedContent)
+  if (combinedContent === strippedContent) return frames
+
+  let contentWritten = false
+  return parsedFrames.map((item) => {
+    if (item.content === undefined || !item.parsed) return item.frame
+    item.parsed.choices[0].delta.content = contentWritten ? '' : strippedContent
+    contentWritten = true
+    return `data: ${JSON.stringify(item.parsed)}\n\n`
+  })
 }
 
 function isQwenAiSemanticRecoveryError(error: unknown): boolean {
@@ -1351,8 +1705,23 @@ function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
   if (typeof sourceRecord.param === 'string') normalized.param = sourceRecord.param
   if (typeof sourceRecord.code === 'string') normalized.code = sourceRecord.code
   if (typeof sourceRecord.accountFault === 'boolean') normalized.accountFault = sourceRecord.accountFault
+  if (sourceRecord.retryScope === 'next-account') normalized.retryScope = sourceRecord.retryScope
   normalized.headers = sanitizeForwardedErrorHeaders(sourceRecord.headers)
   return normalized
+}
+
+function enforceQwenAiFailoverBoundary(
+  error: QwenAiUpstreamError,
+  canFailoverRequest?: () => boolean,
+): QwenAiUpstreamError {
+  if (error.retryScope !== 'next-account' || !canFailoverRequest) return error
+
+  try {
+    if (!canFailoverRequest()) delete error.retryScope
+  } catch {
+    delete error.retryScope
+  }
+  return error
 }
 
 function isQwenAiRiskControlMessage(message: string): boolean {
@@ -1533,6 +1902,11 @@ function createQwenAiStreamEnvelopeError(
     } else if (isRateLimited) {
       error.code = 'qwen_ai_capacity_limit'
     }
+    if (isRiskControl || isRateLimited) {
+      markQwenAiNextAccountFailure(error)
+    } else if (isQwenAiReplayableUpstreamStatus(error.status)) {
+      markQwenAiNextAccountReplay(error)
+    }
     return error
   }
 
@@ -1598,6 +1972,7 @@ function createQwenAiStreamEnvelopeError(
     hasErrorSignal
     && isQwenAiRateLimitMessage(classificationEvidence)
   )
+  const isChatInProgress = isQwenAiChatInProgressEnvelope(record)
 
   if (!isRiskControl && !hasErrorSignal && !isRateLimited) return undefined
 
@@ -1613,6 +1988,13 @@ function createQwenAiStreamEnvelopeError(
     error.code = 'qwen_ai_capacity_limit'
   } else if (envelopeMetadata.code) {
     error.code = envelopeMetadata.code
+  }
+  if (error.status === 401 || isRiskControl || isRateLimited) {
+    markQwenAiNextAccountFailure(error)
+  } else if (isChatInProgress) {
+    error.accountFault = false
+  } else if (isQwenAiReplayableUpstreamStatus(error.status)) {
+    markQwenAiNextAccountReplay(error)
   }
   return error
 }
@@ -1764,19 +2146,12 @@ export class QwenAiAdapter {
 
   private getHeaders(chatId?: string): Record<string, string> {
     const cookies = this.getCookies()
+    const token = this.getToken()
     const headers: Record<string, string> = {
       ...DEFAULT_HEADERS,
       'X-Request-Id': uuid(),
       Timezone: currentTimezoneHeader(),
-    }
-
-    const token = this.getToken()
-    // The current Qwen web frontend sets source=web and removes Authorization for
-    // browser sessions. Sending browser cookies together with desktop bearer auth
-    // is more likely to hit upstream risk control.
-    if (token && !cookies) {
-      headers.source = 'desktop'
-      headers.Authorization = `Bearer ${token}`
+      ...resolveQwenAiAuthHeaders(token, cookies),
     }
 
     if (chatId) {
@@ -1808,10 +2183,8 @@ export class QwenAiAdapter {
       headers['x5sectag'] = x5sectag
     }
 
-    if (cookies) {
-      headers['Cookie'] = cookies
-    } else if (!token) {
-      console.warn('[QwenAI] Warning: No token or cookies provided. Requests may fail authentication.')
+    if (!token && !hasQwenAiSessionCookie(cookies)) {
+      console.warn('[QwenAI] Warning: No JWT or session token cookie provided. Requests may fail authentication.')
       console.warn('[QwenAI] Required cookies: cnaui, aui, sca, xlly_s, cna, token, _bl_uid, x-ap')
     }
 
@@ -2014,8 +2387,15 @@ export class QwenAiAdapter {
     const detail = upstreamMessage ? `: ${upstreamMessage}` : ''
 
     let envelopeError: QwenAiUpstreamError | undefined
+    let explicitEnvelopeStatus: number | undefined
+    let chatInProgress = false
     try {
-      envelopeError = createQwenAiStreamEnvelopeError(JSON.parse(body), body, 'error')
+      const parsedBody = JSON.parse(body)
+      envelopeError = createQwenAiStreamEnvelopeError(parsedBody, body, 'error')
+      if (isObjectValue(parsedBody)) {
+        explicitEnvelopeStatus = readQwenAiEnvelopeStatus(parsedBody, true)
+        chatInProgress = isQwenAiChatInProgressEnvelope(parsedBody)
+      }
     } catch {
       envelopeError = createQwenAiStreamEnvelopeError(body, body, 'error')
     }
@@ -2042,6 +2422,19 @@ export class QwenAiAdapter {
       error.code = 'qwen_ai_capacity_limit'
     } else if (envelopeError?.code) {
       error.code = envelopeError.code
+    }
+    if (error.status === 401 || isRiskControl || isCapacityLimit) {
+      markQwenAiNextAccountFailure(error)
+    } else if (chatInProgress) {
+      error.accountFault = false
+    } else if (
+      isQwenAiReplayableUpstreamStatus(response.status)
+      || (
+        response.status < 400
+        && isQwenAiReplayableUpstreamStatus(explicitEnvelopeStatus)
+      )
+    ) {
+      markQwenAiNextAccountReplay(error)
     }
     return error
   }
@@ -2105,18 +2498,17 @@ export class QwenAiAdapter {
         body,
       ) as QwenAiUpstreamError
 
-      // CHAT_IN_PROGRESS is an admission rejection, not an accepted response
-      // branch. Returning it to the continuation caller lets it wait and retry
-      // the exact same payload without creating a duplicate user turn.
-      if (
-        options.allowChatInProgress
-        && response.status < 400
+      const chatInProgress = response.status < 400
         && isQwenAiChatInProgressEnvelope(parseJsonSafely(body))
-      ) {
+      if (chatInProgress) {
         // A busy chat is provider state, not an invalid credential/account.
-        // Preserve that classification if the bounded retry budget is spent.
+        // Keep that classification even when the caller does not perform the
+        // bounded same-payload continuation wait.
         error.accountFault = false
-        return { chatInProgress: true, error }
+        delete error.retryScope
+        if (options.allowChatInProgress) {
+          return { chatInProgress: true, error }
+        }
       }
 
       throw error
@@ -2156,7 +2548,12 @@ export class QwenAiAdapter {
     return model
   }
 
-  async createChat(modelId: string, title: string = 'New Chat', signal?: AbortSignal): Promise<string> {
+  async createChat(
+    modelId: string,
+    title: string = 'New Chat',
+    signal?: AbortSignal,
+    chatType: 't2t' | 't2i' = 't2t',
+  ): Promise<string> {
     await this.refreshTokenIfNeeded(signal)
 
     const url = `${QWEN_AI_BASE}/api/v2/chats/new`
@@ -2164,7 +2561,7 @@ export class QwenAiAdapter {
       title,
       models: [modelId],
       chat_mode: 'normal',
-      chat_type: 't2t',
+      chat_type: chatType,
       timestamp: Date.now(),
       project_id: '',
     }
@@ -2273,7 +2670,9 @@ export class QwenAiAdapter {
     }
 
     const modelId = this.mapModel(request.model)
-    
+    const imageGeneration = resolveQwenAiImageGenerationOptions(request.image_generation)
+    const chatType = imageGeneration?.chatType ?? 't2t'
+
     // Get forced thinking mode setting from originalModel (preserves user's intent before mapping)
     // If originalModel exists, use it for thinking detection; otherwise fall back to request.model
     const modelForThinking = request.originalModel || request.model
@@ -2293,7 +2692,7 @@ export class QwenAiAdapter {
     }
 
     // Always create a new chat (single-turn mode only)
-    const chatId = await this.createChat(modelId, 'OpenAI_API_Chat', request.signal)
+    const chatId = await this.createChat(modelId, 'OpenAI_API_Chat', request.signal, chatType)
     if (QWEN_AI_DEBUG_REQUEST_LOGS) {
       console.log('[QwenAI] Created new chat:', chatId)
     }
@@ -2354,14 +2753,22 @@ export class QwenAiAdapter {
           files: qwenFiles,
           timestamp: ts,
           models: [modelId],
-          chat_type: 't2t',
+          chat_type: chatType,
           feature_config: featureConfig,
-          extra: { meta: { subChatType: 't2t' } },
-          sub_chat_type: 't2t',
+          extra: {
+            meta: {
+              subChatType: chatType,
+              ...(imageGeneration
+                ? { size: imageGeneration.size, model: imageGeneration.model }
+                : {}),
+            },
+          },
+          sub_chat_type: chatType,
           parent_id: null,
         },
       ],
       timestamp: ts + 1,
+      ...(imageGeneration ? { size: imageGeneration.size } : {}),
     }
 
     const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${chatId}`
@@ -2703,6 +3110,9 @@ export class QwenAiStreamHandler {
   private onEnd?: (chatId: string) => void
   private responseId: string = ''
   private content: string = ''
+  private generatedImages: QwenAiGeneratedImage[] = []
+  private generatedImageKeys = new Set<string>()
+  private generatedInlineImageEncodedBytes = 0
   private toolCallsSent: boolean = false
   private toolStreamParser?: ToolStreamParser
   private toolCallingPlan?: ToolCallingPlan
@@ -2733,11 +3143,46 @@ export class QwenAiStreamHandler {
 
   private resetManagedResponseArtifacts(): void {
     this.content = ''
+    this.generatedImages = []
+    this.generatedImageKeys = new Set<string>()
+    this.generatedInlineImageEncodedBytes = 0
     this.toolCallsSent = false
     this.nativeToolCallStates = new Map<string, NativeToolCallState>()
     this.nativeToolCallIndex = 0
     this.warnedUndeclaredNativeToolNames = new Set<string>()
     this.resetToolStreamParser()
+  }
+
+  private ingestGeneratedImages(extra: unknown): {
+    images: QwenAiGeneratedImage[]
+    startingIndex: number
+  } {
+    const startingIndex = this.generatedImages.length
+    const availableSlots = Math.max(0, QWEN_AI_IMAGE_EXTRA_MAX_RESULTS - startingIndex)
+    const nextImageKeys = new Set(this.generatedImageKeys)
+    let acceptedCount = 0
+    const images = extractQwenAiGeneratedImages(extra)
+      .filter(image => {
+        if (acceptedCount >= availableSlots) return false
+        const key = image.image_url.url
+        if (nextImageKeys.has(key)) return false
+        const encodedBytes = qwenAiInlineImageEncodedBytes(key)
+        if (
+          this.generatedInlineImageEncodedBytes + encodedBytes
+          > QWEN_AI_IMAGE_MAX_TOTAL_ENCODED_BYTES
+        ) {
+          return false
+        }
+        nextImageKeys.add(key)
+        this.generatedInlineImageEncodedBytes += encodedBytes
+        acceptedCount += 1
+        return true
+      })
+    if (images.length > 0) {
+      this.generatedImageKeys = nextImageKeys
+      this.generatedImages = [...this.generatedImages, ...images]
+    }
+    return { images, startingIndex }
   }
 
   /**
@@ -3002,12 +3447,21 @@ export class QwenAiStreamHandler {
 
       const tool = this.toolCallingPlan?.tools?.find(item => item.name === state.name)
       const validation = getToolArgumentValidationIssues(state.arguments, tool)
-      if (validation.missingRequired.length === 0 && validation.unexpected.length === 0) continue
+      const typeMismatches = validation.typeMismatches ?? []
+      const valueMismatches = validation.valueMismatches ?? []
+      if (
+        validation.missingRequired.length === 0
+        && validation.unexpected.length === 0
+        && typeMismatches.length === 0
+        && valueMismatches.length === 0
+      ) continue
 
       issues.push({
         toolName: state.name,
         missingRequired: validation.missingRequired,
         unexpected: validation.unexpected,
+        typeMismatches,
+        valueMismatches,
       })
     }
 
@@ -3177,7 +3631,10 @@ export class QwenAiStreamHandler {
     }
 
     const failStream = (error: Error) => {
-      const upstreamError = normalizeQwenAiStreamFailure(error)
+      const upstreamError = enforceQwenAiFailoverBoundary(
+        normalizeQwenAiStreamFailure(error),
+        () => !visibleFrameCommitted,
+      )
       if (!recordStreamFailure(upstreamError)) return
       discardManagedBranchFrames()
       const errorCode = typeof upstreamError.code === 'string'
@@ -3410,6 +3867,32 @@ export class QwenAiStreamHandler {
       }
     }
 
+    const writeGeneratedImages = (
+      images: QwenAiGeneratedImage[],
+      startingIndex: number,
+    ) => {
+      if (images.length === 0 || finalChunkSent) return
+
+      const content = qwenAiGeneratedImageContentDelta(this.content, images, startingIndex)
+      this.content += content
+      const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
+      const imageChunk = {
+        ...baseChunk,
+        choices: [{
+          index: 0,
+          delta: {
+            ...(!initialChunkSent ? { role: 'assistant' } : {}),
+            content,
+            images,
+          },
+          finish_reason: null,
+        }],
+      }
+      if (writeVisibleSse(`data: ${JSON.stringify(imageChunk)}\n\n`)) {
+        initialChunkSent = true
+      }
+    }
+
     const finishAnswer = (finishReason: string = 'stop') => {
       if (finalChunkSent || semanticRecoveryInFlight) return
 
@@ -3483,6 +3966,17 @@ export class QwenAiStreamHandler {
       ) {
         recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
         return
+      }
+
+      if (!emittedToolCall && hasManagedWorkflowCompletionMarker(this.content)) {
+        this.content = stripManagedWorkflowCompletionMarker(this.content)
+        if (bufferManagedBranch) {
+          managedBranchFrames = stripManagedWorkflowMarkerFromSseFrames(managedBranchFrames)
+          managedBranchBytes = managedBranchFrames.reduce(
+            (total, frame) => total + Buffer.byteLength(frame),
+            0,
+          )
+        }
       }
 
       const hasAnswerOrTool = Boolean(this.content.trim() || emittedToolCall)
@@ -3603,6 +4097,9 @@ export class QwenAiStreamHandler {
             const phase = delta.phase
             const status = delta.status
             const content = delta.content || ''
+            const generatedImageBatch = isQwenAiImageGenerationPhase(phase)
+              ? this.ingestGeneratedImages(delta.extra)
+              : { images: [], startingIndex: this.generatedImages.length }
 
             if (QWEN_AI_DEBUG_STREAM_LOGS) {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
@@ -3639,7 +4136,7 @@ export class QwenAiStreamHandler {
                 }
               }
 
-              if (!content && status !== 'finished') {
+              if (!content && generatedImageBatch.images.length === 0 && status !== 'finished') {
                 return
               }
             }
@@ -3722,8 +4219,21 @@ export class QwenAiStreamHandler {
               writeContent(content)
             }
 
+            writeGeneratedImages(
+              generatedImageBatch.images,
+              generatedImageBatch.startingIndex,
+            )
+            const imageGenerationFinished = status === 'finished'
+              && isQwenAiImageGenerationPhase(phase)
+              && this.generatedImages.length > 0
+            if (imageGenerationFinished) {
+              sawUpstreamCompletion = true
+            }
+
             if (status === 'finished' && (phase === 'answer' || phase === null)) {
               sawUpstreamCompletion = true
+              finishAnswer(delta.finish_reason || 'stop')
+            } else if (imageGenerationFinished) {
               finishAnswer(delta.finish_reason || 'stop')
             }
           }
@@ -3894,7 +4404,10 @@ export class QwenAiStreamHandler {
         if (!resolved) {
           resolved = true
           cleanup()
-          const error = normalizeQwenAiStreamFailure(reason)
+          const error = enforceQwenAiFailoverBoundary(
+            normalizeQwenAiStreamFailure(reason),
+            () => true,
+          )
           destroyReadableStream(stream, error)
           reject(error)
         }
@@ -3931,6 +4444,10 @@ export class QwenAiStreamHandler {
           return
         }
 
+        if (hasManagedWorkflowCompletionMarker(answerText)) {
+          choice.message.content = stripManagedWorkflowCompletionMarker(answerText)
+        }
+
         if (!answerText.trim() && finalReasoning.trim()) {
           recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
           return
@@ -3951,6 +4468,9 @@ export class QwenAiStreamHandler {
             message: {
               ...choice.message,
               ...(finalReasoning ? { reasoning_content: finalReasoning } : {}),
+              ...(this.generatedImages.length > 0
+                ? { images: [...this.generatedImages] }
+                : {}),
             },
           }],
         }
@@ -4122,6 +4642,10 @@ export class QwenAiStreamHandler {
               const phase = delta.phase
               const status = delta.status
               const content = delta.content || ''
+              const generatedImageBatch = isQwenAiImageGenerationPhase(phase)
+                ? this.ingestGeneratedImages(delta.extra)
+                : { images: [], startingIndex: this.generatedImages.length }
+              let shouldFinishAnswer = false
 
               this.ingestNativeToolCallFragments(delta)
               const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
@@ -4171,7 +4695,7 @@ export class QwenAiStreamHandler {
                 if (status === 'finished') {
                   sawAnswerFinish = true
                   sawUpstreamCompletion = true
-                  finishNonStream()
+                  shouldFinishAnswer = true
                 }
               } else if (phase === null) {
                 if (content) {
@@ -4180,8 +4704,28 @@ export class QwenAiStreamHandler {
                 if (status === 'finished') {
                   sawAnswerFinish = true
                   sawUpstreamCompletion = true
-                  finishNonStream()
+                  shouldFinishAnswer = true
                 }
+              }
+
+              if (generatedImageBatch.images.length > 0) {
+                data.choices[0].message.content += qwenAiGeneratedImageContentDelta(
+                  data.choices[0].message.content,
+                  generatedImageBatch.images,
+                  generatedImageBatch.startingIndex,
+                )
+              }
+
+              const imageGenerationFinished = status === 'finished'
+                && isQwenAiImageGenerationPhase(phase)
+                && this.generatedImages.length > 0
+              if (imageGenerationFinished) {
+                sawUpstreamCompletion = true
+                shouldFinishAnswer = true
+              }
+
+              if (shouldFinishAnswer) {
+                finishNonStream()
               }
             }
           } catch (err) {

@@ -244,7 +244,7 @@ test('managed-tool buffered stream validation failure recovers once before bytes
 test('managed-tool streams stay live and do not retry when buffering is disabled', async () => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
   const previousRetries = process.env.CHAT2API_QWEN_AI_RETRY_COUNT
-  delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
   process.env.CHAT2API_QWEN_AI_RETRY_COUNT = '3'
   try {
     const { attempts, execute } = createHarness([{
@@ -450,7 +450,7 @@ test('an explicit retry count does not enable ordinary Qwen stream retries', asy
 
 test('live managed-tool forwarding deletes its temporary chat only after stream termination', async (t) => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
-  delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
   t.after(() => {
     if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
     else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer

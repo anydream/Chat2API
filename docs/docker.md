@@ -183,10 +183,11 @@ QWEN_AI_REQUEST_TIMEOUT_MS=600000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
-CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
-CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
+CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
+CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=3
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
 CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288
+CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES=32768
 CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576
 CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072
 CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32
@@ -239,6 +240,9 @@ Qwen receives the OpenAI message history as one provider prompt. Chat2API
 preserves the messages unchanged while their serialized size is at or below
 `CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES` (default `524288`). Only an
 over-budget transcript is compacted. During that compaction,
+`CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES` (default `32768`) keeps
+space for JSON escaping and the provider request envelope; the rendered prompt
+is measured after JSON serialization before it is sent upstream.
 `CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES` (default `131072`) and
 `CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES` (default `24576`) bound
 individual retained entries, while `CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS`
@@ -247,7 +251,7 @@ deployment limits and do not inspect session ids, project paths, or task text.
 When a managed-tool response reaches a semantic terminal without a tool call,
 Chat2API starts a new user-turn continuation in the same Qwen chat instead of
 replaying that completed response branch. The generic continuation is bounded
-by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `1`); set it to
+by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `3`); set it to
 `0` to disable this semantic recovery. The new turn is parented to Qwen's
 latest `response_id` and does not resend the original messages or files.
 If Qwen is still finalizing the parent response, its continuation endpoint
@@ -270,12 +274,11 @@ that arrives before output retain its HTTP status across protocol bridges.
 `CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS` is an optional deployment
 override: a positive integer releases a still-quiet stream after that many
 milliseconds, and `0` releases it immediately.
-Managed SSE validation is opt-in through
-`CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true`. The normal value (`false`)
-forwards generated SSE immediately, so a long response does not wait for
-validation before sending its first byte. When validation is enabled,
-the managed branch is withheld until terminal validation completes, so this
-mode is intended for callers that explicitly accept a delayed first byte.
+Managed SSE validation defaults to
+`CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true`. The managed branch is withheld
+until terminal validation completes, allowing malformed and provider-only tool
+calls to recover before bytes reach the client. Set it to `false` only when
+lower first-byte latency is more important than transparent branch recovery.
 `CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES` bounds that validation buffer.
 
 ## Upstream Update Flow

@@ -41,7 +41,7 @@ export interface KimiModelOptions {
 
 export function normalizeProviderModelForMatch(model: string): string {
   const baseModel = model.replace(
-    /(?:-(?:web-search|thinking|think|search|fast|r1))+$/i,
+    /(?:\[1m\]|-(?:web-search|thinking|think|search|fast|r1))+$/i,
     '',
   )
   const normalized = baseModel.toLowerCase()

@@ -45,6 +45,16 @@ function shouldDeleteSession(): boolean {
   return sessionManager.shouldDeleteAfterChat()
 }
 
+type ThreeLevelReasoningEffort = 'low' | 'medium' | 'high'
+
+function toThreeLevelReasoningEffort(
+  effort: ChatCompletionRequest['reasoning_effort'] | ChatCompletionRequest['reasoningEffort'],
+): ThreeLevelReasoningEffort | undefined {
+  if (effort === 'minimal') return 'low'
+  if (effort === 'xhigh') return 'high'
+  return effort
+}
+
 function statusFromError(error: unknown): number | undefined {
   const errorRecord = error as {
     status?: unknown
@@ -272,14 +282,13 @@ function validatedSseMaxHoldMsFromEnv(): number {
 }
 
 /**
- * Full managed-tool stream validation is intentionally opt-in. Once an SSE
- * byte is sent, a later parser failure cannot be retried transparently, so
- * the normal path must preserve streaming latency and report that failure
- * in-band instead of withholding the whole response.
+ * Keep managed tool branches private until their terminal protocol state is
+ * known. This allows malformed or provider-only tool calls to be replaced
+ * without splicing two generations into one downstream response.
  */
 function qwenAiBufferManagedStreamsFromEnv(): boolean {
   const raw = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
-  return raw !== undefined && /^(?:1|true|yes|on)$/i.test(raw.trim())
+  return raw === undefined || /^(?:1|true|yes|on)$/i.test(raw.trim())
 }
 
 function requestUsesManagedTools(request: ChatCompletionRequest): boolean {
@@ -515,6 +524,7 @@ export class RequestForwarder {
     let lastRetryable: boolean | undefined
     let lastErrorCode: string | undefined
     let lastAccountFault: boolean | undefined
+    let lastRetryScope: ForwardResult['retryScope']
     let previousRecoveryHint: ForwardResult['recoveryHint']
     let recoveryBypassUsed = false
 
@@ -616,6 +626,7 @@ export class RequestForwarder {
         lastRetryable = result.retryable
         lastErrorCode = result.errorCode
         lastAccountFault = result.accountFault
+        lastRetryScope = result.retryScope
         previousRecoveryHint = result.recoveryHint
 
         if (context.signal?.aborted) {
@@ -660,6 +671,8 @@ export class RequestForwarder {
         lastErrorCode = errorCodeFromError(error)
         const errorAccountFault = (error as { accountFault?: unknown })?.accountFault
         lastAccountFault = typeof errorAccountFault === 'boolean' ? errorAccountFault : undefined
+        const errorRetryScope = (error as { retryScope?: unknown })?.retryScope
+        lastRetryScope = errorRetryScope === 'next-account' ? errorRetryScope : undefined
         const errorRetryable = (error as { retryable?: unknown })?.retryable
         lastRetryable = lastStatus === 499
           || (isQwenAiProvider && (lastStatus === 403 || lastStatus === 429 || lastStatus === 504))
@@ -699,6 +712,7 @@ export class RequestForwarder {
       retryable: lastRetryable,
       errorCode: lastErrorCode,
       accountFault: lastAccountFault,
+      retryScope: lastRetryScope,
     }
   }
 
@@ -731,6 +745,7 @@ export class RequestForwarder {
         url,
         headers,
         data: body,
+        signal: context.signal,
         timeout: proxyStatusManager.getConfig().timeout,
         responseType: request.stream ? 'stream' : 'json',
         validateStatus: () => true,
@@ -812,7 +827,7 @@ export class RequestForwarder {
         stream: transformedRequest.stream,
         temperature: transformedRequest.temperature,
         web_search: transformedRequest.web_search,
-        reasoning_effort: transformedRequest.reasoning_effort,
+        reasoning_effort: toThreeLevelReasoningEffort(transformedRequest.reasoning_effort),
       })
 
       const latency = Date.now() - startTime
@@ -926,7 +941,7 @@ export class RequestForwarder {
         stream: transformedRequest.stream,
         temperature: transformedRequest.temperature,
         web_search: transformedRequest.web_search,
-        reasoning_effort: transformedRequest.reasoning_effort,
+        reasoning_effort: toThreeLevelReasoningEffort(transformedRequest.reasoning_effort),
         deep_research: transformedRequest.deep_research,
       })
 
@@ -1023,7 +1038,9 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     try {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
-      const reasoningEffort = request.reasoning_effort ?? request.reasoningEffort
+      const reasoningEffort = toThreeLevelReasoningEffort(
+        request.reasoning_effort ?? request.reasoningEffort,
+      )
       const enableWebSearch = request.web_search ?? Boolean(request.web_search_options)
       const conversationId = request.conversationId || request.conversation_id
         || request.chatId || request.chat_id
@@ -1270,6 +1287,7 @@ export class RequestForwarder {
             ? Boolean(request.reasoning_effort)
             : undefined,
         thinking_budget: request.thinking_budget,
+        image_generation: request.image_generation,
         signal: context?.signal,
       })
       const { response, chatId, parentId } = await adapter.chatCompletion(
@@ -1504,6 +1522,7 @@ export class RequestForwarder {
       const errorCode = errorCodeFromError(error)
       const upstreamRetryable = (error as { retryable?: unknown })?.retryable
       const upstreamAccountFault = (error as { accountFault?: unknown })?.accountFault
+      const upstreamRetryScope = (error as { retryScope?: unknown })?.retryScope
       const retryable = status === 499
         || status === 403
         || status === 429
@@ -1522,6 +1541,7 @@ export class RequestForwarder {
         retryable,
         errorCode,
         accountFault: typeof upstreamAccountFault === 'boolean' ? upstreamAccountFault : undefined,
+        retryScope: upstreamRetryScope === 'next-account' ? upstreamRetryScope : undefined,
         recoveryHint,
       }
     }
@@ -1550,7 +1570,7 @@ export class RequestForwarder {
         stream: request.stream,
         temperature: request.temperature,
         web_search: request.web_search,
-        reasoning_effort: request.reasoning_effort,
+        reasoning_effort: toThreeLevelReasoningEffort(request.reasoning_effort),
       })
 
       const latency = Date.now() - startTime
@@ -2027,6 +2047,21 @@ export class RequestForwarder {
 
     if (request.tool_choice !== undefined) {
       body.tool_choice = request.tool_choice
+    }
+
+    if (request.reasoning_effort !== undefined) {
+      body.reasoning_effort = request.reasoning_effort
+    }
+
+    const responsesCompatibleRequest = request as ChatCompletionRequest & {
+      parallel_tool_calls?: boolean
+      response_format?: Record<string, unknown>
+    }
+    if (responsesCompatibleRequest.parallel_tool_calls !== undefined) {
+      body.parallel_tool_calls = responsesCompatibleRequest.parallel_tool_calls
+    }
+    if (responsesCompatibleRequest.response_format !== undefined) {
+      body.response_format = responsesCompatibleRequest.response_format
     }
 
     return body

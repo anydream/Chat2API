@@ -80,6 +80,31 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
   return module.exports.QwenAiRequestGovernor
 }
 
+function loadLoadBalancerForRuntimeTest() {
+  const source = fs.readFileSync('src/main/proxy/loadbalancer.ts', 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const module = { exports: {} }
+  const testRequire = specifier => {
+    if (specifier === '../store/store') return { storeManager: {} }
+    if (specifier === './adapters/providerModelOptions') {
+      return { normalizeProviderModelForMatch: value => value }
+    }
+    if (specifier === './qwenAiRequestGovernor') {
+      return { qwenAiRequestGovernor: { isAccountImmediatelyAvailable: () => true } }
+    }
+    if (specifier === '../store/types' || specifier === './types') return {}
+    throw new Error(`Unexpected load-balancer test import: ${specifier}`)
+  }
+
+  new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
+  return module.exports.LoadBalancer
+}
+
 test('Qwen AI requests are routed through a per-provider governor', () => {
   const forwarderSource = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
   const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
@@ -287,6 +312,9 @@ test('Qwen AI governor returns a runtime 429 after the queue deadline', { timeou
   assert.equal(queuedRequestStarted, false)
   assert.equal(result.status, 429)
   assert.equal(result.retryable, true)
+  assert.equal(result.errorCode, 'qwen_ai_queue_timeout')
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, undefined)
   assert.equal(result.headers?.['Retry-After'], '1')
   assert.match(result.error, /waited in queue for more than 1s/)
   assert.ok(waitedMs >= 900, `queue deadline fired too early: ${waitedMs}ms`)
@@ -502,11 +530,34 @@ test('Qwen AI governor adds Retry-After from its configured cooldown when upstre
     status: 429,
     error: 'upstream capacity limited',
     retryable: false,
+    accountFault: true,
+    retryScope: 'next-account',
   }))
 
   assert.equal(result.status, 429)
   assert.equal(result.headers?.['Retry-After'], '45')
   assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, true)
+  assert.equal(result.retryScope, 'next-account')
+})
+
+test('Qwen AI global risk circuit is account-neutral and never requests account failover', async () => {
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  governor.openGlobalCooldown(5_000, 'test_global_circuit', 1)
+  let started = false
+
+  const result = await governor.run('account-1', async () => {
+    started = true
+    return { success: true, status: 200 }
+  })
+
+  assert.equal(started, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'qwen_ai_global_risk_circuit')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, undefined)
 })
 
 test('Qwen AI governor does not cool an account for an account-neutral protocol failure', async () => {
@@ -709,4 +760,58 @@ test('Qwen AI production logs avoid dumping full prompts by default', () => {
   assert.match(qwenAiSource, /fileCount/)
   assert.match(qwenAiSource, /if \(QWEN_AI_DEBUG_PAYLOAD_LOGS\)/)
   assert.match(qwenAiSource, /if \(QWEN_AI_DEBUG_STREAM_LOGS\)/)
+})
+
+test('Qwen AI governor exposes soft load-balancer recovery separately from hard availability', () => {
+  const LoadBalancer = loadLoadBalancerForRuntimeTest()
+  const loadBalancer = new LoadBalancer()
+  const beforeFailure = Date.now()
+  loadBalancer.markAccountFailed('account-1')
+  const failures = loadBalancer.getAccountFailureSnapshot()
+
+  assert.equal(failures['account-1'].count, 1)
+  assert.equal(failures['account-1'].reason, 'request_failure')
+  assert.ok(failures['account-1'].recoveryUntil >= beforeFailure + 60_000)
+  assert.equal(failures['account-1'].cooldownUntil, undefined)
+
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  const status = governor.getStatus(
+    [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+    [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+    failures,
+  )
+  const account = status.accounts[0]
+
+  assert.equal(account.nextAvailableInMs, 0)
+  assert.equal(account.loadBalancerCooldownInMs, 0)
+  assert.ok(account.loadBalancerRecoveryInMs > 59_000)
+  assert.equal(account.loadBalancerFailures, 1)
+  assert.equal(account.loadBalancerReason, 'request_failure')
+})
+
+test('Qwen AI governor exposes the latest structured failover for each account', () => {
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  const record = {
+    requestId: 'request-1',
+    status: 502,
+    errorCode: 'upstream_error',
+    attempt: 2,
+    accountFault: false,
+    timestamp: 1_700_000_000_000,
+  }
+  governor.reportAccountFailover('account-1', record)
+
+  const status = governor.getStatus(
+    [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+    [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+  )
+
+  assert.deepEqual(status.accounts[0].recentFailover, record)
+
+  const panelSource = fs.readFileSync('src/renderer/src/components/proxy/QwenAiGovernorPanel.tsx', 'utf8')
+  assert.match(panelSource, /loadBalancerRecoveryInMs/)
+  assert.match(panelSource, /loadBalancerFailures > 0/)
+  assert.match(panelSource, /recentFailover/)
 })

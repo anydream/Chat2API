@@ -25,7 +25,7 @@ services:
       CHAT2API_BASE_URL: "${CHAT2API_BASE_URL:-http://host.docker.internal:8080/v1}"
       CHAT2API_API_KEY: "${CHAT2API_API_KEY:-sk-chat2api-local}"
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-litellm-local}"
-      LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true}"
+      LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-false}"
       # cancel_on_disconnect is enabled in the mounted LiteLLM configuration.
       # LiteLLM applies this to outer connect/read waits. Streaming activity
       # refreshes that budget; Chat2API separately enforces meaningful idle.

@@ -1,4 +1,4 @@
-import axios from 'axios'
+import axios, { type AxiosResponse } from 'axios'
 import { createHash } from 'crypto'
 import type { Account } from '../../store/types'
 import { storeManager } from '../../store/store'
@@ -12,6 +12,14 @@ type QwenAiRefreshError = Error & {
   status?: number
   code?: string
   retryable?: boolean
+  accountFault?: boolean
+  retryScope?: 'next-account'
+}
+
+type QwenAiSignInResponse = AxiosResponse<any>
+
+function isObjectValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
 
 function decodeJwtPayload(token: string): Record<string, any> | null {
@@ -91,6 +99,181 @@ function hasCookie(cookieHeader: string, name: string): boolean {
   return new RegExp(`(?:^|;\\s*)${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=[^;]+`).test(cookieHeader)
 }
 
+export function hasQwenAiSessionCookie(cookieHeader: string): boolean {
+  return hasCookie(String(cookieHeader || ''), 'token')
+}
+
+export function resolveQwenAiAuthHeaders(token: string, cookieHeader: string): Record<string, string> {
+  const normalizedToken = String(token || '').trim()
+  const cookies = String(cookieHeader || '').trim()
+  const hasSessionCookie = hasQwenAiSessionCookie(cookies)
+
+  return {
+    ...(normalizedToken && !hasSessionCookie
+      ? { Authorization: `Bearer ${normalizedToken}` }
+      : {}),
+    ...(normalizedToken && !hasSessionCookie && !cookies ? { source: 'desktop' } : {}),
+    ...(cookies ? { Cookie: cookies } : {}),
+  }
+}
+
+function extractSignInToken(body: unknown): string {
+  if (!isObjectValue(body)) return ''
+  const nestedData = isObjectValue(body.data) ? body.data : undefined
+  for (const candidate of [nestedData?.token, body.token]) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+  }
+  return ''
+}
+
+function sanitizeRefreshDetail(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const compact = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!compact) return undefined
+
+  return compact
+    .replace(/(Bearer\s+)[^\s]+/gi, '$1[REDACTED]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED_JWT]')
+    .replace(/((?:token|cookie|password|authorization)\s*[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .slice(0, 300)
+}
+
+function detailFromValue(value: unknown): string | undefined {
+  const direct = sanitizeRefreshDetail(value)
+  if (direct) return direct
+  if (!isObjectValue(value)) return undefined
+
+  for (const key of ['message', 'detail', 'details', 'reason', 'code']) {
+    const nested = sanitizeRefreshDetail(value[key])
+    if (nested) return nested
+  }
+  return undefined
+}
+
+export function extractQwenAiRefreshDetail(body: unknown): string | undefined {
+  if (!isObjectValue(body)) return sanitizeRefreshDetail(body)
+  const nestedData = isObjectValue(body.data) ? body.data : undefined
+  const candidates = [
+    nestedData?.details,
+    nestedData?.detail,
+    nestedData?.message,
+    body.details,
+    body.detail,
+    body.message,
+  ]
+
+  for (const candidate of candidates) {
+    const detail = detailFromValue(candidate)
+    if (detail) return detail
+  }
+  return undefined
+}
+
+function isRiskControlled(body: unknown): boolean {
+  try {
+    return /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(
+      JSON.stringify(body || {}),
+    )
+  } catch {
+    return false
+  }
+}
+
+function createRefreshError(options: {
+  message: string
+  status: number
+  retryable: boolean
+  accountFault: boolean
+  retryScope?: 'next-account'
+}): QwenAiRefreshError {
+  const error = new Error(options.message) as QwenAiRefreshError
+  error.status = options.status
+  error.code = 'qwen_ai_token_refresh_failed'
+  error.retryable = options.retryable
+  error.accountFault = options.accountFault
+  if (options.retryScope) error.retryScope = options.retryScope
+  return error
+}
+
+function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefreshError {
+  const upstreamStatus = response.status
+  const detail = extractQwenAiRefreshDetail(response.data)
+  const detailSuffix = detail ? `: ${detail}` : ''
+  const riskControlled = isRiskControlled(response.data)
+
+  if (riskControlled) {
+    return createRefreshError({
+      message: `Qwen AI token refresh failed (risk-control)${detailSuffix}`,
+      status: 403,
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    })
+  }
+
+  if (upstreamStatus === 429) {
+    return createRefreshError({
+      message: `Qwen AI token refresh was rate limited${detailSuffix}`,
+      status: 429,
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    })
+  }
+
+  if (upstreamStatus >= 500) {
+    return createRefreshError({
+      message: `Qwen AI token refresh service failed (HTTP ${upstreamStatus})${detailSuffix}`,
+      status: upstreamStatus === 504 ? 504 : 502,
+      retryable: true,
+      accountFault: true,
+      retryScope: 'next-account',
+    })
+  }
+
+  if (upstreamStatus >= 400 && upstreamStatus < 500 && upstreamStatus !== 404 && upstreamStatus !== 405) {
+    return createRefreshError({
+      message: `Qwen AI credentials were rejected during token refresh${detailSuffix}`,
+      status: 401,
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    })
+  }
+
+  return createRefreshError({
+    message: `Qwen AI token refresh returned an invalid response (HTTP ${upstreamStatus})${detailSuffix}`,
+    status: 502,
+    retryable: true,
+    accountFault: false,
+  })
+}
+
+function createRefreshTransportError(error: unknown, signal?: AbortSignal): QwenAiRefreshError {
+  const record = isObjectValue(error) ? error : undefined
+  const code = typeof record?.code === 'string' ? record.code : ''
+  const message = error instanceof Error ? error.message : ''
+  const cancelled = signal?.aborted || code === 'ERR_CANCELED' || /\bcancel(?:led|ed)?\b/i.test(message)
+  if (cancelled) {
+    return createRefreshError({
+      message: 'Qwen AI token refresh was cancelled',
+      status: 499,
+      retryable: false,
+      accountFault: false,
+    })
+  }
+
+  const timedOut = code === 'ECONNABORTED' || /timed?\s*out|timeout/i.test(message)
+  return createRefreshError({
+    message: timedOut
+      ? 'Qwen AI token refresh timed out'
+      : 'Qwen AI token refresh request failed',
+    status: timedOut ? 504 : 502,
+    retryable: true,
+    accountFault: false,
+  })
+}
+
 export class QwenAiTokenRefresher {
   isTokenExpiringSoon(token: string, now: number = Date.now()): boolean {
     const payload = decodeJwtPayload(token)
@@ -104,7 +287,7 @@ export class QwenAiTokenRefresher {
   async refreshIfNeeded(account: Account, signal?: AbortSignal): Promise<Account> {
     if (
       !this.canRefresh(account) ||
-      (!this.isTokenExpiringSoon(account.credentials.token || '') && this.hasWebSessionCookie(account))
+      !this.isTokenExpiringSoon(account.credentials.token || '')
     ) {
       return account
     }
@@ -124,52 +307,41 @@ export class QwenAiTokenRefresher {
     return Boolean(account.credentials.email && account.credentials.password)
   }
 
-  private hasWebSessionCookie(account: Account): boolean {
-    return hasCookie(account.credentials.cookies || account.credentials.cookie || '', 'token')
-  }
-
   private async refresh(account: Account, signal?: AbortSignal): Promise<Account> {
-    const response = await axios.post(
-      `${QWEN_AI_BASE}/api/v1/auths/signin`,
-      {
-        email: account.credentials.email,
-        password: sha256Hex(account.credentials.password),
+    const payload = {
+      email: account.credentials.email,
+      password: sha256Hex(account.credentials.password),
+    }
+    const requestOptions = {
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        Origin: QWEN_AI_BASE,
+        Referer: `${QWEN_AI_BASE}/`,
+        source: 'web',
+        Version: '0.2.67',
+        Timezone: currentTimezoneHeader(),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
       },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          Origin: QWEN_AI_BASE,
-          Referer: `${QWEN_AI_BASE}/`,
-          source: 'web',
-          Version: '0.2.67',
-          Timezone: currentTimezoneHeader(),
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
-        },
-        timeout: 15000,
-        signal,
-        validateStatus: () => true,
-      },
-    )
+      timeout: 15000,
+      signal,
+      validateStatus: () => true,
+    }
 
-    const token = response.data?.token
-    if (response.status !== 200 || !token || typeof token !== 'string') {
-      const responseText = (() => {
-        try {
-          return JSON.stringify(response.data || {})
-        } catch {
-          return ''
-        }
-      })()
-      const riskControlled = /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(responseText)
-      const error = new Error(`Qwen AI token refresh failed: HTTP ${response.status}`) as QwenAiRefreshError
-      error.status = riskControlled ? 403 : response.status === 200 ? 401 : response.status
-      error.retryable = false
-      if (riskControlled) {
-        error.code = 'qwen_ai_risk_control'
+    let response: QwenAiSignInResponse
+    try {
+      response = await axios.post(`${QWEN_AI_BASE}/api/v2/auths/signin`, payload, requestOptions)
+      if (response.status === 404 || response.status === 405) {
+        response = await axios.post(`${QWEN_AI_BASE}/api/v1/auths/signin`, payload, requestOptions)
       }
-      throw error
+    } catch (error) {
+      throw createRefreshTransportError(error, signal)
+    }
+
+    const token = extractSignInToken(response.data)
+    if (response.status !== 200 || !token || typeof token !== 'string') {
+      throw createRefreshResponseError(response)
     }
 
     const cookies = mergeCookieHeaders(

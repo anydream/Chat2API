@@ -15,6 +15,7 @@ MODULE_PATH = Path(
 RESPONSES_MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py"
 )
+RESPONSES_MAIN_MODULE_PATH = Path("litellm/responses/main.py")
 ANTHROPIC_ADAPTER_MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py"
 )
@@ -203,7 +204,177 @@ def _anthropic_sse_ping_event() -> bytes:
     return b'event: ping\\ndata: {"type":"ping"}\\n\\n'
 
 
+def _anthropic_responses_error_event(message: str) -> Dict[str, Any]:
+    return {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": message or "Upstream Responses stream ended before completion",
+        },
+    }
+
+
 class AnthropicResponsesStreamWrapper:'''
+
+RESPONSES_STATE_ANCHOR = '''        self._sent_message_start = False
+        self._sent_message_stop = False
+        self._chunk_queue: deque = deque()
+'''
+
+RESPONSES_STATE_PATCH = '''        self._sent_message_start = False
+        self._sent_message_stop = False
+        self._terminal_error_seen = False
+        self._chunk_queue: deque = deque()
+'''
+
+RESPONSES_PROCESS_EVENT_ANCHOR = '''    def _process_event(self, event: Any) -> None:
+        """Convert one Responses API event into zero or more Anthropic chunks queued for emission."""
+'''
+
+RESPONSES_PROCESS_EVENT_PATCH = '''    @staticmethod
+    def _event_field(value: Any, name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    @classmethod
+    def _event_error_message(cls, event: Any) -> str:
+        direct_message = cls._event_field(event, "message")
+        if isinstance(direct_message, str) and direct_message:
+            return direct_message
+
+        response = cls._event_field(event, "response")
+        error = cls._event_field(response, "error") if response is not None else None
+        if isinstance(error, str) and error:
+            return error
+        nested_message = cls._event_field(error, "message") if error is not None else None
+        if isinstance(nested_message, str) and nested_message:
+            return nested_message
+        return "Upstream Responses stream failed before completion"
+
+    def _queue_terminal_error(self, message: str) -> None:
+        if self._terminal_error_seen or self._sent_message_stop:
+            return
+        self._terminal_error_seen = True
+        self._sent_message_stop = True
+        self._chunk_queue.append(_anthropic_responses_error_event(message))
+
+    def _process_event(self, event: Any) -> None:
+        """Convert one Responses API event into zero or more Anthropic chunks queued for emission."""
+'''
+
+RESPONSES_CREATED_ANCHOR = '''        if event_type == "response.created":
+            self._sent_message_start = True
+            self._chunk_queue.append(self._make_message_start())
+            return
+'''
+
+RESPONSES_CREATED_PATCH = '''        if event_type == "response.created":
+            if not self._sent_message_start:
+                self._sent_message_start = True
+                self._chunk_queue.append(self._make_message_start())
+            return
+'''
+
+RESPONSES_OUTPUT_ITEM_ANCHOR = '''        # ---- content_block_start for a new output message item ----
+        if event_type == "response.output_item.added":
+'''
+
+RESPONSES_OUTPUT_ITEM_PATCH = '''        # ---- terminal Responses error ----
+        if event_type == "error":
+            self._queue_terminal_error(self._event_error_message(event))
+            return
+
+        # ---- content_block_start for a new output message item ----
+        if event_type == "response.output_item.added":
+'''
+
+RESPONSES_TERMINAL_ANCHOR = '''        # ---- response completed -> message_delta + message_stop ----
+        if event_type in (
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        ):
+'''
+
+RESPONSES_TERMINAL_PATCH = '''        # ---- failed response -> terminal Anthropic error ----
+        if event_type == "response.failed":
+            self._queue_terminal_error(self._event_error_message(event))
+            return
+
+        # ---- response completed -> message_delta + message_stop ----
+        if event_type in (
+            "response.completed",
+            "response.incomplete",
+        ):
+'''
+
+RESPONSES_ANEXT_ANCHOR = '''    async def __anext__(self) -> Dict[str, Any]:
+        # Return any queued chunks first
+        if self._chunk_queue:
+            return self._chunk_queue.popleft()
+
+        # Emit message_start if not yet done (fallback if response.created wasn't fired)
+        if not self._sent_message_start:
+            self._sent_message_start = True
+            self._chunk_queue.append(self._make_message_start())
+            return self._chunk_queue.popleft()
+
+        # Consume the upstream stream
+        try:
+            async for event in self.responses_stream:
+                self._process_event(event)
+                if self._chunk_queue:
+                    return self._chunk_queue.popleft()
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            verbose_logger.error(f"AnthropicResponsesStreamWrapper error: {e}\\n{traceback.format_exc()}")
+
+        # Drain any remaining queued chunks
+        if self._chunk_queue:
+            return self._chunk_queue.popleft()
+
+        raise StopAsyncIteration
+'''
+
+RESPONSES_ANEXT_PATCH = '''    async def __anext__(self) -> Dict[str, Any]:
+        # Return any queued chunks first
+        if self._chunk_queue:
+            return self._chunk_queue.popleft()
+        if self._terminal_error_seen:
+            raise StopAsyncIteration
+
+        # Emit message_start if not yet done (fallback if response.created wasn't fired)
+        if not self._sent_message_start:
+            self._sent_message_start = True
+            self._chunk_queue.append(self._make_message_start())
+            return self._chunk_queue.popleft()
+
+        # Consume the upstream stream
+        try:
+            async for event in self.responses_stream:
+                self._process_event(event)
+                if self._chunk_queue:
+                    return self._chunk_queue.popleft()
+        except StopAsyncIteration:
+            pass
+        except Exception as exc:
+            verbose_logger.error(
+                f"AnthropicResponsesStreamWrapper error: {exc}\\n{traceback.format_exc()}"
+            )
+            self._queue_terminal_error(str(exc) or "Upstream Responses transport failed")
+
+        # A clean EOF without a Responses terminal event is still a broken stream.
+        if not self._sent_message_stop and not self._terminal_error_seen:
+            self._queue_terminal_error(
+                "Upstream Responses stream ended before response.completed"
+            )
+        if self._chunk_queue:
+            return self._chunk_queue.popleft()
+
+        raise StopAsyncIteration
+'''
 
 RESPONSES_ORIGINAL_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
         """Yield SSE-encoded bytes for each Anthropic event chunk."""
@@ -217,7 +388,7 @@ RESPONSES_ORIGINAL_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) 
 '''
 
 RESPONSES_PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
-        """Yield SSE events and keep quiet Responses streams observable."""
+        """Yield observable SSE and terminate failed Responses streams explicitly."""
         heartbeat_interval = _anthropic_sse_heartbeat_interval_seconds()
         pending_chunk = None
         try:
@@ -247,12 +418,42 @@ RESPONSES_PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -
                     yield payload.encode()
                 else:
                     yield chunk
+        except Exception as exc:  # noqa: BLE001
+            verbose_logger.exception(
+                "Anthropic Responses adapter failed while emitting SSE: %s",
+                exc,
+            )
+            if not self._terminal_error_seen and not self._sent_message_stop:
+                payload = _anthropic_responses_error_event(
+                    str(exc) or "Upstream Responses transport failed"
+                )
+                yield f"event: error\\ndata: {json.dumps(payload)}\\n\\n".encode()
         finally:
             if pending_chunk is not None:
                 if not pending_chunk.done():
                     pending_chunk.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await pending_chunk
+'''
+
+RESPONSES_NATIVE_STREAM_MARKER = "Chat2API wildcard declares native Responses streaming"
+RESPONSES_NATIVE_STREAM_ANCHOR = '''            fake_stream=responses_api_provider_config.should_fake_stream(
+                model=model, stream=stream, custom_llm_provider=custom_llm_provider
+            ),
+'''
+RESPONSES_NATIVE_STREAM_PATCH = '''            # Chat2API wildcard declares native Responses streaming through
+            # model_info because the internal model id "*" is absent from
+            # LiteLLM's capability catalog.
+            fake_stream=(
+                False
+                if isinstance(kwargs.get("model_info"), dict)
+                and kwargs["model_info"].get("supports_native_streaming") is True
+                else responses_api_provider_config.should_fake_stream(
+                    model=model,
+                    stream=stream,
+                    custom_llm_provider=custom_llm_provider,
+                )
+            ),
 '''
 
 TOKEN_COUNTER_MARKER = "def _chat2api_anthropic_image_url("
@@ -939,9 +1140,9 @@ def patch_source(source: str) -> str:
 
 
 def patch_responses_source(source: str) -> str:
-    if "def _anthropic_sse_heartbeat_interval_seconds(" in source:
+    if "def _anthropic_responses_error_event(" in source:
         raise RuntimeError(
-            "LiteLLM Responses Anthropic heartbeat patch is already present; "
+            "LiteLLM Responses Anthropic terminal/error patch is already present; "
             "review the base image before removing this build patch."
         )
 
@@ -959,11 +1160,64 @@ def patch_responses_source(source: str) -> str:
     )
     patched = replace_exact(
         patched,
+        RESPONSES_STATE_ANCHOR,
+        RESPONSES_STATE_PATCH,
+        "Responses terminal state anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_PROCESS_EVENT_ANCHOR,
+        RESPONSES_PROCESS_EVENT_PATCH,
+        "Responses event helper anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_CREATED_ANCHOR,
+        RESPONSES_CREATED_PATCH,
+        "Responses message-start anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_OUTPUT_ITEM_ANCHOR,
+        RESPONSES_OUTPUT_ITEM_PATCH,
+        "Responses error event anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_TERMINAL_ANCHOR,
+        RESPONSES_TERMINAL_PATCH,
+        "Responses failed terminal anchor",
+    )
+    patched = replace_exact(
+        patched,
+        RESPONSES_ANEXT_ANCHOR,
+        RESPONSES_ANEXT_PATCH,
+        "Responses transport termination anchor",
+    )
+    patched = replace_exact(
+        patched,
         RESPONSES_ORIGINAL_WRAPPER,
         RESPONSES_PATCHED_WRAPPER,
         "Responses async SSE wrapper",
     )
     compile(patched, str(RESPONSES_MODULE_PATH), "exec")
+    return patched
+
+
+def patch_responses_main_source(source: str) -> str:
+    if RESPONSES_NATIVE_STREAM_MARKER in source:
+        raise RuntimeError(
+            "LiteLLM already contains the Responses native-stream model-info patch; "
+            "review the base image before removing this build patch."
+        )
+
+    patched = replace_exact(
+        source,
+        RESPONSES_NATIVE_STREAM_ANCHOR,
+        RESPONSES_NATIVE_STREAM_PATCH,
+        "Responses native-stream model-info anchor",
+    )
+    compile(patched, str(RESPONSES_MAIN_MODULE_PATH), "exec")
     return patched
 
 
@@ -1163,6 +1417,7 @@ def resolve_targets() -> list[Path]:
     return [
         resolve_installed_target(MODULE_PATH),
         resolve_installed_target(RESPONSES_MODULE_PATH),
+        resolve_installed_target(RESPONSES_MAIN_MODULE_PATH),
         resolve_installed_target(ANTHROPIC_ADAPTER_MODULE_PATH),
         resolve_installed_target(TOKEN_COUNTER_MODULE_PATH),
         resolve_installed_target(PROXY_SERVER_MODULE_PATH),
@@ -1176,6 +1431,8 @@ def main() -> None:
         target_path = target.as_posix()
         if target_path.endswith(RESPONSES_MODULE_PATH.as_posix()):
             patched = patch_responses_source(source)
+        elif target_path.endswith(RESPONSES_MAIN_MODULE_PATH.as_posix()):
+            patched = patch_responses_main_source(source)
         elif target_path.endswith(ANTHROPIC_ADAPTER_MODULE_PATH.as_posix()):
             patched = patch_anthropic_adapter_source(source)
         elif target_path.endswith(TOKEN_COUNTER_MODULE_PATH.as_posix()):

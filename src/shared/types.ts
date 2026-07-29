@@ -54,6 +54,15 @@ export interface QwenAiGovernorEffectiveConfig extends QwenAiGovernorConfig {
   autoTuneReason: string
 }
 
+export interface QwenAiAccountFailoverRecord {
+  requestId?: string
+  status?: number
+  errorCode?: string
+  attempt: number
+  accountFault?: boolean
+  timestamp: number
+}
+
 export interface QwenAiGovernorAccountStatus {
   accountId: string
   accountName: string
@@ -70,8 +79,11 @@ export interface QwenAiGovernorAccountStatus {
   governorFailures: number
   loadBalancerCooldownUntil?: number
   loadBalancerCooldownInMs: number
+  loadBalancerRecoveryUntil?: number
+  loadBalancerRecoveryInMs: number
   loadBalancerReason?: string
   loadBalancerFailures: number
+  recentFailover?: QwenAiAccountFailoverRecord
 }
 
 export interface QwenAiGovernorStatus {

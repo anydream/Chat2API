@@ -29,6 +29,6 @@ test('load balancer avoids a failed Qwen AI account on the next selection', () =
 
   assert.match(source, /FAIL_THRESHOLD = 1/)
   assert.match(source, /RECOVERY_TIME = 60000/)
-  assert.match(source, /let candidates = this\.getAvailableAccounts\(model, preferredProviderId, true\)/)
-  assert.match(source, /candidates = this\.getAvailableAccounts\(model, preferredProviderId, false\)/)
+  assert.match(source, /let candidates = this\.getAvailableAccounts\(\s*model,\s*preferredProviderId,\s*true,/)
+  assert.match(source, /candidates = this\.getAvailableAccounts\(\s*model,\s*preferredProviderId,\s*false,/)
 })

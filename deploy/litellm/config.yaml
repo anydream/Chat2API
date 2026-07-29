@@ -13,6 +13,10 @@ model_list:
       # Preserve Anthropic adaptive-thinking effort through the generic
       # OpenAI-compatible bridge. Chat2API decides how each provider uses it.
       allowed_openai_params: ["reasoning_effort"]
+    model_info:
+      # The wildcard's internal model id is "*", which LiteLLM cannot look up
+      # in its model catalog. Chat2API Responses streams are native SSE.
+      supports_native_streaming: true
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
@@ -29,6 +33,6 @@ router_settings:
 litellm_settings:
   drop_params: true
   strip_anthropic_total_tokens: true
-  # Chat2API exposes the OpenAI Chat Completions contract. LiteLLM's protocol
-  # bridge is configurable so this file does not force a client-specific path.
+  # Keep Anthropic Messages on LiteLLM's Responses bridge. Chat2API exposes
+  # /v1/responses and translates it to the selected provider internally.
   use_chat_completions_url_for_anthropic_messages: os.environ/LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES

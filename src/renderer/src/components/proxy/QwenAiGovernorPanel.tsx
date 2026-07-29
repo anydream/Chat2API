@@ -86,6 +86,10 @@ function formatDuration(ms: number): string {
   return `${seconds}s`
 }
 
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString()
+}
+
 function isPositiveInteger(value: string): boolean {
   const parsed = Number.parseInt(value, 10)
   return Number.isInteger(parsed) && parsed >= 0 && String(parsed) === value.trim()
@@ -427,21 +431,25 @@ export function QwenAiGovernorPanel() {
           <CardDescription>{t('proxy.qwenGovernor.accountStatusDesc')}</CardDescription>
         </CardHeader>
         <CardContent>
-          <Table>
+          <div className="overflow-x-auto">
+          <Table className="min-w-[1280px]">
             <TableHeader>
               <TableRow>
                 <TableHead>{t('providers.accountName')}</TableHead>
                 <TableHead>{t('providers.status')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.queue')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.nextAvailable')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.priorityRecovery')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.failures')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.reason')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.recentFailover')}</TableHead>
                 <TableHead className="text-right">{t('common.actions')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {accounts.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">
                     {t('proxy.qwenGovernor.noAccounts')}
                   </TableCell>
                 </TableRow>
@@ -450,7 +458,10 @@ export function QwenAiGovernorPanel() {
                   account.governorCooldownInMs > 0 ||
                   account.loadBalancerCooldownInMs > 0 ||
                   account.nextAvailableInMs > 0
-                const reason = account.governorCooldownReason || account.loadBalancerReason || '-'
+                const reasons = [account.governorCooldownReason, account.loadBalancerReason]
+                  .filter((reason): reason is string => Boolean(reason))
+                const canClear = isCooling || account.governorFailures > 0 || account.loadBalancerFailures > 0
+                const failover = account.recentFailover
 
                 return (
                   <TableRow key={account.accountId}>
@@ -480,14 +491,44 @@ export function QwenAiGovernorPanel() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <code className="text-xs">{reason}</code>
+                      <span>{formatDuration(account.loadBalancerRecoveryInMs)}</span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={account.loadBalancerFailures > 0 ? 'destructive' : 'secondary'}>
+                        {account.loadBalancerFailures}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      {reasons.length > 0 ? (
+                        <div className="space-y-1">
+                          {reasons.map(reason => <code key={reason} className="block text-xs">{reason}</code>)}
+                        </div>
+                      ) : <span>-</span>}
+                    </TableCell>
+                    <TableCell>
+                      {failover ? (
+                        <div className="max-w-[260px] space-y-1 text-xs">
+                          <p>{formatTimestamp(failover.timestamp)}</p>
+                          <p>{t('proxy.qwenGovernor.attempt')}: {failover.attempt}</p>
+                          <p>{t('proxy.qwenGovernor.statusCode')}: {failover.status ?? '-'}</p>
+                          <p className="truncate" title={failover.errorCode}>{t('proxy.qwenGovernor.errorCode')}: {failover.errorCode || '-'}</p>
+                          <p className="truncate" title={failover.requestId}>{t('proxy.qwenGovernor.requestId')}: {failover.requestId || '-'}</p>
+                          <Badge variant="outline">
+                            {failover.accountFault === true
+                              ? t('proxy.qwenGovernor.accountFault')
+                              : failover.accountFault === false
+                                ? t('proxy.qwenGovernor.accountNeutral')
+                                : t('proxy.qwenGovernor.accountFaultUnknown')}
+                          </Badge>
+                        </div>
+                      ) : <span>-</span>}
                     </TableCell>
                     <TableCell className="text-right">
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={() => handleClearAccount(account.accountId)}
-                        disabled={!isCooling}
+                        disabled={!canClear}
                       >
                         {t('proxy.qwenGovernor.clearCooldown')}
                       </Button>
@@ -497,6 +538,7 @@ export function QwenAiGovernorPanel() {
               })}
             </TableBody>
           </Table>
+          </div>
         </CardContent>
       </Card>
     </div>

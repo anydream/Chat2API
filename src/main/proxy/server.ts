@@ -278,6 +278,7 @@ export class ProxyServer {
         description: 'OpenAI API compatible proxy service',
         endpoints: [
           'POST /v1/chat/completions',
+          'POST /v1/responses',
           'GET /v1/models',
           'GET /v1/models/:model',
           'POST /v1/completions',

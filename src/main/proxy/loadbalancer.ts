@@ -11,6 +11,17 @@ import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 
 const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
 
+type AccountFailureState = {
+  count: number
+  lastFailTime: number
+  cooldownUntil?: number
+  reason?: string
+}
+
+export type AccountFailureSnapshot = AccountFailureState & {
+  recoveryUntil?: number
+}
+
 function debugLoadBalancer(message: string): void {
   if (LOAD_BALANCER_DEBUG) console.log(message)
 }
@@ -20,7 +31,7 @@ function debugLoadBalancer(message: string): void {
  */
 export class LoadBalancer {
   private roundRobinIndex: Map<string, number> = new Map()
-  private failedAccounts: Map<string, { count: number; lastFailTime: number; cooldownUntil?: number; reason?: string }> = new Map()
+  private failedAccounts: Map<string, AccountFailureState> = new Map()
   private static readonly FAIL_THRESHOLD = 1
   private static readonly RECOVERY_TIME = 60000 // 1 minute
   private static readonly QWEN_AI_RISK_COOLDOWN = 10 * 60 * 1000
@@ -34,7 +45,7 @@ export class LoadBalancer {
       count: current.count + 1,
       lastFailTime: Date.now(),
       cooldownUntil: current.cooldownUntil,
-      reason: current.reason,
+      reason: current.reason || 'request_failure',
     })
   }
 
@@ -64,19 +75,9 @@ export class LoadBalancer {
     this.failedAccounts.clear()
   }
 
-  getAccountFailureSnapshot(): Record<string, {
-    count: number
-    lastFailTime: number
-    cooldownUntil?: number
-    reason?: string
-  }> {
+  getAccountFailureSnapshot(): Record<string, AccountFailureSnapshot> {
     const now = Date.now()
-    const snapshot: Record<string, {
-      count: number
-      lastFailTime: number
-      cooldownUntil?: number
-      reason?: string
-    }> = {}
+    const snapshot: Record<string, AccountFailureSnapshot> = {}
 
     this.failedAccounts.forEach((failure, accountId) => {
       if (failure.cooldownUntil && failure.cooldownUntil <= now) {
@@ -89,7 +90,12 @@ export class LoadBalancer {
         return
       }
 
-      snapshot[accountId] = { ...failure }
+      snapshot[accountId] = {
+        ...failure,
+        ...(!failure.cooldownUntil
+          ? { recoveryUntil: failure.lastFailTime + LoadBalancer.RECOVERY_TIME }
+          : {}),
+      }
     })
 
     return snapshot
@@ -143,12 +149,23 @@ export class LoadBalancer {
     model: string,
     strategy: LoadBalanceStrategy = 'round-robin',
     preferredProviderId?: string,
-    preferredAccountId?: string
+    preferredAccountId?: string,
+    excludedAccountIds: ReadonlySet<string> = new Set(),
   ): AccountSelection | null {
-    let candidates = this.getAvailableAccounts(model, preferredProviderId, true)
+    let candidates = this.getAvailableAccounts(
+      model,
+      preferredProviderId,
+      true,
+      excludedAccountIds,
+    )
 
     if (candidates.length === 0) {
-      candidates = this.getAvailableAccounts(model, preferredProviderId, false)
+      candidates = this.getAvailableAccounts(
+        model,
+        preferredProviderId,
+        false,
+        excludedAccountIds,
+      )
     }
 
     if (candidates.length === 0) {
@@ -187,7 +204,8 @@ export class LoadBalancer {
   private getAvailableAccounts(
     model: string,
     preferredProviderId?: string,
-    excludeFailed: boolean = false
+    excludeFailed: boolean = false,
+    excludedAccountIds: ReadonlySet<string> = new Set(),
   ): AccountSelection[] {
     const providers = storeManager.getProviders().filter(p => p.enabled)
     const candidates: AccountSelection[] = []
@@ -203,6 +221,7 @@ export class LoadBalancer {
 
       const accounts = storeManager.getAccountsByProviderId(provider.id, true)
         .filter(account => this.isAccountAvailable(account))
+        .filter(account => !excludedAccountIds.has(account.id))
         .filter(account => !this.isAccountInHardCooldown(account.id))
         .filter(account => !excludeFailed || !this.isAccountInFailure(account.id))
 

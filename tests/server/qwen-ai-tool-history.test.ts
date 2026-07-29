@@ -455,11 +455,13 @@ test('Qwen AI never retains more duplicate-ID results than retained calls', () =
 test('Qwen AI caps the rendered prompt after tool XML expansion', async () => {
   const envNames = [
     'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
+    'CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES',
     'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
     'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
   ]
   const previous = new Map(envNames.map(name => [name, process.env[name]]))
   process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES = '5000'
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES = '500'
   process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = '10000'
   process.env.CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = '10000'
 
@@ -478,13 +480,49 @@ test('Qwen AI caps the rendered prompt after tool XML expansion', async () => {
       { role: 'user', content: 'Continue after the batch.' },
     ], {} as any)
 
-    assert.ok(Buffer.byteLength(prepared.content, 'utf8') <= 5000)
+    assert.ok(Buffer.byteLength(JSON.stringify(prepared.content), 'utf8') <= 4500)
     if (prepared.content.includes('<|CHAT2API|tool_calls>')) {
       assert.equal(
         (prepared.content.match(/<\|CHAT2API\|tool_calls>/g) || []).length,
         (prepared.content.match(/<\/\|CHAT2API\|tool_calls>/g) || []).length,
       )
     }
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
+})
+
+test('Qwen AI reserves provider-envelope space using JSON wire bytes', async () => {
+  const envNames = [
+    'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
+    'CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES',
+    'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
+    'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
+  ]
+  const previous = new Map(envNames.map(name => [name, process.env[name]]))
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES = '5000'
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES = '500'
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = '10000'
+  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = '10000'
+
+  try {
+    const escapedHistory = Array.from({ length: 12 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+      content: `history-${index}: ${'"\\'.repeat(220)}`,
+    }))
+    const prepared = await prepareQwenAiMultimodalMessage([
+      { role: 'user', content: 'Keep the original task anchor.' },
+      ...escapedHistory,
+      { role: 'user', content: 'Continue the current task.' },
+    ], {} as any)
+
+    const wireBytes = Buffer.byteLength(JSON.stringify(prepared.content), 'utf8')
+    assert.ok(wireBytes <= 4500, `rendered prompt wire size is ${wireBytes} bytes`)
+    assert.match(prepared.content, /Continue the current task\./)
+    assert.match(prepared.content, /Earlier conversation omitted/)
   } finally {
     for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name]

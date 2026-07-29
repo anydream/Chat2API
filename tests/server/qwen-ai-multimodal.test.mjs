@@ -283,12 +283,12 @@ test('Qwen AI adapter request timeout is configurable for long-context document 
   assert.doesNotMatch(source, /timeout:\s*120000/)
 })
 
-test('Qwen AI credential warnings only fire when both token and cookies are absent', () => {
+test('Qwen AI credential warnings require either a JWT or the session token cookie', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
-  assert.match(source, /if \(cookies\) \{[\s\S]*headers\['Cookie'\] = cookies[\s\S]*\} else if \(!token\)/)
-  assert.match(source, /No token or cookies provided/)
-  assert.doesNotMatch(source, /else \{\s*console\.warn\('\[QwenAI\] Warning: No cookies provided/)
+  assert.match(source, /if \(!token && !hasQwenAiSessionCookie\(cookies\)\)/)
+  assert.match(source, /No JWT or session token cookie provided/)
+  assert.doesNotMatch(source, /if \(!token && !cookies\)/)
 })
 
 test('Docker Compose exposes Qwen timeout overrides under their runtime names', () => {
@@ -299,6 +299,7 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:-524288\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:-32768\}/)
   assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:-24576\}/)
   assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:-131072\}/)
   assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:-32\}/)
@@ -309,6 +310,7 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES=32768/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32/)
@@ -410,14 +412,16 @@ test('Qwen AI adapter no longer hard-codes stale Baxia challenge headers', () =>
   assert.doesNotMatch(source, /Version: '0\.2\.7'/)
 })
 
-test('Qwen AI adapter uses browser cookies as the primary web session credential', () => {
-  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+test('Qwen AI adapter selects cookie-only mode only for a real session token cookie', () => {
+  const adapterSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const authSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai-token-refresh.ts', 'utf8')
 
-  assert.match(source, /const cookies = this\.getCookies\(\)/)
-  assert.match(source, /Sending browser cookies together with desktop bearer auth/)
-  assert.match(source, /if \(token && !cookies\)/)
-  assert.match(source, /headers\.source = 'desktop'/)
-  assert.match(source, /headers\['Cookie'\] = cookies/)
+  assert.match(adapterSource, /const cookies = this\.getCookies\(\)/)
+  assert.match(adapterSource, /resolveQwenAiAuthHeaders\(token, cookies\)/)
+  assert.match(authSource, /const hasSessionCookie = hasQwenAiSessionCookie\(cookies\)/)
+  assert.match(authSource, /normalizedToken && !hasSessionCookie[\s\S]*Authorization:/)
+  assert.match(authSource, /normalizedToken && !hasSessionCookie && !cookies \? \{ source: 'desktop' \}/)
+  assert.match(authSource, /\.\.\.\(cookies \? \{ Cookie: cookies \} : \{\}\)/)
 })
 
 test('Qwen AI non-stream responses reject empty upstream output instead of returning fake success', () => {

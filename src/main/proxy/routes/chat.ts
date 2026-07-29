@@ -5,9 +5,15 @@
 
 import Router from '@koa/router'
 import type { Context } from 'koa'
-import { ChatCompletionRequest, ChatCompletionResponse, ProxyContext } from '../types'
+import {
+  ChatCompletionRequest,
+  ChatCompletionResponse,
+  ProxyContext,
+  type AccountSelection,
+} from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
+import { forwardWithAccountFailover } from '../accountFailover'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
 import {
@@ -216,14 +222,14 @@ router.post('/completions', async (ctx: Context) => {
   const preferredProviderId = modelMapper.getPreferredProvider(request.model)
   const preferredAccountId = modelMapper.getPreferredAccount(request.model)
 
-  const selection = loadBalancer.selectAccount(
+  const initialSelection = loadBalancer.selectAccount(
     request.model,
     config.loadBalanceStrategy,
     preferredProviderId,
     preferredAccountId
   )
 
-  if (!selection) {
+  if (!initialSelection) {
     ctx.status = 503
     ctx.body = {
       error: {
@@ -236,30 +242,76 @@ router.post('/completions', async (ctx: Context) => {
     return
   }
 
-  const { account, provider, actualModel } = selection
-
-  const context: ProxyContext = {
+  const clientSignal = createClientAbortSignal(ctx)
+  const createProxyContext = (selection: AccountSelection): ProxyContext => ({
     requestId,
-    providerId: provider.id,
-    accountId: account.id,
+    providerId: selection.provider.id,
+    accountId: selection.account.id,
     model: request.model,
-    actualModel,
+    actualModel: selection.actualModel,
     startTime,
     isStream: request.stream || false,
     clientIP,
-    signal: createClientAbortSignal(ctx),
-  }
-
+    signal: clientSignal,
+  })
+  let { account, provider, actualModel } = initialSelection
+  let context = createProxyContext(initialSelection)
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
 
   try {
-    const result = await requestForwarder.forwardChatCompletion(
-      request,
-      account,
-      provider,
-      actualModel,
-      context
-    )
+    const outcome = await forwardWithAccountFailover({
+      initialSelection,
+      maxFailovers: config.retryCount,
+      signal: clientSignal,
+      forward: async ({ selection }) => {
+        const attemptContext = createProxyContext(selection)
+        return requestForwarder.forwardChatCompletion(
+          request,
+          selection.account,
+          selection.provider,
+          selection.actualModel,
+          attemptContext,
+        )
+      },
+      selectNext: excludedAccountIds => loadBalancer.selectAccount(
+        request.model,
+        config.loadBalanceStrategy,
+        preferredProviderId,
+        preferredAccountId,
+        excludedAccountIds,
+      ),
+      onFailedAttempt: ({ selection, attempt }, result) => {
+        if (QwenAiAdapter.isQwenAiProvider(selection.provider)) {
+          qwenAiRequestGovernor.reportAccountFailover(selection.account.id, {
+            requestId,
+            status: result.status,
+            errorCode: result.errorCode,
+            attempt,
+            accountFault: result.accountFault,
+          })
+        }
+        if (result.accountFault !== false) {
+          loadBalancer.markAccountFailed(selection.account.id)
+        }
+        storeManager.addLog('warn', 'Retrying request with another account after upstream failure', {
+          requestId,
+          providerId: selection.provider.id,
+          accountId: selection.account.id,
+          model: request.model,
+          errorCode: result.errorCode,
+          data: {
+            attempt,
+            status: result.status,
+            accountFault: result.accountFault,
+          },
+        })
+      },
+    })
+    account = outcome.selection.account
+    provider = outcome.selection.provider
+    actualModel = outcome.selection.actualModel
+    context = createProxyContext(outcome.selection)
+    const result = outcome.result
 
     const latency = Date.now() - startTime
 

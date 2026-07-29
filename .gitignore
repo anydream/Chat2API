@@ -60,3 +60,6 @@ src/renderer/next-app/
 
 # Backup
 backup/
+
+# Local migration artifacts and development data
+.local/

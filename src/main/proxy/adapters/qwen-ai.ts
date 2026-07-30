@@ -1658,6 +1658,16 @@ function createQwenAiUndeclaredNativeToolError(names: string[]): QwenAiUpstreamE
   return error
 }
 
+const QWEN_AI_INTERNAL_NATIVE_TOOL_NAMES = new Set([
+  'web_search',
+  'web_extractor',
+  'code_interpreter',
+])
+
+function isQwenAiInternalNativeTool(name: string): boolean {
+  return QWEN_AI_INTERNAL_NATIVE_TOOL_NAMES.has(name.trim().toLowerCase())
+}
+
 function createQwenAiIncompleteNativeToolError(names: string[]): QwenAiUpstreamError {
   const uniqueNames = [...new Set(names.filter(Boolean))]
   return createQwenAiToolValidationError({
@@ -3412,7 +3422,12 @@ export class QwenAiStreamHandler {
       this.nativeToolCallStates.set(fragment.key, nextState)
       if (name && !allowed && !this.warnedUndeclaredNativeToolNames.has(name)) {
         this.warnedUndeclaredNativeToolNames.add(name)
-        console.warn('[QwenAI] Ignoring undeclared upstream native tool call:', name)
+        console.warn(
+          isQwenAiInternalNativeTool(name)
+            ? '[QwenAI] Ignoring provider-internal native tool call:'
+            : '[QwenAI] Ignoring undeclared upstream native tool call:',
+          name,
+        )
       }
     }
 
@@ -3422,7 +3437,12 @@ export class QwenAiStreamHandler {
   private getCompleteUndeclaredNativeToolNames(): string[] {
     const names = new Set<string>()
     for (const state of this.nativeToolCallStates.values()) {
-      if (state.name && !state.allowed && isCompleteJsonText(state.arguments)) {
+      if (
+        state.name
+        && !state.allowed
+        && !isQwenAiInternalNativeTool(state.name)
+        && isCompleteJsonText(state.arguments)
+      ) {
         names.add(state.name)
       }
     }

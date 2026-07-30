@@ -186,16 +186,11 @@ QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=3
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
-CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288
-CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES=32768
-CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576
-CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072
-CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32
 # Leave blank/unset for deadline mode; set a non-negative integer for an
 # explicit retry cap (0 disables busy-chat recovery).
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
-CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=120000
+CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 ```
@@ -237,17 +232,8 @@ stream is attached. This prevents several recovery layers from accumulating
 independent waits while preserving long generations that are making progress.
 Set it to `0` to disable recovery and surface the original upstream failure.
 Qwen receives the OpenAI message history as one provider prompt. Chat2API
-preserves the messages unchanged while their serialized size is at or below
-`CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES` (default `524288`). Only an
-over-budget transcript is compacted. During that compaction,
-`CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES` (default `32768`) keeps
-space for JSON escaping and the provider request envelope; the rendered prompt
-is measured after JSON serialization before it is sent upstream.
-`CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES` (default `131072`) and
-`CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES` (default `24576`) bound
-individual retained entries, while `CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS`
-(default `32`) bounds and deduplicates uploaded attachments. These are generic
-deployment limits and do not inspect session ids, project paths, or task text.
+forwards the complete rendered transcript without applying a proxy-side size
+limit or compacting messages, tool arguments, or tool results.
 When a managed-tool response reaches a semantic terminal without a tool call,
 Chat2API starts a new user-turn continuation in the same Qwen chat instead of
 replaying that completed response branch. The generic continuation is bounded
@@ -258,7 +244,7 @@ If Qwen is still finalizing the parent response, its continuation endpoint
 returns HTTP 200 JSON with `code=CHAT_IN_PROGRESS` instead of an SSE stream.
 Chat2API waits with exponential backoff and retries the exact same continuation
 payload until `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS` is spent
-(default `120000` ms). This admission budget is capped by
+(default `300000` ms). This admission budget is capped by
 `QWEN_AI_REQUEST_TIMEOUT_MS` but does not shorten an accepted generation. Leave
 `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` unset/blank for deadline mode;
 set a positive value only when the deployment needs an explicit attempt cap, or

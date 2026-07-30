@@ -298,22 +298,23 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
 
   assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:-524288\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:-32768\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:-24576\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:-131072\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:-32\}/)
+  const transcriptEnvironmentNames = [
+    'MAX_BYTES',
+    'REQUEST_RESERVE_BYTES',
+    'TOOL_RESULT_MAX_BYTES',
+    'MESSAGE_MAX_BYTES',
+    'MAX_FILE_PARTS',
+  ].map((suffix) => ['CHAT2API_QWEN_AI', 'TRANSCRIPT', suffix].join('_'))
+  for (const environmentName of transcriptEnvironmentNames) {
+    assert.doesNotMatch(source, new RegExp(environmentName))
+    assert.doesNotMatch(dockerfile, new RegExp(environmentName))
+  }
   assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{QWEN_AI_REQUEST_TIMEOUT_MS:-600000\}/)
   assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS:\s*\$\{QWEN_AI_RESPONSE_TIMEOUT_MS:-0\}/)
   assert.match(source, /QWEN_AI_STREAM_IDLE_TIMEOUT_MS:\s*\$\{QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000\}/)
   assert.doesNotMatch(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_REQUEST_TIMEOUT_MS/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES=32768/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32/)
   assert.match(dockerfile, /ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0/)
   assert.match(governorSource, /numberFromEnv\('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS',\s*120 \* 1000\)/)
 })

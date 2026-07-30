@@ -35,21 +35,13 @@ services:
       # One cumulative no-progress budget covers transport resumes and
       # workflow continuations; normal active generation is not counted.
       CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000}
-      # Compact only over-budget Qwen transcripts. Per-message/tool-result
-      # limits are applied only as part of that aggregate compaction.
-      CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES: ${CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:-524288}
-      # Reserve space for JSON escaping and the provider request envelope.
-      CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES: ${CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:-32768}
-      CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES: ${CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:-24576}
-      CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES: ${CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:-131072}
-      CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS: ${CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:-32}
       # A busy-chat admission response retries the exact same continuation
       # payload; it never creates another user turn or switches accounts.
       # Busy-chat admission has its own wall-clock budget; it must not inherit
       # the much longer generation timeout. Set 0 to disable busy-chat retry.
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS-}
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:-1000}
-      CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:-120000}
+      CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:-300000}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}

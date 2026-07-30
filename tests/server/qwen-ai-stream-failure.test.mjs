@@ -1902,6 +1902,56 @@ test('Qwen AI stream waits for terminal output before rejecting an undeclared na
   assert.equal(upstream.destroyed, true)
 })
 
+test('Qwen AI stream ignores the provider-internal web retrieval chain and returns the final answer', async () => {
+  const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
+    ToolStreamParser: PassthroughToolStreamParser,
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const output = await handler.handleStream(upstream, { bufferManagedBranch: true })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.on(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  upstream.end([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'web_search', arguments: '{"query":"fixture"}' },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'web_extractor', arguments: '{"url":"https://example.com"}' },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'search-backed answer',
+    } }] })}\n\n`,
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(failure, undefined)
+  assert.match(body, /search-backed answer/)
+  assert.match(body, /"finish_reason":"stop"/)
+})
+
 test('Qwen AI stream does not let undeclared native tool events reset the idle timer', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     normalizeNativeFunctionCallDelta: delta => delta.function_call
@@ -2586,6 +2636,42 @@ test('Qwen AI non-stream parsing rejects an undeclared native tool only at termi
     && /another_provider_tool/.test(error.message)
   ))
   assert.equal(upstream.destroyed, true)
+})
+
+test('Qwen AI non-stream parsing ignores provider-internal code interpreter output', async () => {
+  const { QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
+  const upstream = new PassThrough()
+  const handler = new QwenAiStreamHandler('test-model', undefined, {
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['declared_tool']),
+    toolChoiceMode: 'auto',
+  })
+  const result = handler.handleNonStream(upstream)
+
+  upstream.end([
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      function_call: { name: 'code_interpreter', arguments: '{"code":"1 + 1"}' },
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'computed answer',
+    } }] })}\n\n`,
+  ].join(''))
+
+  const response = await result
+  assert.equal(response.choices[0].message.content, 'computed answer')
 })
 
 test('Qwen AI non-stream parsing rejects answer text after a complete undeclared native tool event', async () => {

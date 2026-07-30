@@ -275,18 +275,8 @@ Response-id resumes and managed-tool continuations share the cumulative
 no-progress recovery work and pauses while a replacement stream is active, so
 long generations that are producing output remain eligible to complete. Set it
 to `0` to disable recovery and return the original upstream failure.
-Qwen transcript compaction is controlled by
-`CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES` (default `524288`). Requests within the
-aggregate budget are preserved unchanged. Only over-budget requests apply the
-provider-envelope reserve `CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES`
-(default `32768`); rendered prompts are measured after JSON serialization so
-escaping and fixed request fields do not consume the upstream limit silently.
-Over-budget requests then apply the
-retained-message and tool-result limits
-`CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES` (default `131072`) and
-`CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES` (default `24576`), plus the
-deduplicated attachment limit `CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS`
-(default `32`).
+Chat2API forwards the complete rendered Qwen transcript without applying a
+proxy-side size limit or compacting messages, tool arguments, or tool results.
 For managed-tool semantic terminals, the proxy submits a generic continuation
 user turn in the same Qwen chat, parented to the latest response id. This path
 is bounded by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `3`),
@@ -296,7 +286,7 @@ Qwen can briefly reject that continuation with HTTP 200 and
 `code=CHAT_IN_PROGRESS` while it finalizes the parent response. The proxy then
 retries the exact same continuation payload in the same chat with exponential
 backoff until `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS` is spent
-(default `120000` ms). The admission budget is capped by
+(default `300000` ms). The admission budget is capped by
 `QWEN_AI_REQUEST_TIMEOUT_MS` and does not shorten an accepted generation. Leave
 `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` unset/blank for deadline mode;
 set a positive value only when the deployment needs an explicit attempt cap, or

@@ -1,10 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import {
-  compactQwenAiTranscriptMessages,
-  prepareQwenAiMultimodalMessage,
-} from '../../src/main/proxy/adapters/qwen-ai-files.ts'
+import { prepareQwenAiMultimodalMessage } from '../../src/main/proxy/adapters/qwen-ai-files.ts'
 
 function assistantToolCall(id: string, name: string, round: number) {
   return {
@@ -216,352 +213,64 @@ test('Qwen AI keeps a generic continuation after the latest tool result', async 
   assert.match(prepared.content, /Only provide a final answer after the results have been verified by tool output\./)
 })
 
-test('Qwen AI preserves an individual message when the complete transcript fits', () => {
-  const content = `task-start ${'x'.repeat(200_000)} task-end`
-  const messages = [{ role: 'user' as const, content }]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 256_000,
-    toolResultMaxBytes: 24_000,
-    messageMaxBytes: 128_000,
-    maxFileParts: 32,
-  })
-
-  assert.equal(compacted[0].content, content)
-  assert.doesNotMatch(JSON.stringify(compacted), /Earlier conversation omitted|\.\.\. truncated/)
-})
-
-test('Qwen AI aggregate budget includes message-array separators', () => {
-  const messages = Array.from({ length: 1000 }, () => ({
-    role: 'user' as const,
-    content: 'x',
-  }))
-  const maxBytes = 29_500
-  assert.ok(Buffer.byteLength(JSON.stringify(messages), 'utf8') > maxBytes)
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes,
-    toolResultMaxBytes: 24_000,
-    messageMaxBytes: 128_000,
-    maxFileParts: 32,
-  })
-
-  assert.notEqual(compacted, messages)
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= maxBytes)
-})
-
-test('Qwen AI bounds large history while retaining the task, continuation, and failed tool pair', () => {
-  const oldResult = `old-result-start ${'x'.repeat(90000)} old-result-end`
-  const failedResult = `failed-result-start ${'y'.repeat(70000)} failed-result-end`
+test('Qwen AI preserves a transcript larger than 512 KiB without modifying caller history', async () => {
+  const firstMessage = `first-message-start ${'a'.repeat(180_000)} first-message-end`
+  const middleMessage = `middle-message-start ${'b'.repeat(180_000)} middle-message-end`
+  const latestMessage = `latest-message-start ${'c'.repeat(180_000)} latest-message-end`
+  const longToolArgument = `argument-start ${'d'.repeat(120_000)} argument-end`
+  const longToolResult = `result-start ${'e'.repeat(120_000)} result-end`
   const messages = [
-    { role: 'system' as const, content: 'system preamble' },
-    { role: 'user' as const, content: 'Create the requested image in the active project.' },
-    assistantToolCall('old-call', 'old_tool', 1),
-    toolResult('old-call', 1),
-    { role: 'tool' as const, tool_call_id: 'old-call', content: oldResult },
-    { role: 'user' as const, content: 'An unrelated middle request.' },
-    assistantToolCall('middle-call', 'middle_tool', 2),
-    toolResult('middle-call', 2),
-    { role: 'user' as const, content: 'Continue the active image task.' },
-    assistantToolCall('failed-call', 'image_tool', 3),
+    { role: 'user' as const, content: firstMessage },
+    { role: 'assistant' as const, content: middleMessage },
+    { role: 'user' as const, content: 'Run the large declared operation.' },
     {
-      role: 'tool' as const,
-      tool_call_id: 'failed-call',
-      is_error: true,
-      content: failedResult,
+      role: 'assistant' as const,
+      content: null,
+      tool_calls: [{
+        id: 'large-history-call',
+        type: 'function' as const,
+        function: {
+          name: 'large_history_tool',
+          arguments: JSON.stringify({ payload: longToolArgument }),
+        },
+      }],
     },
-    { role: 'user' as const, content: 'Continue the active task using the failed result and retry the operation.' },
+    { role: 'tool' as const, tool_call_id: 'large-history-call', content: longToolResult },
+    { role: 'user' as const, content: latestMessage },
   ]
   const snapshot = JSON.parse(JSON.stringify(messages))
 
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 12000,
-    toolResultMaxBytes: 2400,
-    messageMaxBytes: 3200,
-    maxFileParts: 4,
-  })
-  const serializedBytes = Buffer.byteLength(JSON.stringify(compacted), 'utf8')
+  assert.ok(Buffer.byteLength(JSON.stringify(messages), 'utf8') > 512 * 1024)
 
-  assert.ok(serializedBytes <= 12000, `compacted transcript is ${serializedBytes} bytes`)
-  assert.deepEqual(messages, snapshot, 'compaction must not mutate caller messages')
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
 
-  const compactedText = JSON.stringify(compacted)
-  assert.match(compactedText, /Create the requested image in the active project\./)
-  assert.match(compactedText, /Continue the active task using the failed result/)
-  assert.match(compactedText, /failed-call/)
-  assert.match(compactedText, /"is_error":true/)
-  assert.match(compactedText, /failed-result-(?:start|end)/)
-  assert.match(compactedText, /Earlier conversation omitted/)
+  assert.ok(prepared.content.includes(`User: ${firstMessage}`))
+  assert.ok(prepared.content.includes(`Assistant: ${middleMessage}`))
+  assert.ok(prepared.content.includes(`User: ${latestMessage}`))
 
-  const assistantIndex = compacted.findIndex(message => message.role === 'assistant'
-    && message.tool_calls?.some(call => call.id === 'failed-call'))
-  const resultIndex = compacted.findIndex(message => message.role === 'tool'
-    && message.tool_call_id === 'failed-call')
-  assert.ok(assistantIndex >= 0 && resultIndex > assistantIndex, 'failed tool call/result must remain paired')
+  const argumentPrefix = '<|CHAT2API|parameter name="payload"><![CDATA['
+  const argumentStart = prepared.content.indexOf(argumentPrefix)
+  const argumentEnd = prepared.content.indexOf(']]></|CHAT2API|parameter>', argumentStart)
+  assert.ok(argumentStart >= 0 && argumentEnd > argumentStart)
+  assert.equal(
+    prepared.content.slice(argumentStart + argumentPrefix.length, argumentEnd),
+    longToolArgument,
+  )
+
+  const resultPrefix = '<|CHAT2API|tool_result tool_call_id="large-history-call"><![CDATA['
+  const resultStart = prepared.content.indexOf(resultPrefix)
+  const resultEnd = prepared.content.indexOf(']]></|CHAT2API|tool_result>', resultStart)
+  assert.ok(resultStart >= 0 && resultEnd > resultStart)
+  assert.equal(
+    prepared.content.slice(resultStart + resultPrefix.length, resultEnd),
+    longToolResult,
+  )
+
+  assert.doesNotMatch(prepared.content, /Earlier conversation omitted|\[\.\.\. truncated \.\.\.\]/)
+  assert.deepEqual(messages, snapshot, 'transcript preparation must not mutate caller messages')
 })
 
-test('Qwen AI bounds structural tool arguments when text compaction is exhausted', () => {
-  const oversizedArguments = JSON.stringify({ payload: 'x'.repeat(200_000) })
-  const messages = [
-    { role: 'user' as const, content: 'Keep this task active.' },
-    {
-      role: 'assistant' as const,
-      content: null,
-      tool_calls: [{
-        id: 'oversized-call',
-        type: 'function' as const,
-        function: {
-          name: 'write_image',
-          arguments: oversizedArguments,
-        },
-      }],
-    },
-    { role: 'tool' as const, tool_call_id: 'oversized-call', content: 'done' },
-    { role: 'user' as const, content: 'Continue the task.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 1000,
-    toolResultMaxBytes: 100,
-    messageMaxBytes: 100,
-    maxFileParts: 1,
-  })
-
-  const serializedBytes = Buffer.byteLength(JSON.stringify(compacted), 'utf8')
-  assert.ok(serializedBytes <= 1000, `compacted transcript is ${serializedBytes} bytes`)
-  const call = compacted.find(message => message.role === 'assistant')?.tool_calls?.[0]
-  assert.ok(call, 'the active tool call metadata should remain available')
-  assert.ok(call.function.arguments.length <= 100)
-  assert.deepEqual(messages[1].tool_calls?.[0].function.arguments, oversizedArguments)
-})
-
-test('Qwen AI drops an oversized tool call and its result together under a strict budget', () => {
-  const messages = [
-    { role: 'user' as const, content: 'Keep the workflow active.' },
-    {
-      role: 'assistant' as const,
-      content: 'x'.repeat(5000),
-      tool_calls: [{
-        id: 'pair-that-cannot-fit',
-        type: 'function' as const,
-        function: {
-          name: 'declared_tool',
-          arguments: JSON.stringify({ payload: 'y'.repeat(5000) }),
-        },
-      }],
-    },
-    { role: 'tool' as const, tool_call_id: 'pair-that-cannot-fit', content: 'tool result' },
-    { role: 'user' as const, content: 'Continue.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 300,
-    messageMaxBytes: 80,
-    toolResultMaxBytes: 80,
-    maxFileParts: 1,
-  })
-
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 300)
-  const retainedCallIds = compacted
-    .filter(message => message.role === 'assistant')
-    .flatMap(message => message.tool_calls || [])
-    .map(call => call.id)
-  const retainedResultIds = compacted
-    .filter(message => message.role === 'tool')
-    .map(message => message.tool_call_id)
-  assert.deepEqual(retainedResultIds, [], 'an omitted call must not leave an orphan result')
-  assert.deepEqual(retainedCallIds, [], 'the oversized call is omitted as a structural unit')
-})
-
-test('Qwen AI keeps exact tool IDs when a bounded call/result pair is retained', () => {
-  const id = `call-${'z'.repeat(180)}`
-  const toolName = `declared_tool_${'n'.repeat(180)}`
-  const messages = [
-    { role: 'user' as const, content: 'Run the operation.' },
-    {
-      role: 'assistant' as const,
-      content: null,
-      tool_calls: [{
-        id,
-        type: 'function' as const,
-        function: { name: toolName, arguments: JSON.stringify({ value: 'x'.repeat(1200) }) },
-      }],
-    },
-    { role: 'tool' as const, tool_call_id: id, content: 'done' },
-    { role: 'user' as const, content: 'Continue.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 3000,
-    messageMaxBytes: 256,
-    toolResultMaxBytes: 128,
-    maxFileParts: 1,
-  })
-  const retainedCall = compacted.find(message => message.role === 'assistant')?.tool_calls?.[0]
-  const retainedResult = compacted.find(message => message.role === 'tool')
-
-  assert.ok(retainedCall)
-  assert.ok(retainedResult)
-  assert.equal(retainedCall.id, id)
-  assert.equal(retainedCall.function.name, toolName)
-  assert.equal(retainedResult.tool_call_id, id)
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 3000)
-})
-
-test('Qwen AI never retains more duplicate-ID results than retained calls', () => {
-  const duplicateId = 'call-reused-by-client'
-  const messages = [
-    { role: 'user' as const, content: 'Run both operations.' },
-    {
-      role: 'assistant' as const,
-      content: null,
-      tool_calls: Array.from({ length: 8 }, (_, index) => ({
-        id: duplicateId,
-        type: 'function' as const,
-        function: {
-          name: 'declared_tool',
-          arguments: JSON.stringify({ index, payload: 'x'.repeat(400) }),
-        },
-      })),
-    },
-    ...Array.from({ length: 8 }, (_, index) => ({
-      role: 'tool' as const,
-      tool_call_id: duplicateId,
-      content: `result-${index}`,
-    })),
-    { role: 'user' as const, content: 'Continue.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 1200,
-    messageMaxBytes: 120,
-    toolResultMaxBytes: 80,
-    maxFileParts: 1,
-  })
-  const retainedCallCount = compacted
-    .filter(message => message.role === 'assistant')
-    .flatMap(message => message.tool_calls || [])
-    .filter(call => call.id === duplicateId)
-    .length
-  const retainedResultCount = compacted
-    .filter(message => message.role === 'tool' && message.tool_call_id === duplicateId)
-    .length
-
-  assert.ok(retainedCallCount < 8, 'the strict budget should remove at least one duplicate call')
-  assert.equal(retainedResultCount, retainedCallCount)
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 1200)
-})
-
-test('Qwen AI caps the rendered prompt after tool XML expansion', async () => {
-  const envNames = [
-    'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
-  ]
-  const previous = new Map(envNames.map(name => [name, process.env[name]]))
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES = '5000'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES = '500'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = '10000'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = '10000'
-
-  try {
-    const toolCalls = Array.from({ length: 20 }, (_, index) => ({
-      id: `render-call-${index}`,
-      type: 'function' as const,
-      function: {
-        name: 'declared_tool',
-        arguments: JSON.stringify({ index, payload: 'x'.repeat(50) }),
-      },
-    }))
-    const prepared = await prepareQwenAiMultimodalMessage([
-      { role: 'user', content: 'Run the batch.' },
-      { role: 'assistant', content: null, tool_calls: toolCalls },
-      { role: 'user', content: 'Continue after the batch.' },
-    ], {} as any)
-
-    assert.ok(Buffer.byteLength(JSON.stringify(prepared.content), 'utf8') <= 4500)
-    if (prepared.content.includes('<|CHAT2API|tool_calls>')) {
-      assert.equal(
-        (prepared.content.match(/<\|CHAT2API\|tool_calls>/g) || []).length,
-        (prepared.content.match(/<\/\|CHAT2API\|tool_calls>/g) || []).length,
-      )
-    }
-  } finally {
-    for (const [name, value] of previous) {
-      if (value === undefined) delete process.env[name]
-      else process.env[name] = value
-    }
-  }
-})
-
-test('Qwen AI reserves provider-envelope space using JSON wire bytes', async () => {
-  const envNames = [
-    'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
-  ]
-  const previous = new Map(envNames.map(name => [name, process.env[name]]))
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES = '5000'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES = '500'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = '10000'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = '10000'
-
-  try {
-    const escapedHistory = Array.from({ length: 12 }, (_, index) => ({
-      role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
-      content: `history-${index}: ${'"\\'.repeat(220)}`,
-    }))
-    const prepared = await prepareQwenAiMultimodalMessage([
-      { role: 'user', content: 'Keep the original task anchor.' },
-      ...escapedHistory,
-      { role: 'user', content: 'Continue the current task.' },
-    ], {} as any)
-
-    const wireBytes = Buffer.byteLength(JSON.stringify(prepared.content), 'utf8')
-    assert.ok(wireBytes <= 4500, `rendered prompt wire size is ${wireBytes} bytes`)
-    assert.match(prepared.content, /Continue the current task\./)
-    assert.match(prepared.content, /Earlier conversation omitted/)
-  } finally {
-    for (const [name, value] of previous) {
-      if (value === undefined) delete process.env[name]
-      else process.env[name] = value
-    }
-  }
-})
-
-test('Qwen AI bounds oversized parallel tool-call arrays by the same transcript budget', () => {
-  const toolCalls = Array.from({ length: 1000 }, (_, index) => ({
-    id: `parallel-${index}`,
-    type: 'function' as const,
-    function: {
-      name: 'declared_tool',
-      arguments: JSON.stringify({ index, payload: 'x'.repeat(500) }),
-    },
-  }))
-  const messages = [
-    { role: 'user' as const, content: 'Run the active batch.' },
-    { role: 'assistant' as const, content: null, tool_calls: toolCalls },
-    { role: 'user' as const, content: 'Continue after the batch.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 10_000,
-    toolResultMaxBytes: 100,
-    messageMaxBytes: 100,
-    maxFileParts: 1,
-  })
-
-  const serializedBytes = Buffer.byteLength(JSON.stringify(compacted), 'utf8')
-  assert.ok(serializedBytes <= 10_000, `compacted transcript is ${serializedBytes} bytes`)
-  const retainedCalls = compacted.find(message => message.role === 'assistant')?.tool_calls ?? []
-  assert.ok(retainedCalls.length < toolCalls.length, 'oversized arrays must be bounded')
-  assert.ok(retainedCalls.length > 0, 'retain at least one active call when the budget allows it')
-  assert.equal(toolCalls.length, 1000, 'caller tool-call array must not be mutated')
-})
-
-test('Qwen AI deduplicates and bounds attachment uploads without mutating content', async () => {
+test('Qwen AI uploads every unique attachment once without mutating content', async () => {
   const parts = [
     { type: 'image_url' as const, image_url: { url: 'https://example.test/repeated.png' } },
     { type: 'image_url' as const, image_url: { url: 'https://example.test/repeated.png' } },
@@ -583,20 +292,29 @@ test('Qwen AI deduplicates and bounds attachment uploads without mutating conten
   const prepared = await prepareQwenAiMultimodalMessage(messages, uploader as any)
 
   assert.deepEqual(messages, snapshot, 'attachment preparation must not mutate caller messages')
-  assert.ok(uploadedSources.length <= 32)
-  assert.equal(new Set(uploadedSources).size, uploadedSources.length)
-  assert.equal(prepared.files.length, uploadedSources.length)
-  assert.equal(uploadedSources.at(-1), 'https://example.test/image-34.png')
+  assert.equal(uploadedSources.length, 36)
+  assert.equal(new Set(uploadedSources).size, 36)
+  assert.equal(
+    uploadedSources.filter(source => source === 'https://example.test/repeated.png').length,
+    1,
+  )
+  assert.deepEqual(uploadedSources, [
+    'https://example.test/repeated.png',
+    ...Array.from({ length: 35 }, (_, index) => `https://example.test/image-${index}.png`),
+  ])
+  assert.equal(prepared.files.length, 36)
 })
 
-test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the text budget', async () => {
+test('Qwen AI preserves all multimodal text while uploading attachment bytes separately', async () => {
   const systemInstruction = 'system-sentinel-4f9c2d'
   const activeText = 'active-user-sentinel-a81e37'
+  const earlierUserText = `earlier-user-sentinel ${'x'.repeat(5_000)}`
+  const earlierAssistantText = `earlier-assistant-sentinel ${'y'.repeat(5_000)}`
   const imageDataUrl = `data:image/png;base64,${'A'.repeat(600_000)}`
   const messages = [
     { role: 'system' as const, content: systemInstruction },
-    { role: 'user' as const, content: `earlier-user-sentinel ${'x'.repeat(5_000)}` },
-    { role: 'assistant' as const, content: `earlier-assistant-sentinel ${'y'.repeat(5_000)}` },
+    { role: 'user' as const, content: earlierUserText },
+    { role: 'assistant' as const, content: earlierAssistantText },
     {
       role: 'user' as const,
       content: [
@@ -607,32 +325,8 @@ test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the 
   ]
   const snapshot = JSON.parse(JSON.stringify(messages))
 
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 2_000,
-    toolResultMaxBytes: 500,
-    messageMaxBytes: 1_000,
-    maxFileParts: 4,
-  })
-
-  assert.ok(
-    compacted.some(message => message.role === 'system' && message.content === systemInstruction),
-    'the system instruction must survive image transcript compaction',
-  )
-  const activeTurn = compacted.find(message => (
-    message.role === 'user'
-    && Array.isArray(message.content)
-    && message.content.some(part => part.type === 'text' && part.text === activeText)
-  ))
-  assert.ok(activeTurn, 'the active user text must not be evicted by separately uploaded bytes')
-  assert.ok(
-    Array.isArray(activeTurn.content)
-      && activeTurn.content.some(part => part.type === 'image_url' && part.image_url?.url === imageDataUrl),
-    'the attachment reference must remain available to the uploader',
-  )
-  assert.deepEqual(messages, snapshot, 'transcript compaction must not mutate attachment content')
-
   const uploadedSources: string[] = []
-  const prepared = await prepareQwenAiMultimodalMessage(compacted, {
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
     uploadPart: async (part: any) => {
       uploadedSources.push(part.image_url.url)
       return { file: { id: 'uploaded-image-sentinel' } }
@@ -640,19 +334,24 @@ test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the 
   } as any)
 
   assert.ok(prepared.content.includes(`System: ${systemInstruction}`))
+  assert.ok(prepared.content.includes(earlierUserText))
+  assert.ok(prepared.content.includes(earlierAssistantText))
   assert.ok(prepared.content.includes(activeText))
   assert.doesNotMatch(prepared.content, /data:image\/png;base64/)
   assert.deepEqual(uploadedSources, [imageDataUrl])
+  assert.deepEqual(messages, snapshot, 'multimodal preparation must not mutate caller messages')
 })
 
-test('Qwen AI excludes inline audio bytes from transcript budgeting', async () => {
+test('Qwen AI preserves all audio-turn text while uploading audio bytes separately', async () => {
   const systemInstruction = 'system-sentinel-73bd10'
   const activeText = 'active-user-sentinel-c6205a'
+  const earlierUserText = `earlier-user-sentinel ${'x'.repeat(5_000)}`
+  const earlierAssistantText = `earlier-assistant-sentinel ${'y'.repeat(5_000)}`
   const audioData = 'B'.repeat(600_000)
   const messages = [
     { role: 'system' as const, content: systemInstruction },
-    { role: 'user' as const, content: `earlier-user-sentinel ${'x'.repeat(5_000)}` },
-    { role: 'assistant' as const, content: `earlier-assistant-sentinel ${'y'.repeat(5_000)}` },
+    { role: 'user' as const, content: earlierUserText },
+    { role: 'assistant' as const, content: earlierAssistantText },
     {
       role: 'user' as const,
       content: [
@@ -661,31 +360,10 @@ test('Qwen AI excludes inline audio bytes from transcript budgeting', async () =
       ],
     },
   ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 2_000,
-    toolResultMaxBytes: 500,
-    messageMaxBytes: 1_000,
-    maxFileParts: 2,
-  })
-
-  assert.ok(
-    compacted.some(message => message.role === 'system' && message.content === systemInstruction),
-    'the system instruction must survive audio transcript compaction',
-  )
-  const activeTurn = compacted.find(message => (
-    message.role === 'user'
-    && Array.isArray(message.content)
-    && message.content.some(part => part.type === 'text' && part.text === activeText)
-  ))
-  assert.ok(activeTurn)
-  assert.ok(
-    Array.isArray(activeTurn.content)
-      && activeTurn.content.some(part => part.type === 'input_audio' && part.input_audio?.data === audioData),
-  )
+  const snapshot = JSON.parse(JSON.stringify(messages))
 
   const uploadedSources: string[] = []
-  const prepared = await prepareQwenAiMultimodalMessage(compacted, {
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
     uploadPart: async (part: any) => {
       uploadedSources.push(part.input_audio.data)
       return { file: { id: 'uploaded-audio-sentinel' } }
@@ -693,9 +371,12 @@ test('Qwen AI excludes inline audio bytes from transcript budgeting', async () =
   } as any)
 
   assert.ok(prepared.content.includes(`System: ${systemInstruction}`))
+  assert.ok(prepared.content.includes(earlierUserText))
+  assert.ok(prepared.content.includes(earlierAssistantText))
   assert.ok(prepared.content.includes(activeText))
   assert.ok(!prepared.content.includes(audioData))
   assert.deepEqual(uploadedSources, [audioData])
+  assert.deepEqual(messages, snapshot, 'audio preparation must not mutate caller messages')
 })
 
 test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn', async () => {

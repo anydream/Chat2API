@@ -64,23 +64,24 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES:-524288\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES:-32768\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES:-24576\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES:-131072\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:\s*\$\{CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS:-32\}/)
+  const transcriptEnvironmentNames = [
+    'MAX_BYTES',
+    'REQUEST_RESERVE_BYTES',
+    'TOOL_RESULT_MAX_BYTES',
+    'MESSAGE_MAX_BYTES',
+    'MAX_FILE_PARTS',
+  ].map((suffix) => ['CHAT2API_QWEN_AI', 'TRANSCRIPT', suffix].join('_'))
+  for (const environmentName of transcriptEnvironmentNames) {
+    assert.doesNotMatch(serverCompose, new RegExp(environmentName))
+    assert.doesNotMatch(serverDockerfile, new RegExp(environmentName))
+  }
   assert.match(serverCompose, /CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS-\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:-1000\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:-120000\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:-300000\}/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES=524288/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_REQUEST_RESERVE_BYTES=32768/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES=24576/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES=131072/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS=32/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=120000/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000/)
   assert.doesNotMatch(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=/)
   assert.match(dockerfile, /apply-anthropic-midstream-error-patch\.py/)

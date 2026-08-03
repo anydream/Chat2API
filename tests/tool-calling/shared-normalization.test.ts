@@ -34,6 +34,7 @@ const questionSchema = {
           question: { type: 'string' },
           options: {
             type: 'array',
+            minItems: 2,
             items: {
               type: 'object',
               properties: {
@@ -233,7 +234,10 @@ test('shared validation reports nested types that normalization could not restor
   const recoverable = getToolArgumentValidationIssues({
     questions: [{
       question: 'Choose a task',
-      options: '[{"label":"Code","description":"Edit the project"}]',
+      options: JSON.stringify([
+        { label: 'Code', description: 'Edit the project' },
+        { label: 'Review', description: 'Inspect the project' },
+      ]),
     }],
   }, tool(questionSchema))
 
@@ -247,6 +251,63 @@ test('shared validation reports nested types that normalization could not restor
     unexpected: [],
     typeMismatches: [],
   })
+})
+
+test('shared validation enforces array cardinality used by AskUserQuestion', () => {
+  const oneOption = getToolArgumentValidationIssues({
+    questions: [{
+      question: 'What should be done?',
+      options: [{ label: 'Provide details', description: 'Describe the task.' }],
+    }],
+  }, tool(questionSchema))
+  const twoOptions = getToolArgumentValidationIssues({
+    questions: [{
+      question: 'What should be done?',
+      options: [
+        { label: 'Provide details', description: 'Describe the task.' },
+        { label: 'Skip', description: 'Continue without details.' },
+      ],
+    }],
+  }, tool(questionSchema))
+
+  assert.deepEqual(oneOption, {
+    missingRequired: [],
+    unexpected: [],
+    typeMismatches: [],
+    valueMismatches: ['questions[0].options (array has 1 items, minimum is 2)'],
+  })
+  assert.deepEqual(twoOptions, {
+    missingRequired: [],
+    unexpected: [],
+    typeMismatches: [],
+  })
+})
+
+test('shared validation enforces scalar, object, uniqueness, and numeric constraints', () => {
+  assert.match(
+    getToolArgumentValidationIssues('"a"', tool({ type: 'string', minLength: 2 })).valueMismatches?.[0] || '',
+    /minimum is 2/,
+  )
+  assert.match(
+    getToolArgumentValidationIssues('"abc"', tool({ type: 'string', pattern: '^x' })).valueMismatches?.[0] || '',
+    /does not match pattern/,
+  )
+  assert.match(
+    getToolArgumentValidationIssues([1, 1], tool({ type: 'array', uniqueItems: true })).valueMismatches?.[0] || '',
+    /must be unique/,
+  )
+  assert.match(
+    getToolArgumentValidationIssues({}, tool({ type: 'object', minProperties: 1 })).valueMismatches?.[0] || '',
+    /minimum is 1/,
+  )
+  assert.match(
+    getToolArgumentValidationIssues(2, tool({ type: 'number', exclusiveMinimum: 2 })).valueMismatches?.[0] || '',
+    /greater than 2/,
+  )
+  assert.match(
+    getToolArgumentValidationIssues(5, tool({ type: 'number', multipleOf: 2 })).valueMismatches?.[0] || '',
+    /multiple of 2/,
+  )
 })
 
 test('shared normalization keeps union branches whole and applies allOf constraints cumulatively', () => {

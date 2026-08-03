@@ -174,7 +174,14 @@ export class LoadBalancer {
 
     if (preferredAccountId) {
       const preferred = candidates.find(c => c.account.id === preferredAccountId)
-      if (preferred && !this.isAccountInFailure(preferredAccountId)) {
+      if (
+        preferred
+        && !this.isAccountInFailure(preferredAccountId)
+        && (
+          !this.isQwenAiProvider(preferred.provider)
+          || qwenAiRequestGovernor.isAccountImmediatelyAvailable(preferredAccountId)
+        )
+      ) {
         return preferred
       }
     }

@@ -1,5 +1,5 @@
 import { storeManager } from '../store/store'
-import type { Provider, AuthType } from '../../shared/types'
+import type { Provider, AuthType, ProviderModelCapability } from '../../shared/types'
 import type { CredentialField } from '../store/types'
 
 export interface CustomProviderData {
@@ -14,7 +14,7 @@ export interface CustomProviderData {
   icon?: string
   supportedModels?: string[]
   modelMappings?: Record<string, string>
-  modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
+  modelCapabilities?: Record<string, ProviderModelCapability>
   modelsApiEndpoint?: string
   modelsApiHeaders?: Record<string, string>
   credentialFields?: CredentialField[]

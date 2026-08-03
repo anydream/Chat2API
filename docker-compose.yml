@@ -17,12 +17,39 @@ services:
       CHAT2API_STORAGE_ENCRYPTION_KEY: ${CHAT2API_STORAGE_ENCRYPTION_KEY}
       CHAT2API_LOG_LEVEL: info
       CHAT2API_LOAD_BALANCE_STRATEGY: round-robin
+      # Detect the protocol-level Claude context-summary turn from its
+      # structural instructions. Set to off when a deployment owns this path.
+      CHAT2API_COMPACTION_DETECTION: ${CHAT2API_COMPACTION_DETECTION:-auto}
+      # Summary turns default to provider answer mode; set true only when the
+      # upstream model explicitly requires a thinking phase for summaries.
+      CHAT2API_QWEN_AI_COMPACTION_THINKING: ${CHAT2API_QWEN_AI_COMPACTION_THINKING:-auto}
+      # Live /models max_context_length minus summary output is preferred.
+      CHAT2API_QWEN_AI_COMPACTION_INPUT_TOKEN_BUDGET: ${CHAT2API_QWEN_AI_COMPACTION_INPUT_TOKEN_BUDGET:-0}
+      # Zero trusts the live catalogue. Set a positive value only when a
+      # deployment intentionally needs a stricter cap than the provider.
+      CHAT2API_QWEN_AI_COMPACTION_METADATA_MAX_INPUT_TOKENS: ${CHAT2API_QWEN_AI_COMPACTION_METADATA_MAX_INPUT_TOKENS:-0}
+      CHAT2API_QWEN_AI_COMPACTION_FALLBACK_INPUT_TOKENS: ${CHAT2API_QWEN_AI_COMPACTION_FALLBACK_INPUT_TOKENS:-12000}
+      CHAT2API_QWEN_AI_COMPACTION_PROMPT_TOKEN_RESERVE: ${CHAT2API_QWEN_AI_COMPACTION_PROMPT_TOKEN_RESERVE:-512}
+      CHAT2API_QWEN_AI_COMPACTION_CHUNK_DELAY_MS: ${CHAT2API_QWEN_AI_COMPACTION_CHUNK_DELAY_MS:-0}
+      CHAT2API_QWEN_AI_COMPACTION_MAX_REDUCTION_ROUNDS: ${CHAT2API_QWEN_AI_COMPACTION_MAX_REDUCTION_ROUNDS:-6}
+      # Zero dynamically traverses every active account eligible for the model.
+      CHAT2API_QWEN_AI_COMPACTION_MAX_ACCOUNT_ATTEMPTS: ${CHAT2API_QWEN_AI_COMPACTION_MAX_ACCOUNT_ATTEMPTS:-0}
+      # Simultaneous recovery candidates; this does not cap total account
+      # rotation for a compaction request.
+      CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE: ${CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE:-2}
+      # Ordinary pre-output 401/403/429/5xx failures also traverse the active
+      # Qwen pool. A positive value can impose a deployment-specific cap.
+      CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:-0}
       # Queue admission is independent from the active response budget.
       # Keep it configurable so deployments can choose how long clients wait
       # for a governor slot before receiving a retryable 429.
       CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS: ${CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000}
-      # Keep managed-tool responses live by default. Enable only when the
-      # deployment explicitly accepts delayed first bytes for validation.
+      # Reserve this many effective governor slots for ordinary client
+      # requests while context compaction is running. Zero opts into a shared
+      # pool for deployments with a separate upstream capacity plan.
+      CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS: ${CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS:-1}
+      # Hold managed tool frames until their arguments pass terminal
+      # validation. Context compaction strips tools and bypasses this path.
       CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS: ${CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS:-true}
       # Keep HTTP status mutable until the first visible frame by default.
       # Set a non-negative value only to impose an explicit preflight deadline.
@@ -46,8 +73,10 @@ services:
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}
       CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT: ${CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT-}
-      CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS: ${CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS-}
-      CHAT2API_QWEN_AI_MAX_CONCURRENT: ${CHAT2API_QWEN_AI_MAX_CONCURRENT-}
+      # A 1s floor is the value validated against the current Qwen account
+      # pool; distinct accounts still remain subject to upstream responses.
+      CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS: ${CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS:-1000}
+      CHAT2API_QWEN_AI_MAX_CONCURRENT: ${CHAT2API_QWEN_AI_MAX_CONCURRENT:-16}
       CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS-}
       CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
       # Long-context provider responses are bounded separately from idle stalls.

@@ -13,7 +13,7 @@ import {
 } from '../types'
 import { loadBalancer } from '../loadbalancer'
 import { requestForwarder } from '../forwarder'
-import { forwardWithAccountFailover } from '../accountFailover'
+import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
 import {
@@ -32,6 +32,7 @@ import {
 } from '../utils/toolFormatConverter'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { SseKeepAliveStream } from '../utils/sseKeepAlive'
+import { classifyChatRequest } from '../requestIntent'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -141,6 +142,37 @@ function requestFailureLogLevel(status: number | undefined): 'debug' | 'warn' | 
   return 'error'
 }
 
+interface EffectiveSelectionHint {
+  effectiveAccountId?: string
+  effectiveProviderId?: string
+  effectiveActualModel?: string
+}
+
+function resolveEffectiveSelection(
+  fallback: AccountSelection,
+  hint: EffectiveSelectionHint,
+): AccountSelection {
+  if (!hint.effectiveAccountId) return fallback
+
+  const effectiveAccount = storeManager.getAccountById(hint.effectiveAccountId)
+  const effectiveProvider = storeManager.getProviderById(
+    hint.effectiveProviderId || effectiveAccount?.providerId || fallback.provider.id,
+  )
+  if (
+    !effectiveAccount
+    || !effectiveProvider
+    || effectiveAccount.providerId !== effectiveProvider.id
+  ) {
+    return fallback
+  }
+
+  return {
+    account: effectiveAccount,
+    provider: effectiveProvider,
+    actualModel: hint.effectiveActualModel || fallback.actualModel,
+  }
+}
+
 /**
  * Handle Chat Completions Request
  */
@@ -218,6 +250,19 @@ router.post('/completions', async (ctx: Context) => {
     console.log('[Chat] Deep research enabled via X-Deep-Research header')
   }
 
+  const requestIntent = classifyChatRequest(request)
+  console.info('[Chat] request-intent', JSON.stringify({
+    requestId,
+    intent: requestIntent.intent,
+    reason: requestIntent.reason,
+    messageCount: requestIntent.messageCount,
+    toolCount: requestIntent.toolCount,
+    textChars: requestIntent.textChars,
+    lastUserTextChars: requestIntent.lastUserTextChars,
+    lastUserTextPrefix: requestIntent.lastUserTextPrefix,
+    signals: requestIntent.signals,
+  }))
+
   const config = storeManager.getConfig()
   const preferredProviderId = modelMapper.getPreferredProvider(request.model)
   const preferredAccountId = modelMapper.getPreferredAccount(request.model)
@@ -253,15 +298,29 @@ router.post('/completions', async (ctx: Context) => {
     isStream: request.stream || false,
     clientIP,
     signal: clientSignal,
+    requestIntent: requestIntent.intent,
   })
   let { account, provider, actualModel } = initialSelection
   let context = createProxyContext(initialSelection)
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
 
+  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+  const activeAccountCount = initialProviderIsQwenAi
+    ? storeManager.getAccountsByProviderId(initialSelection.provider.id)
+      .filter(candidate => candidate.status === 'active')
+      .length
+    : 0
+  const maxFailovers = resolveAccountFailoverLimit({
+    configuredMaxFailovers: config.retryCount,
+    qwenAiProvider: initialProviderIsQwenAi,
+    activeAccountCount,
+    qwenAiMaxAccountFailovers: process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
+  })
+
   try {
     const outcome = await forwardWithAccountFailover({
       initialSelection,
-      maxFailovers: config.retryCount,
+      maxFailovers,
       signal: clientSignal,
       forward: async ({ selection }) => {
         const attemptContext = createProxyContext(selection)
@@ -310,8 +369,12 @@ router.post('/completions', async (ctx: Context) => {
     account = outcome.selection.account
     provider = outcome.selection.provider
     actualModel = outcome.selection.actualModel
-    context = createProxyContext(outcome.selection)
     const result = outcome.result
+    const effectiveSelection = resolveEffectiveSelection(outcome.selection, result)
+    account = effectiveSelection.account
+    provider = effectiveSelection.provider
+    actualModel = effectiveSelection.actualModel
+    context = createProxyContext({ account, provider, actualModel })
 
     const latency = Date.now() - startTime
 
@@ -508,24 +571,52 @@ router.post('/completions', async (ctx: Context) => {
       let collectedContent = ''
       let streamOutcomeRecorded = !deferStreamOutcome
 
+      const qwenAiStream = QwenAiAdapter.isQwenAiProvider(provider)
+        ? result.stream as QwenAiOutputStream
+        : undefined
+      const getDeferredStreamSelection = (): AccountSelection => resolveEffectiveSelection(
+        { account, provider, actualModel },
+        {
+          effectiveAccountId: qwenAiStream?.qwenAiEffectiveAccountId,
+          effectiveProviderId: qwenAiStream?.qwenAiEffectiveProviderId,
+          effectiveActualModel: qwenAiStream?.qwenAiEffectiveActualModel,
+        },
+      )
+
       const recordDeferredStreamOutcome = (success: boolean, error?: Error) => {
         if (!deferStreamOutcome || streamOutcomeRecorded) return
         streamOutcomeRecorded = true
 
         const completionLatency = Date.now() - startTime
+        const completionSelection = getDeferredStreamSelection()
+        const completionAccount = completionSelection.account
+        const completionProvider = completionSelection.provider
+        const completionActualModel = completionSelection.actualModel
         if (success) {
-          loadBalancer.clearAccountFailure(account.id)
+          loadBalancer.clearAccountFailure(completionAccount.id)
           proxyStatusManager.recordRequestSuccess(completionLatency)
-          storeManager.incrementAccountUsage(account.id)
-          storeManager.recordRequestInStats(true, completionLatency, request.model, provider.id, account.id)
+          storeManager.incrementAccountUsage(completionAccount.id)
+          storeManager.recordRequestInStats(
+            true,
+            completionLatency,
+            request.model,
+            completionProvider.id,
+            completionAccount.id,
+          )
           storeManager.addLog('debug', 'Stream response completed', {
             requestId,
-            providerId: provider.id,
-            accountId: account.id,
+            providerId: completionProvider.id,
+            accountId: completionAccount.id,
             model: request.model,
+            actualModel: completionActualModel,
           })
           if (logEntryId) {
             storeManager.updateRequestLog(logEntryId, {
+              actualModel: completionActualModel,
+              providerId: completionProvider.id,
+              providerName: completionProvider.name,
+              accountId: completionAccount.id,
+              accountName: completionAccount.name,
               latency: completionLatency,
               responseStatus: 200,
             })
@@ -538,9 +629,9 @@ router.post('/completions', async (ctx: Context) => {
           context.signal?.aborted,
         )
         const failureCode = streamFailureCode(error)
-        const qwenAiFailure = QwenAiAdapter.isQwenAiProvider(provider)
+        const qwenAiFailure = QwenAiAdapter.isQwenAiProvider(completionProvider)
         if (qwenAiFailure) {
-          qwenAiRequestGovernor.reportDeferredFailure(account.id, {
+          qwenAiRequestGovernor.reportDeferredFailure(completionAccount.id, {
             success: false,
             status: failureStatus,
             headers: streamFailureHeaders(error),
@@ -548,38 +639,50 @@ router.post('/completions', async (ctx: Context) => {
             errorCode: failureCode,
             retryable: false,
             accountFault: streamFailureAccountFault(error),
-          })
+          }, requestIntent.intent)
         }
         proxyStatusManager.recordRequestFailure(completionLatency)
         if (failureStatus !== 499 && streamFailureAccountFault(error) !== false) {
           if (qwenAiFailure && isQwenAiRiskControl(
-            provider.id,
+            completionProvider.id,
             failureStatus,
             error?.message,
             failureCode,
             true,
           )) {
-            loadBalancer.markQwenAiRiskControl(account.id)
+            loadBalancer.markQwenAiRiskControl(completionAccount.id)
           } else if (failureStatus !== 429) {
-            loadBalancer.markAccountFailed(account.id)
+            loadBalancer.markAccountFailed(completionAccount.id)
           }
         }
-        storeManager.recordRequestInStats(false, completionLatency, request.model, provider.id, account.id)
+        storeManager.recordRequestInStats(
+          false,
+          completionLatency,
+          request.model,
+          completionProvider.id,
+          completionAccount.id,
+        )
         const failureLogLevel = requestFailureLogLevel(failureStatus)
         storeManager.addLog(
           failureLogLevel,
           `${failureStatus === 499 ? 'Stream response cancelled' : 'Stream response failed'}: ${error?.message || 'Unknown stream error'}`,
           {
             requestId,
-            providerId: provider.id,
-            accountId: account.id,
+            providerId: completionProvider.id,
+            accountId: completionAccount.id,
             model: request.model,
+            actualModel: completionActualModel,
             status: failureStatus,
             errorCode: failureCode,
           },
         )
         if (logEntryId) {
           storeManager.updateRequestLog(logEntryId, {
+            actualModel: completionActualModel,
+            providerId: completionProvider.id,
+            providerName: completionProvider.name,
+            accountId: completionAccount.id,
+            accountName: completionAccount.name,
             status: 'error',
             statusCode: failureStatus,
             responseStatus: failureStatus,
@@ -591,9 +694,6 @@ router.post('/completions', async (ctx: Context) => {
         }
       }
 
-      const qwenAiStream = QwenAiAdapter.isQwenAiProvider(provider)
-        ? result.stream as QwenAiOutputStream
-        : undefined
       if (qwenAiStream) {
         qwenAiStream.once(QWEN_AI_STREAM_FAILURE_EVENT, (error: Error) => {
           recordDeferredStreamOutcome(false, error)
@@ -621,7 +721,22 @@ router.post('/completions', async (ctx: Context) => {
         // Kimi's Connect handler deliberately withholds [DONE] when an
         // upstream trailer reports an error. Preserve that signal so clients
         // do not mistake a permission/auth failure for a successful answer.
-        if (KimiAdapter.isKimiProvider(provider)) {
+        if (qwenAiStream) {
+          const status = streamFailureStatus(err, context.signal?.aborted)
+          wrapperStream.write(`event: error\ndata: ${JSON.stringify({
+            error: {
+              message: err.message,
+              type: 'api_error',
+              code: streamFailureCode(err) || 'qwen_ai_stream_error',
+              status,
+              retryable: false,
+              ...(streamFailureAccountFault(err) === undefined
+                ? {}
+                : { accountFault: streamFailureAccountFault(err) }),
+            },
+          })}\n\n`)
+          wrapperStream.write('data: [DONE]\n\n')
+        } else if (KimiAdapter.isKimiProvider(provider)) {
           wrapperStream.write(`data: ${JSON.stringify({
             error: {
               message: err.message,

@@ -63,3 +63,4 @@ backup/
 
 # Local migration artifacts and development data
 .local/
+.local-artifacts/

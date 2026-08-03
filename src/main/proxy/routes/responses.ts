@@ -4,15 +4,19 @@ import Router from '@koa/router'
 import type { Context } from 'koa'
 import { requestForwarder } from '../forwarder'
 import { loadBalancer } from '../loadbalancer'
-import { forwardWithAccountFailover } from '../accountFailover'
+import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
-import { QwenAiAdapter } from '../adapters/qwen-ai'
+import {
+  QwenAiAdapter,
+  QWEN_AI_STREAM_FAILURE_EVENT,
+  type QwenAiOutputStream,
+} from '../adapters/qwen-ai'
 import { modelMapper } from '../modelMapper'
 import { proxyStatusManager } from '../status'
 import { streamHandler } from '../stream'
 import type { AccountSelection, ChatMessage, ProxyContext } from '../types'
 import { storeManager } from '../../store/store'
-import { sanitizeForwardedErrorHeaders } from '../utils/errors'
+import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import {
   chatCompletionToResponse,
   responseOutputToChatMessages,
@@ -22,6 +26,7 @@ import {
 } from '../responses/compat'
 import { responsesConversationStore } from '../responses/store'
 import { createResponsesStreamTransform } from '../responses/stream'
+import { classifyChatRequest } from '../requestIntent'
 import {
   createResponseImageResolver,
   ResponseImageResolutionError,
@@ -87,6 +92,31 @@ function destroyStream(stream: NodeJS.ReadableStream | undefined, error?: Error)
   }
 }
 
+function streamFailureStatus(
+  error: (Error & { status?: unknown }) | undefined,
+  clientAborted = false,
+): number {
+  if (clientAborted || isClientCancellationError(error)) return 499
+  if (typeof error?.status === 'number') return error.status
+  if (/timed out|timeout|idle for more than/i.test(error?.message || '')) return 504
+  return 502
+}
+
+function streamFailureCode(error: Error | undefined): string | undefined {
+  const code = (error as (Error & { code?: unknown }) | undefined)?.code
+  return typeof code === 'string' && code.trim() ? code : undefined
+}
+
+function streamFailureAccountFault(error: Error | undefined): boolean | undefined {
+  const accountFault = (error as (Error & { accountFault?: unknown }) | undefined)?.accountFault
+  return typeof accountFault === 'boolean' ? accountFault : undefined
+}
+
+function streamFailureHeaders(error: Error | undefined): Record<string, string> | undefined {
+  const headers = (error as (Error & { headers?: unknown }) | undefined)?.headers
+  return sanitizeForwardedErrorHeaders(headers)
+}
+
 router.post('/responses', async (ctx: Context) => {
   const startedAt = Date.now()
   const createdAt = Math.floor(startedAt / 1000)
@@ -127,6 +157,15 @@ router.post('/responses', async (ctx: Context) => {
     ...translated.chatRequest,
     signal: abort.controller.signal,
   }
+  const requestIntent = classifyChatRequest(chatRequest)
+  console.info('[Responses] request-intent', JSON.stringify({
+    requestId: responseId,
+    intent: requestIntent.intent,
+    reason: requestIntent.reason,
+    signals: requestIntent.signals,
+    messageCount: requestIntent.messageCount,
+    textChars: requestIntent.textChars,
+  }))
   const imageResolver = createResponseImageResolver({ signal: abort.controller.signal })
   const config = storeManager.getConfig()
   const preferredProviderId = modelMapper.getPreferredProvider(chatRequest.model)
@@ -161,13 +200,60 @@ router.post('/responses', async (ctx: Context) => {
     isStream: chatRequest.stream === true,
     clientIP: clientIp(ctx),
     signal: abort.controller.signal,
+    requestIntent: requestIntent.intent,
   })
   let { account, provider, actualModel } = initialSelection
+  let qwenAiStream: QwenAiOutputStream | undefined
   proxyStatusManager.recordRequestStart(chatRequest.model, provider.id, account.id)
+
+  const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+  const activeAccountCount = initialProviderIsQwenAi
+    ? storeManager.getAccountsByProviderId(initialSelection.provider.id)
+      .filter(candidate => candidate.status === 'active')
+      .length
+    : 0
+  const maxFailovers = resolveAccountFailoverLimit({
+    configuredMaxFailovers: config.retryCount,
+    qwenAiProvider: initialProviderIsQwenAi,
+    activeAccountCount,
+    qwenAiMaxAccountFailovers: process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
+  })
+
+  const applyEffectiveSelection = (
+    effectiveAccountId?: string,
+    effectiveProviderId?: string,
+    effectiveActualModel?: string,
+  ) => {
+    if (!effectiveAccountId) return
+    const effectiveAccount = storeManager.getAccountById(effectiveAccountId)
+    const effectiveProvider = storeManager.getProviderById(
+      effectiveProviderId || effectiveAccount?.providerId || provider.id,
+    )
+    if (
+      !effectiveAccount
+      || !effectiveProvider
+      || effectiveAccount.providerId !== effectiveProvider.id
+    ) {
+      return
+    }
+
+    account = effectiveAccount
+    provider = effectiveProvider
+    actualModel = effectiveActualModel || actualModel
+  }
+  const refreshEffectiveStreamSelection = () => {
+    if (!qwenAiStream) return
+    applyEffectiveSelection(
+      qwenAiStream.qwenAiEffectiveAccountId,
+      qwenAiStream.qwenAiEffectiveProviderId,
+      qwenAiStream.qwenAiEffectiveActualModel,
+    )
+  }
 
   let outcomeRecorded = false
   const recordSuccess = () => {
     if (outcomeRecorded) return
+    refreshEffectiveStreamSelection()
     outcomeRecorded = true
     const latency = Date.now() - startedAt
     loadBalancer.clearAccountFailure(account.id)
@@ -179,25 +265,49 @@ router.post('/responses', async (ctx: Context) => {
       providerId: provider.id,
       accountId: account.id,
       model: chatRequest.model,
+      actualModel,
       latency,
       isStream: chatRequest.stream === true,
     })
   }
-  const recordFailure = (error: Error, status = 502, penalizeAccount = true) => {
+  const recordFailure = (
+    error: Error,
+    status = 502,
+    penalizeAccount = true,
+    deferredStreamFailure = false,
+  ) => {
     if (outcomeRecorded) return
+    refreshEffectiveStreamSelection()
     outcomeRecorded = true
     const latency = Date.now() - startedAt
+    const accountFault = streamFailureAccountFault(error)
+    const shouldPenalizeAccount = penalizeAccount && accountFault !== false
+    if (deferredStreamFailure && QwenAiAdapter.isQwenAiProvider(provider)) {
+      qwenAiRequestGovernor.reportDeferredFailure(account.id, {
+        success: false,
+        status,
+        headers: streamFailureHeaders(error),
+        error: error.message,
+        errorCode: streamFailureCode(error),
+        retryable: false,
+        accountFault: accountFault ?? shouldPenalizeAccount,
+      }, requestIntent.intent)
+    }
     proxyStatusManager.recordRequestFailure(latency)
-    if (penalizeAccount && status !== 429 && status !== 499) loadBalancer.markAccountFailed(account.id)
+    if (shouldPenalizeAccount && status !== 429 && status !== 499) {
+      loadBalancer.markAccountFailed(account.id)
+    }
     storeManager.recordRequestInStats(false, latency, chatRequest.model, provider.id, account.id)
     storeManager.addLog(status === 499 ? 'debug' : 'error', 'Responses request failed', {
       requestId: responseId,
       providerId: provider.id,
       accountId: account.id,
       model: chatRequest.model,
+      actualModel,
       latency,
       error: error.message,
-      data: { status },
+      errorCode: streamFailureCode(error),
+      data: { status, accountFault },
     })
   }
   const storeConversation = (output: Array<Record<string, any>>) => {
@@ -217,7 +327,7 @@ router.post('/responses', async (ctx: Context) => {
   try {
     const outcome = await forwardWithAccountFailover({
       initialSelection,
-      maxFailovers: config.retryCount,
+      maxFailovers,
       signal: abort.controller.signal,
       forward: async ({ selection }) => requestForwarder.forwardChatCompletion(
         chatRequest,
@@ -264,12 +374,23 @@ router.post('/responses', async (ctx: Context) => {
     provider = outcome.selection.provider
     actualModel = outcome.selection.actualModel
     const result = outcome.result
+    applyEffectiveSelection(
+      result.effectiveAccountId,
+      result.effectiveProviderId,
+      result.effectiveActualModel,
+    )
 
     if (!result.success) {
       abort.cleanup()
       const status = abort.controller.signal.aborted ? 499 : result.status ?? 500
+      const failure = Object.assign(new Error(result.error ?? 'Request failed'), {
+        status,
+        code: result.errorCode,
+        headers: result.headers,
+        accountFault: result.accountFault,
+      })
       recordFailure(
-        new Error(result.error ?? 'Request failed'),
+        failure,
         status,
         result.accountFault !== false,
       )
@@ -307,6 +428,27 @@ router.post('/responses', async (ctx: Context) => {
       ctx.set('X-Accel-Buffering', 'no')
 
       const rawStream = result.stream
+      qwenAiStream = QwenAiAdapter.isQwenAiProvider(provider)
+        ? rawStream as QwenAiOutputStream
+        : undefined
+      if (qwenAiStream) {
+        qwenAiStream.once(QWEN_AI_STREAM_FAILURE_EVENT, (error: Error) => {
+          recordFailure(
+            error,
+            streamFailureStatus(error, abort.controller.signal.aborted),
+            true,
+            true,
+          )
+        })
+        if (qwenAiStream.qwenAiFailure) {
+          recordFailure(
+            qwenAiStream.qwenAiFailure,
+            streamFailureStatus(qwenAiStream.qwenAiFailure, abort.controller.signal.aborted),
+            true,
+            true,
+          )
+        }
+      }
       const chatStream = result.skipTransform
         ? rawStream
         : rawStream.pipe(streamHandler.createTransformStream(
@@ -330,35 +472,42 @@ router.post('/responses', async (ctx: Context) => {
           recordSuccess()
         },
         onFailure: (error) => {
-          const status = abort.controller.signal.aborted
-            ? 499
-            : error instanceof ResponseImageResolutionError
-              ? error.status
-              : 502
-          recordFailure(error, status, !(error instanceof ResponseImageResolutionError))
+          const imageResolutionFailure = error instanceof ResponseImageResolutionError
+          const status = imageResolutionFailure
+            ? error.status
+            : streamFailureStatus(error, abort.controller.signal.aborted)
+          recordFailure(error, status, !imageResolutionFailure, !imageResolutionFailure)
         },
       }).start()
 
       const sourceError = (error: Error) => {
-        const status = abort.controller.signal.aborted ? 499 : 502
+        const status = streamFailureStatus(error, abort.controller.signal.aborted)
         if (!abort.controller.signal.aborted) {
           responsesStream.fail(error)
           responsesStream.end()
         } else {
-          recordFailure(error, status)
+          recordFailure(error, status, true, true)
         }
       }
       rawStream.once('error', sourceError)
       if (chatStream !== rawStream) chatStream.once('error', sourceError)
       responsesStream.once('error', (error: Error) => {
-        recordFailure(error, abort.controller.signal.aborted ? 499 : 502)
+        const imageResolutionFailure = error instanceof ResponseImageResolutionError
+        recordFailure(
+          error,
+          imageResolutionFailure
+            ? error.status
+            : streamFailureStatus(error, abort.controller.signal.aborted),
+          !imageResolutionFailure,
+          !imageResolutionFailure,
+        )
         destroyStream(rawStream)
         if (chatStream !== rawStream) destroyStream(chatStream)
       })
       responsesStream.once('end', abort.cleanup)
       abort.controller.signal.addEventListener('abort', () => {
         const cancellation = new Error('Client disconnected from Responses stream.')
-        recordFailure(cancellation, 499)
+        recordFailure(cancellation, 499, true, true)
         destroyStream(rawStream)
         if (chatStream !== rawStream) destroyStream(chatStream)
         destroyStream(responsesStream)

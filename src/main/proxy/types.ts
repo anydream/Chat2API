@@ -152,6 +152,8 @@ export interface ChatCompletionRequest {
   parallel_tool_calls?: boolean
   /** Structured-output configuration translated from Responses text.format. */
   response_format?: Record<string, any>
+  /** Optional client metadata preserved at the protocol boundary. */
+  metadata?: Record<string, unknown> | null
   /** Internal image-generation hint translated from a Responses built-in tool. */
   image_generation?: {
     enabled: true
@@ -284,6 +286,8 @@ export interface ProxyContext {
   isStream: boolean
   clientIP?: string
   signal?: AbortSignal
+  /** Internal request intent detected before provider forwarding. */
+  requestIntent?: 'normal' | 'context_compaction'
 }
 
 /**
@@ -310,6 +314,12 @@ export interface ForwardResult {
   recoveryHint?: 'managed_tool_stream_validation'
   providerSessionId?: string
   parentMessageId?: string
+  /** Account that produced the client-visible result after internal routing. */
+  effectiveAccountId?: string
+  /** Provider that produced the client-visible result after internal routing. */
+  effectiveProviderId?: string
+  /** Actual provider model used for the client-visible result. */
+  effectiveActualModel?: string
 }
 
 /**

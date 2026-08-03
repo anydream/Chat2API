@@ -1,6 +1,13 @@
 export type QwenAiRequestReadyAtInput = {
   lastGlobalStartAt: number
   globalMinIntervalMs: number
+  /**
+   * A bounded account failover may skip aggregate pacing once. This is only
+   * intended for an upstream response that explicitly permits selecting a
+   * different account; global circuit and account cooldowns remain enforced by
+   * the governor.
+   */
+  recoveryBypassGlobalInterval?: boolean
   accountNextAvailableAt: number
   accountCooldownUntil: number
   recoveryBypassAccountInterval: boolean
@@ -14,8 +21,10 @@ export type QwenAiAdaptiveLimitsInput = {
   configuredMaxConcurrent: number
   configuredGlobalMinIntervalMs: number
   accountMinIntervalMs: number
+  accountCount: number
   healthyAccountCount: number
   recentRiskEvents: number
+  recentRiskAccountCount: number
 }
 
 export type QwenAiAdaptiveLimits = {
@@ -44,14 +53,6 @@ export function calculateQwenAiAdaptiveLimits(input: QwenAiAdaptiveLimitsInput):
     }
   }
 
-  if (input.recentRiskEvents > 0) {
-    return {
-      maxConcurrent: RISK_CONCURRENCY,
-      globalMinIntervalMs: Math.max(configuredGlobalMinIntervalMs, RISK_GLOBAL_INTERVAL_MS),
-      autoTuneReason: 'recent_risk_events',
-    }
-  }
-
   const healthyAccountCount = Math.max(0, Math.floor(input.healthyAccountCount))
   if (healthyAccountCount <= 1) {
     return {
@@ -65,17 +66,42 @@ export function calculateQwenAiAdaptiveLimits(input: QwenAiAdaptiveLimitsInput):
   const accountBasedIntervalMs = Math.ceil(
     Math.max(0, input.accountMinIntervalMs) / healthyAccountCount,
   )
+  const baseConcurrency = Math.max(
+    1,
+    Math.min(accountBasedConcurrency, Math.max(1, Math.floor(input.autoTuneMaxConcurrent))),
+  )
+  const baseIntervalMs = Math.max(
+    Math.max(0, Math.floor(input.autoTuneMinGlobalIntervalMs)),
+    accountBasedIntervalMs,
+  )
+  const accountCount = Math.max(healthyAccountCount, Math.floor(input.accountCount))
+  const recentRiskAccountCount = Math.min(
+    accountCount,
+    Math.max(0, Math.floor(input.recentRiskAccountCount)),
+  )
+
+  if (recentRiskAccountCount <= 0 || accountCount <= 0) {
+    return {
+      maxConcurrent: baseConcurrency,
+      globalMinIntervalMs: baseIntervalMs,
+      autoTuneReason: `healthy_accounts_${healthyAccountCount}`,
+    }
+  }
+
+  // Account cooldowns already remove failing credentials from selection. Use
+  // distinct affected accounts to scale the remaining pool proportionally;
+  // one noisy account must not collapse a large healthy pool to concurrency 1.
+  const healthyRiskRatio = Math.max(
+    1 / accountCount,
+    (accountCount - recentRiskAccountCount) / accountCount,
+  )
 
   return {
-    maxConcurrent: Math.max(
-      1,
-      Math.min(accountBasedConcurrency, Math.max(1, Math.floor(input.autoTuneMaxConcurrent))),
-    ),
-    globalMinIntervalMs: Math.max(
-      Math.max(0, Math.floor(input.autoTuneMinGlobalIntervalMs)),
-      accountBasedIntervalMs,
-    ),
-    autoTuneReason: `healthy_accounts_${healthyAccountCount}`,
+    maxConcurrent: Math.max(1, Math.round(baseConcurrency * healthyRiskRatio)),
+    globalMinIntervalMs: Math.max(baseIntervalMs, Math.ceil(baseIntervalMs / healthyRiskRatio)),
+    autoTuneReason:
+      `risk_accounts_${recentRiskAccountCount}_events_${Math.max(0, Math.floor(input.recentRiskEvents))}`
+      + `_of_${accountCount}`,
   }
 }
 
@@ -116,7 +142,9 @@ export function calculateQwenAiRequestReadyAt(input: QwenAiRequestReadyAtInput):
   }
 
   return Math.max(
-    input.lastGlobalStartAt + input.globalMinIntervalMs,
+    input.recoveryBypassGlobalInterval
+      ? input.lastGlobalStartAt
+      : input.lastGlobalStartAt + input.globalMinIntervalMs,
     input.recoveryBypassAccountInterval ? 0 : input.accountNextAvailableAt,
     input.accountCooldownUntil,
   )

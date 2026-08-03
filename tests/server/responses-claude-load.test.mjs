@@ -457,7 +457,9 @@ async function startMockUpstream() {
 
     const loadMarker = text.match(/LOAD_CASE_\d+/)?.[0]
     const longLoadMarker = text.match(/LONG_(?:RESPONSES|CLAUDE)_LOAD_\d+/)?.[0]
-    if (loadMarker || longLoadMarker) await delay(30)
+    // Keep synthetic load requests open long enough for the client burst to
+    // overlap even when the complete server suite is CPU-scheduled together.
+    if (loadMarker || longLoadMarker) await delay(100)
 
     let content = loadMarker ? `reply:${loadMarker}` : 'offline compatibility reply'
     if (text.startsWith('LONG_RESPONSES_CONTEXT:')) {

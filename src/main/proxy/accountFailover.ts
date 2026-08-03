@@ -12,6 +12,13 @@ export interface AccountFailoverOutcome {
   excludedAccountIds: ReadonlySet<string>
 }
 
+export interface AccountFailoverLimitInput {
+  configuredMaxFailovers: number
+  qwenAiProvider: boolean
+  activeAccountCount: number
+  qwenAiMaxAccountFailovers?: string
+}
+
 interface AccountFailoverOptions {
   initialSelection: AccountSelection
   maxFailovers: number
@@ -22,6 +29,23 @@ interface AccountFailoverOptions {
     attempt: AccountFailoverAttempt,
     result: ForwardResult,
   ) => void | Promise<void>
+}
+
+function nonNegativeInteger(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
+export function resolveAccountFailoverLimit(input: AccountFailoverLimitInput): number {
+  const configuredMaxFailovers = nonNegativeInteger(input.configuredMaxFailovers)
+  if (!input.qwenAiProvider) return configuredMaxFailovers
+
+  const poolMaxFailovers = Math.max(0, nonNegativeInteger(input.activeAccountCount) - 1)
+  const deploymentLimit = Number(input.qwenAiMaxAccountFailovers)
+  if (!Number.isSafeInteger(deploymentLimit) || deploymentLimit <= 0) {
+    return poolMaxFailovers
+  }
+
+  return Math.min(poolMaxFailovers, deploymentLimit)
 }
 
 export function isNextAccountFailoverEligible(

@@ -123,6 +123,20 @@ test('Responses request translates Codex messages, function history, strict tool
   assert.equal(conversationMessages.some((message) => message.content === 'current instructions'), false)
 })
 
+test('Responses preserves compaction protocol metadata for the shared intent classifier', () => {
+  const { chatRequest } = responsesRequestToChatCompletion({
+    model: 'gpt-compatible',
+    input: 'opaque protocol payload',
+    metadata: { purpose: 'context_compaction' },
+    context_management: { edits: [{ type: 'clear_tool_uses_20250919' }] },
+  })
+
+  assert.deepEqual(chatRequest.metadata, { purpose: 'context_compaction' })
+  assert.deepEqual((chatRequest as any).context_management, {
+    edits: [{ type: 'clear_tool_uses_20250919' }],
+  })
+})
+
 test('Responses image generation remains off when tool_choice is none or another function', () => {
   const base = {
     model: 'test',

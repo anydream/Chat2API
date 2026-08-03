@@ -386,5 +386,6 @@ test('Qwen AI ordinary Chat Completions retain t2t without image-generation meta
 
 test('Qwen AI forwarder preserves the internal Responses image-generation hint', () => {
   const source = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
-  assert.match(source, /image_generation:\s*request\.image_generation/)
+  assert.match(source, /if \(intent !== 'context_compaction'\) return request/)
+  assert.match(source, /image_generation:\s*providerRequest\.image_generation/)
 })

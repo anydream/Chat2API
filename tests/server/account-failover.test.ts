@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   forwardWithAccountFailover,
   isNextAccountFailoverEligible,
+  resolveAccountFailoverLimit,
 } from '../../src/main/proxy/accountFailover.ts'
 import type { AccountSelection, ForwardResult } from '../../src/main/proxy/types.ts'
 
@@ -24,6 +25,33 @@ const nextAccountFailure: ForwardResult = {
   accountFault: true,
   retryScope: 'next-account',
 }
+
+test('Qwen failover limit covers the current active account pool by default', () => {
+  const baseInput = {
+    configuredMaxFailovers: 3,
+    qwenAiProvider: true,
+    activeAccountCount: 99,
+  }
+
+  assert.equal(resolveAccountFailoverLimit(baseInput), 98)
+  assert.equal(resolveAccountFailoverLimit({
+    ...baseInput,
+    qwenAiMaxAccountFailovers: '0',
+  }), 98)
+  assert.equal(resolveAccountFailoverLimit({
+    ...baseInput,
+    qwenAiMaxAccountFailovers: '20',
+  }), 20)
+})
+
+test('non-Qwen failover limit preserves the configured retry count', () => {
+  assert.equal(resolveAccountFailoverLimit({
+    configuredMaxFailovers: 3,
+    qwenAiProvider: false,
+    activeAccountCount: 99,
+    qwenAiMaxAccountFailovers: '80',
+  }), 3)
+})
 
 test('preflight account failures switch accounts inside the same request', async () => {
   const first = selection('account-1')
@@ -56,6 +84,81 @@ test('preflight account failures switch accounts inside the same request', async
   assert.equal(outcome.selection.account.id, 'account-2')
   assert.equal(outcome.result.success, true)
   assert.equal(outcome.failoverCount, 1)
+})
+
+test('Qwen capacity limits switch accounts inside the same client request', async () => {
+  const first = selection('account-1')
+  const second = selection('account-2')
+  const attempted: string[] = []
+  const capacityLimited: ForwardResult = {
+    success: false,
+    status: 429,
+    error: 'Qwen AI upstream capacity is temporarily unavailable',
+    errorCode: 'qwen_ai_capacity_limit',
+    retryable: false,
+    accountFault: true,
+    retryScope: 'next-account',
+  }
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: first,
+    maxFailovers: 1,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      return current.account.id === first.account.id
+        ? capacityLimited
+        : { success: true, status: 200, body: { choices: [] } }
+    },
+    selectNext: excluded => excluded.has(first.account.id) ? second : null,
+  })
+
+  assert.deepEqual(attempted, ['account-1', 'account-2'])
+  assert.equal(outcome.result.success, true)
+  assert.equal(outcome.selection.account.id, 'account-2')
+  assert.equal(outcome.failoverCount, 1)
+})
+
+test('Qwen failover reaches a later healthy account after multiple 403 and 429 responses', async () => {
+  const accounts = Array.from({ length: 6 }, (_, index) => selection(`account-${index + 1}`))
+  const maxFailovers = resolveAccountFailoverLimit({
+    configuredMaxFailovers: 3,
+    qwenAiProvider: true,
+    activeAccountCount: accounts.length,
+  })
+  const attempted: string[] = []
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: accounts[0],
+    maxFailovers,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      if (current.account.id === accounts.at(-1)?.account.id) {
+        return { success: true, status: 200, body: { choices: [] } }
+      }
+
+      const accountNumber = Number(current.account.id.split('-').at(-1))
+      return {
+        success: false,
+        status: accountNumber % 2 === 0 ? 429 : 403,
+        error: accountNumber % 2 === 0
+          ? 'Qwen AI upstream capacity is temporarily unavailable'
+          : 'Qwen AI risk-control challenge',
+        errorCode: accountNumber % 2 === 0
+          ? 'qwen_ai_capacity_limit'
+          : 'qwen_ai_risk_control',
+        retryable: false,
+        accountFault: true,
+        retryScope: 'next-account',
+      }
+    },
+    selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+  })
+
+  assert.equal(maxFailovers, 5)
+  assert.deepEqual(attempted, accounts.map(item => item.account.id))
+  assert.equal(outcome.result.success, true)
+  assert.equal(outcome.selection.account.id, 'account-6')
+  assert.equal(outcome.failoverCount, 5)
 })
 
 test('only explicit preflight replay scopes are replayed', async () => {
@@ -154,10 +257,16 @@ test('both OpenAI-compatible generation routes use the shared account failover p
   ]) {
     const source = fs.readFileSync(routePath, 'utf8')
     assert.match(source, /forwardWithAccountFailover\(\{/)
-    assert.match(source, /maxFailovers:\s*config\.retryCount/)
     assert.match(source, /excludedAccountIds\s*=>\s*loadBalancer\.selectAccount\(/)
     assert.match(source, /reportAccountFailover\(selection\.account\.id/)
     assert.match(source, /if \(result\.accountFault !== false\) \{\s*loadBalancer\.markAccountFailed/)
     assert.match(source, /data:\s*\{\s*attempt,\s*status:\s*result\.status,\s*accountFault:\s*result\.accountFault/)
   }
+
+  const chatSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
+  const responsesSource = fs.readFileSync('src/main/proxy/routes/responses.ts', 'utf8')
+  assert.match(chatSource, /maxFailovers,/)
+  assert.match(chatSource, /resolveAccountFailoverLimit\(\{/)
+  assert.match(responsesSource, /maxFailovers,/)
+  assert.match(responsesSource, /resolveAccountFailoverLimit\(\{/)
 })

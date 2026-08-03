@@ -616,6 +616,28 @@ export function responsesRequestToChatCompletion(
   const webSearch = allTools?.some((tool) => (
     tool?.type === 'web_search' || tool?.type === 'web_search_preview'
   ))
+  const requestRecord = request as Record<string, unknown>
+  const protocolExtensions: Record<string, unknown> = {}
+  for (const key of [
+    'system',
+    'context_management',
+    'contextManagement',
+    'compaction',
+    'compact',
+    'auto_compact',
+    'autoCompact',
+    'context_edit',
+    'contextEdit',
+    'anthropic_context_management',
+    'extra_body',
+    'extraBody',
+    'provider_fields',
+    'providerFields',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(requestRecord, key)) {
+      protocolExtensions[key] = requestRecord[key]
+    }
+  }
 
   const chatRequest: ResponsesChatCompletionRequest = {
     model: request.model,
@@ -640,6 +662,10 @@ export function responsesRequestToChatCompletion(
     image_generation: imageGeneration,
     parallel_tool_calls: request.parallel_tool_calls,
     response_format: textFormatToChatResponseFormat(request.text),
+    metadata: request.metadata && typeof request.metadata === 'object'
+      ? { ...request.metadata }
+      : undefined,
+    ...protocolExtensions,
   }
 
   return { chatRequest, conversationMessages }

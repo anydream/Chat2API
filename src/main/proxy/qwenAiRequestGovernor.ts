@@ -18,6 +18,8 @@ import {
   parseQwenAiRetryAfterMs,
 } from './qwenAiGovernorPolicy'
 
+export type QwenAiRequestClass = 'normal' | 'context_compaction'
+
 type QueueItem = {
   id: string
   accountId: string
@@ -30,16 +32,39 @@ type QueueItem = {
   signal?: AbortSignal
   queueAbortListener?: () => void
   recoveryBypassAccountInterval: boolean
+  recoveryBypassGlobalInterval: boolean
+  waitForActiveSettlementOnAbort: boolean
   requestId?: string
   attempt: number
+  requestClass: QwenAiRequestClass
   cancelled: boolean
 }
 
-type QwenAiGovernorRunOptions = {
+export type QwenAiGovernorRunOptions = {
   signal?: AbortSignal
+  /**
+   * When false, return an internal admission-deferred result instead of
+   * placing the request in the shared governor queue. Context compaction uses
+   * this mode so a large map/reduce operation cannot accumulate hidden work
+   * behind normal traffic or another compaction stage.
+   */
+  allowQueue?: boolean
   recoveryBypassAccountInterval?: boolean
+  /**
+   * Allow one explicitly account-scoped failover to start without waiting for
+   * the aggregate pacing interval. The caller must keep this bounded and only
+   * use it after an upstream `next-account` decision.
+   */
+  recoveryBypassGlobalInterval?: boolean
+  waitForActiveSettlementOnAbort?: boolean
   requestId?: string
   attempt?: number
+  /**
+   * Normal client work is always preferred over internal context compaction.
+   * Internal map/reduce calls must opt into the lower-priority class so one
+   * large transcript cannot occupy every provider slot.
+   */
+  requestClass?: QwenAiRequestClass
 }
 
 type CooldownState = {
@@ -52,6 +77,11 @@ type RiskEvent = {
   accountId: string
   timestamp: number
 }
+
+// A few account-level risk responses are not enough evidence to stop a large
+// pool. The circuit becomes meaningful only after risk has spread through the
+// pool and the remaining healthy capacity is small.
+const GLOBAL_RISK_POOL_RATIO = 0.1
 
 function withRetryAfterHeader(result: ForwardResult, cooldownMs: number): ForwardResult {
   const hasRetryAfter = Object.keys(result.headers || {})
@@ -94,6 +124,20 @@ function numberFromEnv(name: string, fallback: number): number {
 
   const value = Number(raw)
   return Number.isFinite(value) && value >= 0 ? value : fallback
+}
+
+function compactionReservedSlots(maxConcurrent: number): number {
+  const availableSlots = Math.max(0, Math.floor(maxConcurrent) - 1)
+  if (availableSlots === 0) return 0
+
+  // Keep one slot for ordinary traffic by default. Deployments that have a
+  // separate Qwen pool for compaction can explicitly set this to zero; the
+  // value is bounded against the effective governor cap.
+  const configured = numberFromEnv(
+    'CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS',
+    1,
+  )
+  return Math.min(availableSlots, Math.max(0, Math.floor(configured)))
 }
 
 function explicitNumberFromEnv(
@@ -236,6 +280,7 @@ export class QwenAiRequestGovernor {
   private accountNextAvailableAt: Map<string, number> = new Map()
   private accountCooldowns: Map<string, CooldownState> = new Map()
   private activeByAccount: Map<string, number> = new Map()
+  private activeByRequestClass: Map<QwenAiRequestClass, number> = new Map()
   private globalCooldown: CooldownState | undefined
   private riskEvents: RiskEvent[] = []
   private recentFailovers: ReadonlyMap<string, QwenAiAccountFailoverRecord> = new Map()
@@ -259,6 +304,21 @@ export class QwenAiRequestGovernor {
         return
       }
 
+      const requestClass = options.requestClass || 'normal'
+      if (options.allowQueue === false) {
+        const waitMs = this.getImmediateAdmissionWaitMs(
+          accountId,
+          requestClass,
+          now,
+          options.recoveryBypassGlobalInterval === true,
+          options.recoveryBypassAccountInterval === true,
+        )
+        if (waitMs > 0) {
+          resolve(this.createAdmissionDeferredResult(waitMs, requestClass))
+          return
+        }
+      }
+
       const item: QueueItem = {
         id: String(this.nextQueueItemId++),
         accountId,
@@ -269,8 +329,11 @@ export class QwenAiRequestGovernor {
         queueDepthAtEnqueue: this.queue.length + 1,
         signal: options.signal,
         recoveryBypassAccountInterval: options.recoveryBypassAccountInterval === true,
+        recoveryBypassGlobalInterval: options.recoveryBypassGlobalInterval === true,
+        waitForActiveSettlementOnAbort: options.waitForActiveSettlementOnAbort === true,
         requestId: options.requestId,
         attempt: options.attempt ?? 1,
+        requestClass,
         cancelled: false,
       }
 
@@ -294,7 +357,7 @@ export class QwenAiRequestGovernor {
         }
         cancelQueued(options.signal?.aborted
           ? this.createCancelledResult('Client disconnected while Qwen AI request was queued.')
-          : this.createQueueTimeoutResult())
+          : this.createQueueTimeoutResult(item.requestClass))
       }, QWEN_AI_QUEUE_TIMEOUT_MS)
 
       item.queueAbortListener = () => {
@@ -308,6 +371,15 @@ export class QwenAiRequestGovernor {
         return
       }
       this.pump()
+      if (
+        options.allowQueue === false
+        && this.queue.some(candidate => candidate === item || candidate.id === item.id)
+      ) {
+        // A normal item may have won the ready slot between the synchronous
+        // preflight above and `pump()`. Never leave an immediate-only
+        // compaction item behind it in the shared queue.
+        cancelQueued(this.createAdmissionDeferredResult(1000, requestClass))
+      }
     })
   }
 
@@ -322,7 +394,7 @@ export class QwenAiRequestGovernor {
     }
   }
 
-  private createQueueTimeoutResult(): ForwardResult {
+  private createQueueTimeoutResult(requestClass: QwenAiRequestClass): ForwardResult {
     const retryAfterSeconds = Math.max(1, Math.ceil(QWEN_AI_QUEUE_TIMEOUT_MS / 1000))
     return {
       success: false,
@@ -334,7 +406,70 @@ export class QwenAiRequestGovernor {
       errorCode: 'qwen_ai_queue_timeout',
       retryable: true,
       accountFault: false,
+      // No upstream generation was started. A normal client request can be
+      // routed to another account; internal compaction keeps its pipeline
+      // failure local so it does not churn the whole account pool.
+      ...(requestClass === 'normal' ? { retryScope: 'next-account' as const } : {}),
     }
+  }
+
+  private createAdmissionDeferredResult(
+    waitMs: number,
+    requestClass: QwenAiRequestClass,
+  ): ForwardResult {
+    const retryAfterSeconds = Math.max(1, Math.ceil(Math.max(1, waitMs) / 1000))
+    return {
+      success: false,
+      status: 429,
+      headers: {
+        'Retry-After': String(retryAfterSeconds),
+      },
+      error: `Qwen AI ${requestClass} admission is deferred until a provider slot is ready.`,
+      errorCode: 'qwen_ai_compaction_admission_deferred',
+      retryable: true,
+      accountFault: false,
+    }
+  }
+
+  /**
+   * Return a positive wait when an immediate-only request cannot start. This
+   * check is synchronous with `run()` and therefore closes the microtask race
+   * where several compaction stages otherwise enqueue before the first one is
+   * admitted.
+   */
+  private getImmediateAdmissionWaitMs(
+    accountId: string,
+    requestClass: QwenAiRequestClass,
+    now: number,
+    recoveryBypassGlobalInterval: boolean,
+    recoveryBypassAccountInterval: boolean,
+  ): number {
+    const config = this.getEffectiveConfig()
+    const compactionLimit = this.getCompactionConcurrencyLimit(config.maxConcurrent)
+    const activeCompaction = this.getActiveRequestCount('context_compaction')
+
+    if (
+      this.active >= config.maxConcurrent
+      || (requestClass === 'context_compaction' && activeCompaction >= compactionLimit)
+      || this.queue.some(item => item.accountId === accountId && !item.cancelled)
+    ) {
+      // There is no reliable completion ETA for an in-flight stream. A short
+      // retry hint keeps the caller out of the queue while the release hook
+      // wakes its own scheduler as soon as the slot settles.
+      return 1000
+    }
+
+    const readyAt = calculateQwenAiRequestReadyAt({
+      lastGlobalStartAt: this.lastGlobalStartAt,
+      globalMinIntervalMs: config.globalMinIntervalMs,
+      recoveryBypassGlobalInterval,
+      accountNextAvailableAt: this.accountNextAvailableAt.get(accountId) || 0,
+      accountCooldownUntil: this.accountCooldowns.get(accountId)?.until || 0,
+      recoveryBypassAccountInterval,
+      accountActive: (this.activeByAccount.get(accountId) || 0) > 0,
+    })
+    if (readyAt === Number.POSITIVE_INFINITY) return 1000
+    return Math.max(0, readyAt - now)
   }
 
   private clearQueueItemWaiters(item: QueueItem): void {
@@ -372,16 +507,35 @@ export class QwenAiRequestGovernor {
       return
     }
 
+    const compactionLimit = this.getCompactionConcurrencyLimit(config.maxConcurrent)
     while (this.active < config.maxConcurrent && this.queue.length > 0) {
       const now = Date.now()
       let selectedIndex = -1
       let nextReadyAt = Number.POSITIVE_INFINITY
+      const activeCompaction = this.getActiveRequestCount('context_compaction')
 
       for (let index = 0; index < this.queue.length; index += 1) {
-        const readyAt = this.getReadyAt(this.queue[index], now)
+        const candidate = this.queue[index]
+        // Compaction is deliberately kept below the total cap. Do not let a
+        // queued compaction item hide a ready normal request or create a
+        // timer that spins while the reserved slot is occupied.
+        if (
+          candidate.requestClass === 'context_compaction'
+          && activeCompaction >= compactionLimit
+        ) {
+          continue
+        }
+
+        const readyAt = this.getReadyAt(candidate, now)
         if (readyAt <= now) {
-          selectedIndex = index
-          break
+          // Preserve FIFO within each class, while always giving ordinary
+          // client traffic the first ready slot.
+          if (candidate.requestClass === 'normal') {
+            selectedIndex = index
+            break
+          }
+          if (selectedIndex === -1) selectedIndex = index
+          continue
         }
         nextReadyAt = Math.min(nextReadyAt, readyAt)
       }
@@ -414,6 +568,10 @@ export class QwenAiRequestGovernor {
     const queueWaitMs = Math.max(0, startedAt - item.enqueuedAt)
     this.active += 1
     this.activeByAccount.set(item.accountId, (this.activeByAccount.get(item.accountId) || 0) + 1)
+    this.activeByRequestClass.set(
+      item.requestClass,
+      this.getActiveRequestCount(item.requestClass) + 1,
+    )
     this.lastGlobalStartAt = startedAt
     this.accountNextAvailableAt.set(item.accountId, startedAt + config.accountMinIntervalMs)
     this.logLifecycle(item, 'admitted', {
@@ -435,6 +593,10 @@ export class QwenAiRequestGovernor {
         })
         this.active -= 1
         this.activeByAccount.set(item.accountId, Math.max(0, (this.activeByAccount.get(item.accountId) || 1) - 1))
+        this.activeByRequestClass.set(
+          item.requestClass,
+          Math.max(0, this.getActiveRequestCount(item.requestClass) - 1),
+        )
         this.pump()
       }
     }
@@ -452,7 +614,9 @@ export class QwenAiRequestGovernor {
       } else if (activeStream) {
         destroyForwardStream(activeStream)
       }
-      item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
+      if (!runStarted || !item.waitForActiveSettlementOnAbort) {
+        item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
+      }
     }
 
     item.signal?.addEventListener('abort', abortActive, { once: true })
@@ -479,7 +643,7 @@ export class QwenAiRequestGovernor {
           return
         }
 
-        const recordedResult = this.recordResult(item.accountId, result)
+        const recordedResult = this.recordResult(item.accountId, result, item.requestClass)
         if (recordedResult.success && recordedResult.stream) {
           activeStream = recordedResult.stream
           const releaseStream = () => {
@@ -524,9 +688,25 @@ export class QwenAiRequestGovernor {
       requestId: item.requestId,
       accountId: item.accountId,
       attempt: item.attempt,
+      requestClass: item.requestClass,
+      normalActiveRequests: this.getActiveRequestCount('normal'),
+      compactionActiveRequests: this.getActiveRequestCount('context_compaction'),
+      normalQueuedRequests: this.queue.filter(candidate => candidate.requestClass === 'normal').length,
+      compactionQueuedRequests: this.queue.filter(
+        candidate => candidate.requestClass === 'context_compaction',
+      ).length,
       queueDepthAtEnqueue: item.queueDepthAtEnqueue,
       ...metrics,
     }))
+  }
+
+  private getActiveRequestCount(requestClass: QwenAiRequestClass): number {
+    return this.activeByRequestClass.get(requestClass) || 0
+  }
+
+  private getCompactionConcurrencyLimit(effectiveMaxConcurrent: number): number {
+    const maxConcurrent = Math.max(1, Math.floor(effectiveMaxConcurrent))
+    return Math.max(1, maxConcurrent - compactionReservedSlots(maxConcurrent))
   }
 
   private getReadyAt(item: QueueItem, now: number): number {
@@ -539,11 +719,16 @@ export class QwenAiRequestGovernor {
       accountNextAvailableAt: this.accountNextAvailableAt.get(item.accountId) || 0,
       accountCooldownUntil: this.accountCooldowns.get(item.accountId)?.until || 0,
       recoveryBypassAccountInterval: item.recoveryBypassAccountInterval,
+      recoveryBypassGlobalInterval: item.recoveryBypassGlobalInterval,
       accountActive: (this.activeByAccount.get(item.accountId) || 0) > 0,
     })
   }
 
-  private recordResult(accountId: string, result: ForwardResult): ForwardResult {
+  private recordResult(
+    accountId: string,
+    result: ForwardResult,
+    requestClass: QwenAiRequestClass = 'normal',
+  ): ForwardResult {
     if (result.success) {
       this.accountCooldowns.delete(accountId)
       return result
@@ -583,7 +768,13 @@ export class QwenAiRequestGovernor {
       const failures = (current?.failures || 0) + 1
       const cooldownMs = Math.min(config.riskCooldownMs * (2 ** (failures - 1)), config.maxRiskCooldownMs)
       this.openCooldown(accountId, cooldownMs, 'qwen_ai_risk_control', failures)
-      this.recordGlobalRiskControl(accountId, config)
+      // One context compaction can fan out into correlated map/reduce calls.
+      // Keep each affected account out of rotation, but do not mistake those
+      // internal calls for independent evidence that ordinary traffic must be
+      // stopped globally.
+      if (requestClass === 'normal') {
+        this.recordGlobalRiskControl(accountId, config, this.getQwenAiAccountScope())
+      }
       return result
     }
 
@@ -609,9 +800,13 @@ export class QwenAiRequestGovernor {
     return result
   }
 
-  reportDeferredFailure(accountId: string, result: ForwardResult): void {
+  reportDeferredFailure(
+    accountId: string,
+    result: ForwardResult,
+    requestClass: QwenAiRequestClass = 'normal',
+  ): void {
     if (result.success) return
-    this.recordResult(accountId, result)
+    this.recordResult(accountId, result, requestClass)
     this.pump()
   }
 
@@ -629,14 +824,29 @@ export class QwenAiRequestGovernor {
     )
   }
 
-  private recordGlobalRiskControl(accountId: string, config: QwenAiGovernorConfig): void {
+  private recordGlobalRiskControl(
+    accountId: string,
+    config: QwenAiGovernorConfig,
+    accountScope: { accountCount: number; healthyAccountCount: number },
+  ): void {
     const now = Date.now()
     this.riskEvents = this.riskEvents
       .filter(event => now - event.timestamp <= config.riskWindowMs)
       .concat({ accountId, timestamp: now })
 
     const distinctRiskAccounts = new Set(this.riskEvents.map(event => event.accountId)).size
-    if (distinctRiskAccounts < config.globalRiskThreshold) {
+    const poolSize = accountScope.accountCount
+    const poolRiskThreshold = poolSize > 0
+      ? Math.max(config.globalRiskThreshold, Math.ceil(poolSize * GLOBAL_RISK_POOL_RATIO))
+      : config.globalRiskThreshold
+    const healthyRemainingThreshold = poolSize > 0
+      ? Math.max(1, Math.ceil(poolSize * GLOBAL_RISK_POOL_RATIO))
+      : 0
+
+    if (
+      distinctRiskAccounts < poolRiskThreshold
+      || (poolSize > 0 && accountScope.healthyAccountCount > healthyRemainingThreshold)
+    ) {
       return
     }
 
@@ -646,6 +856,10 @@ export class QwenAiRequestGovernor {
       config.maxGlobalRiskCooldownMs,
     )
 
+    console.warn(
+      `[QwenAI Governor] Global risk threshold reached (${distinctRiskAccounts}/${poolSize || 'unknown'} risk accounts; `
+      + `${accountScope.healthyAccountCount} healthy; threshold ${poolRiskThreshold})`,
+    )
     this.openGlobalCooldown(cooldownMs, 'qwen_ai_global_risk_circuit', failures)
   }
 
@@ -792,9 +1006,11 @@ export class QwenAiRequestGovernor {
   private calculateEffectiveConfig(
     config: QwenAiGovernorConfig,
     options: {
+      accountCount: number
       healthyAccountCount: number
       coolingAccountCount: number
       recentRiskEvents: number
+      recentRiskAccounts: number
     },
   ): QwenAiGovernorEffectiveConfig {
     const configuredMaxConcurrent = Math.max(1, config.maxConcurrent)
@@ -806,8 +1022,10 @@ export class QwenAiRequestGovernor {
       configuredMaxConcurrent,
       configuredGlobalMinIntervalMs,
       accountMinIntervalMs: config.accountMinIntervalMs,
+      accountCount: options.accountCount,
       healthyAccountCount: options.healthyAccountCount,
       recentRiskEvents: options.recentRiskEvents,
+      recentRiskAccountCount: options.recentRiskAccounts,
     })
 
     return {
@@ -834,9 +1052,11 @@ export class QwenAiRequestGovernor {
     const accountScope = this.getQwenAiAccountScope(loadBalancerFailures)
 
     return this.calculateEffectiveConfig(config, {
+      accountCount: accountScope.accountCount,
       healthyAccountCount: accountScope.healthyAccountCount,
       coolingAccountCount: accountScope.coolingAccountCount,
       recentRiskEvents: this.getRecentRiskEventCount(config, now),
+      recentRiskAccounts: this.getRecentRiskAccountCount(config, now),
     })
   }
 
@@ -849,6 +1069,7 @@ export class QwenAiRequestGovernor {
     return (
       this.getGlobalCooldownInMs(now) === 0
       && (this.activeByAccount.get(accountId) || 0) === 0
+      && !this.queue.some(item => item.accountId === accountId && !item.cancelled)
       && (this.accountNextAvailableAt.get(accountId) || 0) <= now
       && (this.accountCooldowns.get(accountId)?.until || 0) <= now
     )
@@ -924,10 +1145,26 @@ export class QwenAiRequestGovernor {
       }
     })
 
+    const normalActiveRequests = this.getActiveRequestCount('normal')
+    const compactionActiveRequests = this.getActiveRequestCount('context_compaction')
+    const normalQueuedRequests = this.queue.filter(item => item.requestClass === 'normal').length
+    const compactionQueuedRequests = this.queue.filter(
+      item => item.requestClass === 'context_compaction',
+    ).length
+    const compactionMaxConcurrent = this.getCompactionConcurrencyLimit(
+      effectiveConfig.maxConcurrent,
+    )
+
     return {
       config,
       effectiveConfig,
       queueSize: this.queue.length,
+      normalActiveRequests,
+      compactionActiveRequests,
+      normalQueuedRequests,
+      compactionQueuedRequests,
+      compactionMaxConcurrent,
+      normalReservedSlots: Math.max(0, effectiveConfig.maxConcurrent - compactionMaxConcurrent),
       activeRequests: this.active,
       globalNextAvailableAt: globalNextAvailableAt > now ? globalNextAvailableAt : undefined,
       globalNextAvailableInMs: Math.max(0, globalNextAvailableAt - now),

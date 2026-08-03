@@ -90,6 +90,14 @@ export interface QwenAiGovernorStatus {
   config: QwenAiGovernorConfig
   effectiveConfig: QwenAiGovernorEffectiveConfig
   queueSize: number
+  /** Requests currently occupying slots, split by scheduler class. */
+  normalActiveRequests: number
+  compactionActiveRequests: number
+  normalQueuedRequests: number
+  compactionQueuedRequests: number
+  /** Effective compaction cap after reserving slots for normal traffic. */
+  compactionMaxConcurrent: number
+  normalReservedSlots: number
   activeRequests: number
   globalNextAvailableAt?: number
   globalNextAvailableInMs: number
@@ -126,6 +134,10 @@ export interface Account {
 export interface ProviderModelCapability {
   /** Whether the provider permits skipping its reasoning/thinking phase. */
   thinkingSkippable?: boolean
+  /** Maximum input context reported by the provider model catalogue. */
+  maxContextLength?: number
+  /** Maximum tokens reserved for a provider-generated context summary. */
+  maxSummaryGenerationLength?: number
 }
 
 export interface Provider {

@@ -17,9 +17,32 @@ ENV NODE_ENV=production
 ENV CHAT2API_HOST=0.0.0.0
 ENV CHAT2API_PORT=8080
 ENV CHAT2API_DATA_DIR=/data
+ENV CHAT2API_COMPACTION_DETECTION=auto
+ENV CHAT2API_QWEN_AI_COMPACTION_THINKING=auto
+# Compaction input uses live model limits first; these values are deployment
+# controls for an explicit override, optional metadata cap, or a
+# catalogue-without-limits fallback. Zero leaves live metadata uncapped.
+ENV CHAT2API_QWEN_AI_COMPACTION_INPUT_TOKEN_BUDGET=0
+ENV CHAT2API_QWEN_AI_COMPACTION_METADATA_MAX_INPUT_TOKENS=0
+ENV CHAT2API_QWEN_AI_COMPACTION_FALLBACK_INPUT_TOKENS=12000
+ENV CHAT2API_QWEN_AI_COMPACTION_PROMPT_TOKEN_RESERVE=512
+ENV CHAT2API_QWEN_AI_COMPACTION_CHUNK_DELAY_MS=0
+ENV CHAT2API_QWEN_AI_COMPACTION_MAX_REDUCTION_ROUNDS=6
+# Zero means use the complete active account pool discovered at runtime.
+ENV CHAT2API_QWEN_AI_COMPACTION_MAX_ACCOUNT_ATTEMPTS=0
+# Limit simultaneous recovery candidates only; account rotation still uses
+# the complete active pool unless the deployment sets an attempt cap.
+ENV CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE=2
+ENV CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=0
+# Keep the adaptive pacing floor aligned with the validated multi-account
+# deployment; upstream 429/risk responses still control account cooldowns.
+ENV CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
 # Docker deployments allow long active generations while still bounding
 # streams that stop producing data. Queue admission remains independent.
 ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
+# Keep one effective governor slot available for ordinary client requests
+# while a context-compaction map/reduce is active.
+ENV CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS=1
 # Managed-tool validation buffering is opt-in; the default preserves live SSE.
 ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
 # A transport reset can continue the same Qwen response without resubmitting

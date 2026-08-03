@@ -78,6 +78,9 @@ export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
 export type QwenAiOutputStream = PassThrough & {
   qwenAiFailure?: Error
+  qwenAiEffectiveAccountId?: string
+  qwenAiEffectiveProviderId?: string
+  qwenAiEffectiveActualModel?: string
 }
 
 const DEFAULT_HEADERS = {
@@ -117,6 +120,10 @@ type StreamHandlingOptions = {
   idleTimeoutMs?: number
   /** Withhold managed-tool frames until the response branch passes validation. */
   bufferManagedBranch?: boolean
+  /** Accept a provider response that contains only thinking/summary text. */
+  allowReasoningOnlyOutput?: boolean
+  /** Emit accepted reasoning-only text as assistant content for summary turns. */
+  reasoningOnlyAsContent?: boolean
   onFailure?: (error: Error) => void
   recoverFromIdle?: QwenAiRecoveryCallback
   recoverFromSemanticEmpty?: QwenAiRecoveryCallback
@@ -369,7 +376,10 @@ function isMeaningfulQwenAiEvent(
 
   if (!isObjectValue(data)) return false
   if (data.error || data.errors || data.ret) return true
-  if (data['response.created']) return false
+  // response.created is not generated content and cannot complete a request,
+  // but it proves that Qwen is still emitting upstream state. Keep the idle
+  // watchdog alive; the separate response timeout remains the hard fallback.
+  if (data['response.created']) return true
 
   const choices = data.choices
   if (!Array.isArray(choices)) return false
@@ -1443,6 +1453,7 @@ type QwenAiUpstreamError = Error & {
   retryable?: boolean
   accountFault?: boolean
   retryScope?: 'next-account'
+  upstreamState?: 'no_events' | 'active_without_terminal' | 'completed_without_valid_output' | 'client_disconnected'
 }
 
 type QwenAiErrorEnvelopeMetadata = {
@@ -1716,6 +1727,7 @@ function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
   if (typeof sourceRecord.code === 'string') normalized.code = sourceRecord.code
   if (typeof sourceRecord.accountFault === 'boolean') normalized.accountFault = sourceRecord.accountFault
   if (sourceRecord.retryScope === 'next-account') normalized.retryScope = sourceRecord.retryScope
+  if (sourceRecord.upstreamState) normalized.upstreamState = sourceRecord.upstreamState
   normalized.headers = sanitizeForwardedErrorHeaders(sourceRecord.headers)
   return normalized
 }
@@ -1735,11 +1747,11 @@ function enforceQwenAiFailoverBoundary(
 }
 
 function isQwenAiRiskControlMessage(message: string): boolean {
-  return /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish|哎哟喂|被挤爆/i.test(message)
+  return /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(message)
 }
 
 function isQwenAiRateLimitMessage(message: string): boolean {
-  return /(?:^|\D)429(?:\D|$)|too many requests|rate.?limit|throttl|quota(?:[_\s-]?(?:limit|exceeded|exhausted))?|resource[_\s-]?exhausted/i.test(message)
+  return /(?:^|\D)429(?:\D|$)|too many requests|rate.?limit|throttl|quota(?:[_\s-]?(?:limit|exceeded|exhausted))?|resource[_\s-]?exhausted|(?:service|server) busy|overload(?:ed|ing)?|哎哟喂|被挤爆|服务繁忙|系统繁忙/i.test(message)
 }
 
 function qwenAiErrorValueText(value: unknown): string {
@@ -1909,6 +1921,8 @@ function createQwenAiStreamEnvelopeError(
     error.retryable = false
     if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
+      error.retryable = true
+      markQwenAiNextAccountFailure(error)
     } else if (isRateLimited) {
       error.code = 'qwen_ai_capacity_limit'
     }
@@ -2009,7 +2023,7 @@ function createQwenAiStreamEnvelopeError(
   return error
 }
 
-function findModelCapability(
+export function findModelCapability(
   provider: Provider,
   requestedModel: string,
   modelId: string,
@@ -2430,6 +2444,14 @@ export class QwenAiAdapter {
       error.code = 'qwen_ai_risk_control'
     } else if (isCapacityLimit) {
       error.code = 'qwen_ai_capacity_limit'
+      // Capacity throttling is account-local and should fail over to another
+      // healthy account instead of surfacing an API error to the client.
+      error.retryable = true
+      markQwenAiNextAccountFailure(error)
+    } else if (chatInProgress) {
+      error.status = 429
+      error.code = 'CHAT_IN_PROGRESS'
+      error.retryable = true
     } else if (envelopeError?.code) {
       error.code = envelopeError.code
     }
@@ -2998,7 +3020,12 @@ export class QwenAiAdapter {
       retryAfterMs = baseRetryDelayMs,
     ): QwenAiUpstreamError => {
       const exhausted = (validationError || new Error('Qwen AI chat is still in progress')) as QwenAiUpstreamError
-      exhausted.retryable = false
+      // CHAT_IN_PROGRESS means the provider is temporarily serializing the
+      // same chat. Surface it as a transient 429 so Claude/LiteLLM can retry
+      // instead of waiting five minutes and receiving an opaque 504.
+      exhausted.status = 429
+      exhausted.code = 'CHAT_IN_PROGRESS'
+      exhausted.retryable = true
       exhausted.accountFault = false
       const hasRetryAfter = Object.keys(exhausted.headers || {})
         .some(key => key.toLowerCase() === 'retry-after')
@@ -3523,7 +3550,11 @@ export class QwenAiStreamHandler {
     return toolCalls.sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
   }
 
-  private emitNativeToolCalls(transStream: PassThrough, toolCalls: ToolCall[]): boolean {
+  private emitNativeToolCalls(
+    transStream: PassThrough,
+    toolCalls: ToolCall[],
+    includeAssistantRole = true,
+  ): boolean {
     if (this.toolCallsSent || toolCalls.length === 0) return false
 
     this.toolCallsSent = true
@@ -3538,7 +3569,7 @@ export class QwenAiStreamHandler {
           choices: [{
             index: 0,
             delta: {
-              role: i === 0 ? 'assistant' : undefined,
+              role: i === 0 && includeAssistantRole ? 'assistant' : undefined,
               tool_calls: [toolCall],
             },
             finish_reason: null,
@@ -3583,9 +3614,18 @@ export class QwenAiStreamHandler {
     let idleTimer: NodeJS.Timeout | undefined
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
+    let upstreamEventCount = 0
+    let lastUpstreamEventAt = 0
+    let lastUpstreamEventType = 'none'
     const bufferManagedBranch = options.bufferManagedBranch === true
       && this.toolCallingPlan?.shouldParseResponse === true
+    // Live mode exposes only provider-declared reasoning. Answer and tool
+    // candidates stay private until their terminal workflow state validates.
+    const stageManagedAnswer = !bufferManagedBranch
+      && this.toolCallingPlan?.shouldParseResponse === true
+    const buffersManagedCandidate = bufferManagedBranch || stageManagedAnswer
     let visibleFrameCommitted = false
+    let answerFrameCommitted = false
     let managedBranchFrames: string[] = []
     let managedBranchBytes = 0
     let parser: ReturnType<typeof createParser>
@@ -3597,11 +3637,12 @@ export class QwenAiStreamHandler {
     }
 
     const flushManagedBranchFrames = () => {
-      if (!bufferManagedBranch || managedBranchFrames.length === 0) return
+      if (!buffersManagedCandidate || managedBranchFrames.length === 0) return
       for (const frame of managedBranchFrames) {
         transStream.write(frame)
       }
       visibleFrameCommitted = true
+      answerFrameCommitted = true
       discardManagedBranchFrames()
     }
 
@@ -3655,6 +3696,21 @@ export class QwenAiStreamHandler {
         normalizeQwenAiStreamFailure(error),
         () => !visibleFrameCommitted,
       )
+      upstreamError.upstreamState = upstreamError.status === 499
+        ? 'client_disconnected'
+        : upstreamEventCount === 0
+          ? 'no_events'
+          : sawUpstreamCompletion
+            ? 'completed_without_valid_output'
+            : 'active_without_terminal'
+      console.warn('[QwenAI] Upstream state at stream failure', JSON.stringify({
+        upstreamEventCount,
+        lastUpstreamEventAt,
+        lastUpstreamEventType,
+        responseId: this.responseId || undefined,
+        sawUpstreamCompletion,
+        clientAborted: upstreamError.status === 499,
+      }))
       if (!recordStreamFailure(upstreamError)) return
       discardManagedBranchFrames()
       const errorCode = typeof upstreamError.code === 'string'
@@ -3686,6 +3742,7 @@ export class QwenAiStreamHandler {
           ...(errorStatus === undefined ? {} : { status: errorStatus }),
           ...(errorRetryable === undefined ? {} : { retryable: errorRetryable }),
           ...(errorAccountFault === undefined ? {} : { accountFault: errorAccountFault }),
+          ...(upstreamError.upstreamState === undefined ? {} : { upstream_state: upstreamError.upstreamState }),
         },
       })}\n\n`)
       transStream.end('data: [DONE]\n\n')
@@ -3734,9 +3791,13 @@ export class QwenAiStreamHandler {
       }, options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS)
     }
 
-    const writeVisibleSse = (frame: string): boolean => {
+    const writeVisibleSse = (
+      frame: string,
+      answerVisible = true,
+      progressVisible = answerVisible,
+    ): boolean => {
       if (finalChunkSent) return false
-      if (bufferManagedBranch) {
+      if (bufferManagedBranch || (stageManagedAnswer && answerVisible)) {
         const frameBytes = Buffer.byteLength(frame)
         if (managedBranchBytes + frameBytes > QWEN_AI_MANAGED_BRANCH_MAX_BYTES) {
           failStream(createQwenAiStreamFailure(
@@ -3750,7 +3811,8 @@ export class QwenAiStreamHandler {
         return true
       }
       transStream.write(frame)
-      visibleFrameCommitted = true
+      if (progressVisible) visibleFrameCommitted = true
+      if (answerVisible) answerFrameCommitted = true
       // Upstream events, parser buffering, and protocol fragments are not
       // client-visible progress. Refresh only after a frame reached the
       // downstream stream.
@@ -3768,7 +3830,7 @@ export class QwenAiStreamHandler {
       if (
         this.toolCallingPlan?.shouldParseResponse === true
         && !bufferManagedBranch
-        && visibleFrameCommitted
+        && answerFrameCommitted
       ) {
         failStream(error)
         return
@@ -3781,11 +3843,13 @@ export class QwenAiStreamHandler {
       }
 
       semanticRecoveryInFlight = true
-      if (bufferManagedBranch) {
+      if (buffersManagedCandidate) {
         discardManagedBranchFrames()
         this.resetManagedResponseArtifacts()
         reasoningText = ''
         summaryText = ''
+      }
+      if (bufferManagedBranch) {
         initialChunkSent = false
         hasSentReasoning = false
       }
@@ -3937,7 +4001,7 @@ export class QwenAiStreamHandler {
       const completeNativeToolCalls = this.getCompleteNativeToolCalls()
       if (completeNativeToolCalls.length > 0) {
         flushManagedBranchFrames()
-        if (this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
+        if (this.emitNativeToolCalls(transStream, completeNativeToolCalls, !initialChunkSent)) {
           completeStream()
           return
         }
@@ -3990,7 +4054,7 @@ export class QwenAiStreamHandler {
 
       if (!emittedToolCall && hasManagedWorkflowCompletionMarker(this.content)) {
         this.content = stripManagedWorkflowCompletionMarker(this.content)
-        if (bufferManagedBranch) {
+        if (buffersManagedCandidate) {
           managedBranchFrames = stripManagedWorkflowMarkerFromSseFrames(managedBranchFrames)
           managedBranchBytes = managedBranchFrames.reduce(
             (total, frame) => total + Buffer.byteLength(frame),
@@ -3999,7 +4063,22 @@ export class QwenAiStreamHandler {
         }
       }
 
-      const hasAnswerOrTool = Boolean(this.content.trim() || emittedToolCall)
+      let hasAnswerOrTool = Boolean(this.content.trim() || emittedToolCall)
+
+      if (
+        !hasAnswerOrTool
+        && options.allowReasoningOnlyOutput
+        && (reasoningText.trim() || summaryText.trim())
+      ) {
+        const fallbackContent = summaryText.trim() || reasoningText.trim()
+        if (!initialChunkSent) sendInitialChunk()
+        writeContent(fallbackContent)
+        hasAnswerOrTool = Boolean(this.content.trim())
+        console.info('[QwenAI] Accepted reasoning-only output for context compaction', JSON.stringify({
+          chars: fallbackContent.length,
+          asContent: options.reasoningOnlyAsContent === true,
+        }))
+      }
 
       const hasReasoningOnlyOutput = Boolean(
         !hasAnswerOrTool && (reasoningText.trim() || summaryText.trim()),
@@ -4047,7 +4126,7 @@ export class QwenAiStreamHandler {
           choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
           created: this.created,
         })}\n\n`
-        if (writeVisibleSse(initialChunk)) {
+        if (writeVisibleSse(initialChunk, false)) {
           initialChunkSent = true
         }
         if (QWEN_AI_DEBUG_STREAM_LOGS) {
@@ -4072,6 +4151,9 @@ export class QwenAiStreamHandler {
           }
           
           if (event.data === '[DONE]') {
+            upstreamEventCount += 1
+            lastUpstreamEventAt = Date.now()
+            lastUpstreamEventType = 'done'
             console.log('[QwenAI] Received [DONE] signal')
             sawUpstreamCompletion = true
             finishAnswer('stop')
@@ -4094,6 +4176,11 @@ export class QwenAiStreamHandler {
             failStream(envelopeError)
             return
           }
+          upstreamEventCount += 1
+          lastUpstreamEventAt = Date.now()
+          lastUpstreamEventType = data['response.created']
+            ? 'response.created'
+            : Array.isArray(data.choices) ? 'choices' : 'json'
           if (QWEN_AI_DEBUG_STREAM_LOGS) {
             console.log('[QwenAI] Parsed JSON data keys:', Object.keys(data))
           }
@@ -4110,6 +4197,14 @@ export class QwenAiStreamHandler {
           if (data.choices && data.choices.length > 0) {
             if (!this.shouldProcessResponseEvent(data)) {
               return
+            }
+
+            // Compaction may intentionally keep Qwen reasoning private until
+            // the terminal summary is available. Growing upstream reasoning
+            // still proves generation progress and must refresh the semantic
+            // idle watchdog even though no model bytes are exposed yet.
+            if (isMeaningfulQwenAiEvent(event, summaryText.length)) {
+              refreshIdleTimer()
             }
 
             const choice = data.choices[0]
@@ -4150,7 +4245,7 @@ export class QwenAiStreamHandler {
                 && completeNativeToolCalls.length > 0
               ) {
                 flushManagedBranchFrames()
-                if (this.emitNativeToolCalls(transStream, completeNativeToolCalls)) {
+                if (this.emitNativeToolCalls(transStream, completeNativeToolCalls, !initialChunkSent)) {
                   completeStream()
                   return
                 }
@@ -4163,9 +4258,10 @@ export class QwenAiStreamHandler {
 
             if (phase === 'think') {
               if (status !== 'finished' && content) {
-                // Stream thinking content as reasoning_content in real-time
+                // Summary turns buffer thinking text and emit it as content at
+                // the terminal marker; regular requests keep live reasoning.
                 reasoningText += content
-                if (!hasSentReasoning) {
+                if (!options.reasoningOnlyAsContent && !hasSentReasoning) {
                   writeVisibleSse(
                     `data: ${JSON.stringify({
                       id: this.responseId || this.chatId,
@@ -4173,20 +4269,25 @@ export class QwenAiStreamHandler {
                       object: 'chat.completion.chunk',
                       choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
                       created: this.created,
-                    })}\n\n`
+                    })}\n\n`,
+                    false,
+                    true,
                   )
                   hasSentReasoning = true
                   console.log('[QwenAI] Sent reasoning role chunk')
                 }
-                writeVisibleSse(
-                  `data: ${JSON.stringify({
-                    id: this.responseId || this.chatId,
-                    model: this.model,
-                    object: 'chat.completion.chunk',
-                    choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
-                    created: this.created,
-                  })}\n\n`
-                )
+                if (!options.reasoningOnlyAsContent) {
+                  writeVisibleSse(
+                    `data: ${JSON.stringify({
+                      id: this.responseId || this.chatId,
+                      model: this.model,
+                      object: 'chat.completion.chunk',
+                      choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
+                      created: this.created,
+                    })}\n\n`,
+                    false,
+                  )
+                }
               }
               // When status === 'finished', the think phase is done
             } else if (phase === 'thinking_summary') {
@@ -4199,7 +4300,7 @@ export class QwenAiStreamHandler {
                 if (newSummary && newSummary.length > summaryText.length) {
                   // Send only the incremental diff as reasoning_content
                   const diff = newSummary.substring(summaryText.length)
-                  if (diff) {
+                  if (diff && !options.reasoningOnlyAsContent) {
                     if (!hasSentReasoning) {
                       writeVisibleSse(
                         `data: ${JSON.stringify({
@@ -4208,7 +4309,8 @@ export class QwenAiStreamHandler {
                           object: 'chat.completion.chunk',
                           choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
                           created: this.created,
-                        })}\n\n`
+                        })}\n\n`,
+                        false,
                       )
                       hasSentReasoning = true
                     }
@@ -4219,7 +4321,9 @@ export class QwenAiStreamHandler {
                         object: 'chat.completion.chunk',
                         choices: [{ index: 0, delta: { reasoning_content: diff }, finish_reason: null }],
                         created: this.created,
-                      })}\n\n`
+                      })}\n\n`,
+                      false,
+                      true,
                     )
                   }
                   summaryText = newSummary
@@ -4438,7 +4542,7 @@ export class QwenAiStreamHandler {
 
         const choice = data.choices[0]
         const answerText = choice.message.content || ''
-        const finalReasoning = reasoningText || summaryText
+        const finalReasoning = summaryText || reasoningText
         const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
         if (completeUndeclaredNativeToolNames.length > 0) {
           recoverFromSemanticEmpty(createQwenAiUndeclaredNativeToolError(completeUndeclaredNativeToolNames))
@@ -4469,8 +4573,16 @@ export class QwenAiStreamHandler {
         }
 
         if (!answerText.trim() && finalReasoning.trim()) {
-          recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
-          return
+          if (options.allowReasoningOnlyOutput) {
+            choice.message.content = finalReasoning
+            console.info('[QwenAI] Accepted non-stream reasoning-only output for context compaction', JSON.stringify({
+              chars: finalReasoning.length,
+              asContent: options.reasoningOnlyAsContent === true,
+            }))
+          } else {
+            recoverFromSemanticEmpty(createQwenAiSemanticEmptyError())
+            return
+          }
         }
 
         if (!answerText.trim() && !finalReasoning.trim()) {

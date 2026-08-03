@@ -43,6 +43,12 @@ function loadRequestForwarder(overrides = {}) {
         }),
       },
     },
+    './loadbalancer': {
+      loadBalancer: {
+        selectAccount: () => null,
+        markAccountFailed: () => {},
+      },
+    },
     './adapters/deepseek': { DeepSeekAdapter: adapterWithMatcher('isDeepSeekProvider') },
     './adapters/deepseek-stream': { DeepSeekStreamHandler: StreamHandler },
     './adapters/glm': {
@@ -67,6 +73,7 @@ function loadRequestForwarder(overrides = {}) {
       createQwenAiResumableStream: overrides.createQwenAiResumableStream || (stream => stream),
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
+      findQwenAiModelCapability: overrides.findQwenAiModelCapability || (() => undefined),
     },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
@@ -105,6 +112,41 @@ function loadRequestForwarder(overrides = {}) {
           finalCount: messages.length,
           strategyResults: [],
         })),
+      }),
+    },
+    './requestIntent': {
+      classifyChatRequest: () => ({
+        intent: 'normal',
+        textChars: 0,
+      }),
+    },
+    './qwenAiCompactionBoundary': {
+      boundQwenAiCompactionMessages: messages => ({
+        messages,
+        chunks: [{ messages, estimatedTokens: 0, sourceTextChars: 0 }],
+        originalMessageCount: messages.length,
+        keptMessageCount: messages.length,
+        originalEstimatedTokens: 0,
+        keptEstimatedTokens: 0,
+        inputTokenBudget: 12000,
+        chunkBudgetTokens: 12000,
+        chunkSource: 'fallback',
+        chunkCount: 1,
+        splitMessageCount: 0,
+        sourceTextChars: 0,
+        coveredTextChars: 0,
+        boundarySource: 'fallback',
+        trimmed: false,
+      }),
+      planQwenAiCompactionChunks: messages => ({
+        chunks: [{ messages, estimatedTokens: 0, sourceTextChars: 0 }],
+        chunkBudgetTokens: 12000,
+        chunkSource: 'fallback',
+        sourceMessageCount: messages.length,
+        sourceTextChars: 0,
+        coveredTextChars: 0,
+        splitMessageCount: 0,
+        chunkCount: 1,
       }),
     },
   }
@@ -761,7 +803,7 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
     { signal: new AbortController().signal },
   )
 
-  output.write('data: {"choices":[{"delta":{"content":""}}]}\n\n')
+  output.write('data: {"choices":[{"delta":{"content":"ready"}}]}\n\n')
   const result = await resultPromise
   assert.equal(result.success, true)
   assert.equal(chatCalls.length, 1)
@@ -910,7 +952,7 @@ test('Qwen AI forwarder does not fresh-replay prose without a structural continu
     { signal: new AbortController().signal },
   )
 
-  output.write('data: {"choices":[{"delta":{"content":""}}]}\n\n')
+  output.write('data: {"choices":[{"delta":{"content":"ready"}}]}\n\n')
   const result = await resultPromise
   assert.equal(result.success, true)
   assert.equal(chatCalls.length, 1)

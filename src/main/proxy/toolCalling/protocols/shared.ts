@@ -608,6 +608,7 @@ function collectDirectSchemaValidationIssues(
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => jsonValuesEqual(value, candidate))) {
     issues.valueMismatches.push(`${displaySchemaPath(path)} (value is not in enum)`)
   }
+  issues.valueMismatches.push(...collectSchemaConstraintIssues(value, schema, path))
 
   if (Array.isArray(value)) {
     const itemSchema = getSchemaProperty(schema, 'items')
@@ -664,6 +665,130 @@ function collectDirectSchemaValidationIssues(
   }
 
   return issues
+}
+
+/**
+ * Check the finite-value JSON Schema constraints that are most commonly used
+ * by client tools.  This remains deliberately small and deterministic rather
+ * than attempting to become a general-purpose schema engine.
+ */
+function collectSchemaConstraintIssues(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path: string,
+): string[] {
+  const label = displaySchemaPath(path)
+  const mismatches: string[] = []
+
+  if (Array.isArray(value)) {
+    const minItems = nonNegativeIntegerSchemaValue(schema.minItems)
+    if (minItems !== undefined && value.length < minItems) {
+      mismatches.push(`${label} (array has ${value.length} items, minimum is ${minItems})`)
+    }
+
+    const maxItems = nonNegativeIntegerSchemaValue(schema.maxItems)
+    if (maxItems !== undefined && value.length > maxItems) {
+      mismatches.push(`${label} (array has ${value.length} items, maximum is ${maxItems})`)
+    }
+
+    if (schema.uniqueItems === true) {
+      outer: for (let left = 0; left < value.length; left += 1) {
+        for (let right = left + 1; right < value.length; right += 1) {
+          if (jsonValuesEqual(value[left], value[right])) {
+            mismatches.push(`${label} (array items must be unique)`)
+            break outer
+          }
+        }
+      }
+    }
+  }
+
+  if (typeof value === 'string') {
+    // JSON Schema string lengths are measured in Unicode code points, rather
+    // than UTF-16 code units, so astral characters count as one character.
+    const length = [...value].length
+    const minLength = nonNegativeIntegerSchemaValue(schema.minLength)
+    if (minLength !== undefined && length < minLength) {
+      mismatches.push(`${label} (string has length ${length}, minimum is ${minLength})`)
+    }
+
+    const maxLength = nonNegativeIntegerSchemaValue(schema.maxLength)
+    if (maxLength !== undefined && length > maxLength) {
+      mismatches.push(`${label} (string has length ${length}, maximum is ${maxLength})`)
+    }
+
+    if (typeof schema.pattern === 'string') {
+      try {
+        if (!new RegExp(schema.pattern).test(value)) {
+          mismatches.push(`${label} (string does not match pattern)`)
+        }
+      } catch {
+        // Ignore malformed provider-supplied patterns. Other schema rules
+        // remain enforceable without rejecting every otherwise valid call.
+      }
+    }
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const minimum = finiteSchemaNumber(schema.minimum)
+    const maximum = finiteSchemaNumber(schema.maximum)
+    const exclusiveMinimum = finiteSchemaNumber(schema.exclusiveMinimum)
+    const exclusiveMaximum = finiteSchemaNumber(schema.exclusiveMaximum)
+
+    if (exclusiveMinimum !== undefined && value <= exclusiveMinimum) {
+      mismatches.push(`${label} (number must be greater than ${exclusiveMinimum})`)
+    } else if (schema.exclusiveMinimum === true && minimum !== undefined && value <= minimum) {
+      mismatches.push(`${label} (number must be greater than ${minimum})`)
+    } else if (minimum !== undefined && value < minimum) {
+      mismatches.push(`${label} (number is below minimum ${minimum})`)
+    }
+
+    if (exclusiveMaximum !== undefined && value >= exclusiveMaximum) {
+      mismatches.push(`${label} (number must be less than ${exclusiveMaximum})`)
+    } else if (schema.exclusiveMaximum === true && maximum !== undefined && value >= maximum) {
+      mismatches.push(`${label} (number must be less than ${maximum})`)
+    } else if (maximum !== undefined && value > maximum) {
+      mismatches.push(`${label} (number is above maximum ${maximum})`)
+    }
+
+    const multipleOf = finiteSchemaNumber(schema.multipleOf)
+    if (multipleOf !== undefined && multipleOf > 0) {
+      const quotient = value / multipleOf
+      const nearestInteger = Math.round(quotient)
+      const tolerance = Number.EPSILON * Math.max(1, Math.abs(quotient)) * 8
+      if (Math.abs(quotient - nearestInteger) > tolerance) {
+        mismatches.push(`${label} (number is not a multiple of ${multipleOf})`)
+      }
+    }
+  }
+
+  if (isPlainObject(value)) {
+    const propertyCount = Object.keys(value).length
+    const minProperties = nonNegativeIntegerSchemaValue(schema.minProperties)
+    if (minProperties !== undefined && propertyCount < minProperties) {
+      mismatches.push(`${label} (object has ${propertyCount} properties, minimum is ${minProperties})`)
+    }
+
+    const maxProperties = nonNegativeIntegerSchemaValue(schema.maxProperties)
+    if (maxProperties !== undefined && propertyCount > maxProperties) {
+      mismatches.push(`${label} (object has ${propertyCount} properties, maximum is ${maxProperties})`)
+    }
+  }
+
+  return mismatches
+}
+
+function nonNegativeIntegerSchemaValue(value: unknown): number | undefined {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && Number.isFinite(value)
+    && value >= 0
+    ? value
+    : undefined
+}
+
+function finiteSchemaNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 function expectedSchemaTypes(schema: Record<string, unknown>): string[] {

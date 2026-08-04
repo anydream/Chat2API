@@ -32,6 +32,8 @@ function inferBufferedSseStatus(details: SseErrorDetails): BufferedSseStatus {
     return 499
   }
 
+  if (details.code === 'qwen_ai_upstream_busy') return 503
+
   if (details.status === 403 || details.code === 'qwen_ai_risk_control' || /risk-control|captcha|challenge|FAIL_SYS_USER_VALIDATE|RGV587/i.test(message)) {
     return 403
   }

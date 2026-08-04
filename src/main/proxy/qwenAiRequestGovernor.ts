@@ -37,6 +37,7 @@ type QueueItem = {
   requestId?: string
   attempt: number
   requestClass: QwenAiRequestClass
+  globalRecoveryProbe: boolean
   cancelled: boolean
 }
 
@@ -79,8 +80,8 @@ type RiskEvent = {
 }
 
 // A few account-level risk responses are not enough evidence to stop a large
-// pool. The circuit becomes meaningful only after risk has spread through the
-// pool and the remaining healthy capacity is small.
+// pool. The circuit is eligible only after risk reaches a pool-relative sample
+// and no healthy account remains.
 const GLOBAL_RISK_POOL_RATIO = 0.1
 
 function withRetryAfterHeader(result: ForwardResult, cooldownMs: number): ForwardResult {
@@ -282,6 +283,9 @@ export class QwenAiRequestGovernor {
   private activeByAccount: Map<string, number> = new Map()
   private activeByRequestClass: Map<QwenAiRequestClass, number> = new Map()
   private globalCooldown: CooldownState | undefined
+  private globalRecoveryProbeItemId: string | undefined
+  private globalRecoveryProbeAccountId: string | undefined
+  private globalRecoveryNextAt = 0
   private riskEvents: RiskEvent[] = []
   private recentFailovers: ReadonlyMap<string, QwenAiAccountFailoverRecord> = new Map()
   private nextQueueItemId = 1
@@ -298,13 +302,17 @@ export class QwenAiRequestGovernor {
         return
       }
 
+      const requestClass = options.requestClass || 'normal'
       const globalCooldownInMs = this.getGlobalCooldownInMs(now)
-      if (globalCooldownInMs > 0) {
-        resolve(this.createGlobalCircuitOpenResult(globalCooldownInMs))
+      const globalRecoveryProbe = globalCooldownInMs > 0
+        && this.canStartGlobalRecoveryProbe(accountId, requestClass, now)
+      if (globalCooldownInMs > 0 && !globalRecoveryProbe) {
+        resolve(this.createGlobalCircuitOpenResult(
+          this.getGlobalRecoveryWaitMs(now, globalCooldownInMs),
+        ))
         return
       }
 
-      const requestClass = options.requestClass || 'normal'
       if (options.allowQueue === false) {
         const waitMs = this.getImmediateAdmissionWaitMs(
           accountId,
@@ -334,12 +342,23 @@ export class QwenAiRequestGovernor {
         requestId: options.requestId,
         attempt: options.attempt ?? 1,
         requestClass,
+        globalRecoveryProbe,
         cancelled: false,
+      }
+
+      if (globalRecoveryProbe) {
+        this.globalRecoveryProbeItemId = item.id
+        this.globalRecoveryProbeAccountId = accountId
+        this.globalRecoveryNextAt = now + this.getGlobalRecoveryIntervalMs()
+        console.warn(
+          `[QwenAI Governor] Global circuit half-open probe admitted for account ${accountId}`,
+        )
       }
 
       const cancelQueued = (result: ForwardResult) => {
         if (item.cancelled) return
         item.cancelled = true
+        this.completeGlobalRecoveryProbe(item, false)
         this.removeQueuedItem(item)
         resolve(result)
       }
@@ -503,8 +522,8 @@ export class QwenAiRequestGovernor {
     this.expireGlobalCooldown(nowForGlobal)
     const globalCooldownInMs = this.getGlobalCooldownInMs(nowForGlobal)
     if (globalCooldownInMs > 0) {
-      this.rejectQueuedRequestsForGlobalCircuit(globalCooldownInMs)
-      return
+      this.rejectQueuedRequestsForGlobalCircuit(globalCooldownInMs, true)
+      if (!this.queue.some(item => item.globalRecoveryProbe && !item.cancelled)) return
     }
 
     const compactionLimit = this.getCompactionConcurrencyLimit(config.maxConcurrent)
@@ -610,6 +629,7 @@ export class QwenAiRequestGovernor {
       // upload, or chat creation is still running.
       item.signal?.removeEventListener('abort', abortActive)
       if (!runStarted) {
+        this.completeGlobalRecoveryProbe(item, false)
         release()
       } else if (activeStream) {
         destroyForwardStream(activeStream)
@@ -638,12 +658,14 @@ export class QwenAiRequestGovernor {
           item.signal?.removeEventListener('abort', abortActive)
           activeStream = result.stream
           destroyForwardStream(result.stream)
+          this.completeGlobalRecoveryProbe(item, false)
           release()
           item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
           return
         }
 
         const recordedResult = this.recordResult(item.accountId, result, item.requestClass)
+        this.completeGlobalRecoveryProbe(item, recordedResult.success)
         if (recordedResult.success && recordedResult.stream) {
           activeStream = recordedResult.stream
           const releaseStream = () => {
@@ -663,6 +685,7 @@ export class QwenAiRequestGovernor {
       .catch((error) => {
         item.signal?.removeEventListener('abort', abortActive)
         if (settledByAbort || item.signal?.aborted || item.cancelled) {
+          this.completeGlobalRecoveryProbe(item, false)
           release()
           item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
           return
@@ -671,6 +694,7 @@ export class QwenAiRequestGovernor {
         if (accountFault !== false) {
           this.openCooldown(item.accountId, this.getConfig().failureCooldownMs, 'exception')
         }
+        this.completeGlobalRecoveryProbe(item, false)
         release()
         item.reject(error)
       })
@@ -839,16 +863,16 @@ export class QwenAiRequestGovernor {
     const poolRiskThreshold = poolSize > 0
       ? Math.max(config.globalRiskThreshold, Math.ceil(poolSize * GLOBAL_RISK_POOL_RATIO))
       : config.globalRiskThreshold
-    const healthyRemainingThreshold = poolSize > 0
-      ? Math.max(1, Math.ceil(poolSize * GLOBAL_RISK_POOL_RATIO))
-      : 0
-
     if (
       distinctRiskAccounts < poolRiskThreshold
-      || (poolSize > 0 && accountScope.healthyAccountCount > healthyRemainingThreshold)
+      || (poolSize > 0 && accountScope.healthyAccountCount > 0)
     ) {
       return
     }
+
+    // Once the circuit is half-open, a failed probe is additional evidence
+    // about that account, not a reason to extend the whole pool's cooldown.
+    if (this.getGlobalCooldownInMs(now) > 0) return
 
     const failures = (this.globalCooldown?.failures || 0) + 1
     const cooldownMs = Math.min(
@@ -870,6 +894,7 @@ export class QwenAiRequestGovernor {
       failures,
       reason,
     }
+    if (!this.globalRecoveryProbeItemId) this.globalRecoveryNextAt = 0
 
     console.warn(
       `[QwenAI Governor] Global circuit opened for ${Math.ceil(cooldownMs / 1000)}s (${reason})`,
@@ -888,12 +913,67 @@ export class QwenAiRequestGovernor {
   private expireGlobalCooldown(now: number): void {
     if (this.globalCooldown && this.globalCooldown.until <= now) {
       this.globalCooldown = undefined
+      if (!this.globalRecoveryProbeItemId) this.globalRecoveryNextAt = 0
       this.riskEvents = this.riskEvents.filter(event => now - event.timestamp <= this.getConfig().riskWindowMs)
     }
   }
 
   private getGlobalCooldownInMs(now: number): number {
     return Math.max(0, (this.globalCooldown?.until || 0) - now)
+  }
+
+  private getGlobalRecoveryIntervalMs(): number {
+    return Math.max(1000, this.getEffectiveConfig().globalMinIntervalMs)
+  }
+
+  private canStartGlobalRecoveryProbe(
+    accountId: string,
+    requestClass: QwenAiRequestClass,
+    now: number,
+  ): boolean {
+    if (
+      requestClass !== 'normal'
+      || this.globalCooldown?.reason !== 'qwen_ai_global_risk_circuit'
+      || this.globalRecoveryProbeItemId
+      || now < this.globalRecoveryNextAt
+    ) {
+      return false
+    }
+
+    this.expireCooldown(accountId, now)
+    return (
+      (this.activeByAccount.get(accountId) || 0) === 0
+      && !this.queue.some(item => item.accountId === accountId && !item.cancelled)
+      && (this.accountNextAvailableAt.get(accountId) || 0) <= now
+      && (this.accountCooldowns.get(accountId)?.until || 0) <= now
+    )
+  }
+
+  private getGlobalRecoveryWaitMs(now: number, globalCooldownInMs: number): number {
+    const recoveryWaitMs = this.globalRecoveryProbeItemId
+      ? this.getGlobalRecoveryIntervalMs()
+      : Math.max(0, this.globalRecoveryNextAt - now)
+    return Math.min(
+      globalCooldownInMs,
+      Math.max(1000, recoveryWaitMs || this.getGlobalRecoveryIntervalMs()),
+    )
+  }
+
+  private completeGlobalRecoveryProbe(item: QueueItem, success: boolean): void {
+    if (!item.globalRecoveryProbe || this.globalRecoveryProbeItemId !== item.id) return
+
+    this.globalRecoveryProbeItemId = undefined
+    this.globalRecoveryProbeAccountId = undefined
+    if (success) {
+      this.globalCooldown = undefined
+      this.globalRecoveryNextAt = 0
+      console.warn('[QwenAI Governor] Global circuit closed after a successful half-open probe')
+      return
+    }
+
+    if (this.getGlobalCooldownInMs(Date.now()) > 0) {
+      this.globalRecoveryNextAt = Date.now() + this.getGlobalRecoveryIntervalMs()
+    }
   }
 
   private createGlobalCircuitOpenResult(waitMs: number): ForwardResult {
@@ -911,14 +991,23 @@ export class QwenAiRequestGovernor {
     }
   }
 
-  private rejectQueuedRequestsForGlobalCircuit(waitMs: number): void {
+  private rejectQueuedRequestsForGlobalCircuit(
+    waitMs: number,
+    preserveGlobalRecoveryProbe = false,
+  ): void {
     if (this.queue.length === 0) return
 
-    const queued = this.queue.splice(0)
+    const queued = preserveGlobalRecoveryProbe
+      ? this.queue.filter(item => !item.globalRecoveryProbe)
+      : this.queue.slice()
+    this.queue = preserveGlobalRecoveryProbe
+      ? this.queue.filter(item => item.globalRecoveryProbe)
+      : []
     const result = this.createGlobalCircuitOpenResult(waitMs)
     for (const item of queued) {
       item.cancelled = true
       this.clearQueueItemWaiters(item)
+      this.completeGlobalRecoveryProbe(item, false)
       item.resolve(item.signal?.aborted
         ? this.createCancelledResult('Client disconnected while Qwen AI request was queued.')
         : { ...result })
@@ -1065,14 +1154,17 @@ export class QwenAiRequestGovernor {
   }
 
   isAccountImmediatelyAvailable(accountId: string, now = Date.now()): boolean {
+    this.expireGlobalCooldown(now)
     this.expireCooldown(accountId, now)
-    return (
-      this.getGlobalCooldownInMs(now) === 0
-      && (this.activeByAccount.get(accountId) || 0) === 0
+    const accountReady = (
+      (this.activeByAccount.get(accountId) || 0) === 0
       && !this.queue.some(item => item.accountId === accountId && !item.cancelled)
       && (this.accountNextAvailableAt.get(accountId) || 0) <= now
       && (this.accountCooldowns.get(accountId)?.until || 0) <= now
     )
+    if (!accountReady) return false
+    if (this.getGlobalCooldownInMs(now) === 0) return true
+    return this.canStartGlobalRecoveryProbe(accountId, 'normal', now)
   }
 
   getStatus(
@@ -1173,6 +1265,11 @@ export class QwenAiRequestGovernor {
       globalCooldownInMs: this.getGlobalCooldownInMs(now),
       globalCooldownReason: this.globalCooldown?.reason,
       globalFailures: this.globalCooldown?.failures || 0,
+      globalRecoveryProbeActive: Boolean(this.globalRecoveryProbeItemId),
+      globalRecoveryProbeAccountId: this.globalRecoveryProbeAccountId,
+      globalRecoveryNextAt:
+        this.globalRecoveryNextAt > now ? this.globalRecoveryNextAt : undefined,
+      globalRecoveryNextInMs: Math.max(0, this.globalRecoveryNextAt - now),
       recentRiskEvents,
       recentRiskAccounts,
       accounts: accountStatuses,
@@ -1202,6 +1299,9 @@ export class QwenAiRequestGovernor {
     this.accountCooldowns.clear()
     this.accountNextAvailableAt.clear()
     this.globalCooldown = undefined
+    this.globalRecoveryProbeItemId = undefined
+    this.globalRecoveryProbeAccountId = undefined
+    this.globalRecoveryNextAt = 0
     this.riskEvents = []
     this.pump()
   }

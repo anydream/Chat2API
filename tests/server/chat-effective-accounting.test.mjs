@@ -13,6 +13,7 @@ function loadChatRoute({
   activeAccountCount = 2,
   configuredMaxFailovers = 0,
   qwenAiProvider = true,
+  deferManagedStreamCommit = false,
 }) {
   const source = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
   const output = ts.transpileModule(source, {
@@ -75,6 +76,7 @@ function loadChatRoute({
     governorFailures: [],
     statusSuccesses: [],
     statusFailures: [],
+    forwardContexts: [],
   }
 
   class MockRouter {
@@ -131,11 +133,13 @@ function loadChatRoute({
   }
 
   const localModules = {
+    'node:stream': { PassThrough },
     '@koa/router': MockRouter,
     '../types': {},
     '../loadbalancer': {
       loadBalancer: {
         selectAccount: () => initialSelection,
+        hasCompleteQwenAiWebSession: () => false,
         clearAccountFailure: accountId => calls.cleared.push(accountId),
         markAccountFailed: accountId => calls.failed.push(accountId),
         markQwenAiRiskControl: accountId => calls.riskControlled.push(accountId),
@@ -143,7 +147,27 @@ function loadChatRoute({
     },
     '../forwarder': {
       requestForwarder: {
-        forwardChatCompletion: async () => forwardResult,
+        forwardChatCompletion: async (...args) => {
+          calls.forwardContexts.push(args.at(-1))
+          return forwardResult
+        },
+      },
+      shouldDeferQwenAiManagedStreamCommit: () => deferManagedStreamCommit,
+    },
+    '../qwenAiDeferredStream': {
+      createDeferredQwenAiFailoverStream: outcomePromise => {
+        const deferred = new PassThrough()
+        void outcomePromise.then(outcome => {
+          deferred.qwenAiEffectiveAccountId = outcome.selection.account.id
+          deferred.qwenAiEffectiveProviderId = outcome.selection.provider.id
+          deferred.qwenAiEffectiveActualModel = outcome.selection.actualModel
+          if (!outcome.result.success || !outcome.result.stream) {
+            deferred.destroy(new Error(outcome.result.error || 'deferred failure'))
+            return
+          }
+          outcome.result.stream.pipe(deferred)
+        })
+        return deferred
       },
     },
     '../accountFailover': {
@@ -310,6 +334,44 @@ test('chat route uses all 99 active Qwen accounts while non-Qwen keeps retryCoun
     await invokeChatRoute(harness)
     assert.deepEqual(harness.calls.maxFailovers, [3])
   })
+})
+
+test('managed Qwen route returns its client stream before atomic account validation finishes', async () => {
+  let resolveForward
+  const pendingForward = new Promise(resolve => {
+    resolveForward = resolve
+  })
+  const upstream = new PassThrough()
+  const harness = loadChatRoute({
+    stream: true,
+    deferManagedStreamCommit: true,
+    forwardResult: pendingForward,
+  })
+
+  const invocation = invokeChatRoute(harness)
+  const { ctx } = await Promise.race([
+    invocation,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('route waited for managed account validation before returning the SSE stream')),
+      200,
+    )),
+  ])
+
+  assert.equal(harness.calls.forwardContexts.length, 1)
+  assert.equal(harness.calls.forwardContexts[0].deferManagedStreamCommit, true)
+  assert.ok(ctx.body instanceof PassThrough)
+
+  ctx.body.resume()
+  const ended = once(ctx.body, 'end')
+  resolveForward({
+    success: true,
+    status: 200,
+    stream: upstream,
+    skipTransform: true,
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  upstream.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+  await ended
 })
 
 test('non-stream chat accounting uses ForwardResult effective selection', async () => {

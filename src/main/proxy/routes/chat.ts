@@ -3,6 +3,7 @@
  * Implements /v1/chat/completions route
  */
 
+import { PassThrough } from 'node:stream'
 import Router from '@koa/router'
 import type { Context } from 'koa'
 import {
@@ -12,8 +13,12 @@ import {
   type AccountSelection,
 } from '../types'
 import { loadBalancer } from '../loadbalancer'
-import { requestForwarder } from '../forwarder'
+import {
+  requestForwarder,
+  shouldDeferQwenAiManagedStreamCommit,
+} from '../forwarder'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
+import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import { KimiAdapter } from '../adapters/kimi'
 import {
@@ -288,7 +293,11 @@ router.post('/completions', async (ctx: Context) => {
   }
 
   const clientSignal = createClientAbortSignal(ctx)
-  const createProxyContext = (selection: AccountSelection): ProxyContext => ({
+  const createProxyContext = (
+    selection: AccountSelection,
+    deferManagedStreamCommit = false,
+    onQwenAiProgressFrame?: (frame: string) => void,
+  ): ProxyContext => ({
     requestId,
     providerId: selection.provider.id,
     accountId: selection.account.id,
@@ -299,12 +308,18 @@ router.post('/completions', async (ctx: Context) => {
     clientIP,
     signal: clientSignal,
     requestIntent: requestIntent.intent,
+    ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
+    ...(onQwenAiProgressFrame ? { onQwenAiProgressFrame } : {}),
   })
   let { account, provider, actualModel } = initialSelection
   let context = createProxyContext(initialSelection)
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
 
   const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+  const failoverSelectionConstraints = initialProviderIsQwenAi
+    && loadBalancer.hasCompleteQwenAiWebSession(initialSelection)
+    ? { qwenAiWebSessionTier: 'complete' as const }
+    : undefined
   const activeAccountCount = initialProviderIsQwenAi
     ? storeManager.getAccountsByProviderId(initialSelection.provider.id)
       .filter(candidate => candidate.status === 'active')
@@ -316,56 +331,86 @@ router.post('/completions', async (ctx: Context) => {
     activeAccountCount,
     qwenAiMaxAccountFailovers: process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
   })
+  const deferManagedStreamCommit = initialProviderIsQwenAi
+    && shouldDeferQwenAiManagedStreamCommit(request)
+  const qwenAiProgressStream = deferManagedStreamCommit ? new PassThrough() : undefined
+  const onQwenAiProgressFrame = qwenAiProgressStream
+    ? (frame: string) => { qwenAiProgressStream.write(frame) }
+    : undefined
+
+  const runWithAccountFailover = () => forwardWithAccountFailover({
+    initialSelection,
+    maxFailovers,
+    signal: clientSignal,
+    forward: async ({ selection }) => {
+      const attemptContext = createProxyContext(
+        selection,
+        deferManagedStreamCommit,
+        onQwenAiProgressFrame,
+      )
+      return requestForwarder.forwardChatCompletion(
+        request,
+        selection.account,
+        selection.provider,
+        selection.actualModel,
+        attemptContext,
+      )
+    },
+    selectNext: excludedAccountIds => loadBalancer.selectAccount(
+      request.model,
+      config.loadBalanceStrategy,
+      preferredProviderId,
+      preferredAccountId,
+      excludedAccountIds,
+      failoverSelectionConstraints,
+    ),
+    onFailedAttempt: ({ selection, attempt }, result) => {
+      if (QwenAiAdapter.isQwenAiProvider(selection.provider)) {
+        qwenAiRequestGovernor.reportAccountFailover(selection.account.id, {
+          requestId,
+          status: result.status,
+          errorCode: result.errorCode,
+          attempt,
+          accountFault: result.accountFault,
+        })
+      }
+      if (result.accountFault !== false) {
+        loadBalancer.markAccountFailed(selection.account.id)
+      }
+      storeManager.addLog('warn', 'Retrying request with another account after upstream failure', {
+        requestId,
+        providerId: selection.provider.id,
+        accountId: selection.account.id,
+        model: request.model,
+        errorCode: result.errorCode,
+        data: {
+          attempt,
+          status: result.status,
+          accountFault: result.accountFault,
+        },
+      })
+    },
+  })
 
   try {
-    const outcome = await forwardWithAccountFailover({
-      initialSelection,
-      maxFailovers,
-      signal: clientSignal,
-      forward: async ({ selection }) => {
-        const attemptContext = createProxyContext(selection)
-        return requestForwarder.forwardChatCompletion(
-          request,
-          selection.account,
-          selection.provider,
-          selection.actualModel,
-          attemptContext,
-        )
-      },
-      selectNext: excludedAccountIds => loadBalancer.selectAccount(
-        request.model,
-        config.loadBalanceStrategy,
-        preferredProviderId,
-        preferredAccountId,
-        excludedAccountIds,
-      ),
-      onFailedAttempt: ({ selection, attempt }, result) => {
-        if (QwenAiAdapter.isQwenAiProvider(selection.provider)) {
-          qwenAiRequestGovernor.reportAccountFailover(selection.account.id, {
-            requestId,
-            status: result.status,
-            errorCode: result.errorCode,
-            attempt,
-            accountFault: result.accountFault,
-          })
-        }
-        if (result.accountFault !== false) {
-          loadBalancer.markAccountFailed(selection.account.id)
-        }
-        storeManager.addLog('warn', 'Retrying request with another account after upstream failure', {
-          requestId,
-          providerId: selection.provider.id,
-          accountId: selection.account.id,
-          model: request.model,
-          errorCode: result.errorCode,
-          data: {
-            attempt,
-            status: result.status,
-            accountFault: result.accountFault,
+    const failoverPromise = runWithAccountFailover()
+    const outcome = deferManagedStreamCommit
+      ? {
+          selection: initialSelection,
+          result: {
+            success: true,
+            status: 200,
+            stream: createDeferredQwenAiFailoverStream(
+              failoverPromise,
+              clientSignal,
+              qwenAiProgressStream,
+            ),
+            skipTransform: true,
           },
-        })
-      },
-    })
+          failoverCount: 0,
+          excludedAccountIds: new Set<string>(),
+        }
+      : await failoverPromise
     account = outcome.selection.account
     provider = outcome.selection.provider
     actualModel = outcome.selection.actualModel

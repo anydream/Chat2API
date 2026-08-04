@@ -227,6 +227,37 @@ test('account-neutral preflight failures replay independently of account fault',
   assert.equal(outcome.failoverCount, 1)
 })
 
+test('exhausted malformed-tool recovery replays the complete request on the next account', async () => {
+  const accounts = [selection('account-1'), selection('account-2')]
+  const attempted: string[] = []
+  const malformedToolFailure: ForwardResult = {
+    success: false,
+    status: 502,
+    error: 'Provider returned declared native tool call with incomplete JSON arguments: Bash',
+    errorCode: 'malformed_tool_call',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  }
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: accounts[0],
+    maxFailovers: 1,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      return current.account.id === accounts[0].account.id
+        ? malformedToolFailure
+        : { success: true, status: 200, body: { choices: [] } }
+    },
+    selectNext: excluded => accounts.find(item => !excluded.has(item.account.id)) ?? null,
+  })
+
+  assert.deepEqual(attempted, ['account-1', 'account-2'])
+  assert.equal(outcome.result.success, true)
+  assert.equal(outcome.selection.account.id, 'account-2')
+  assert.equal(outcome.failoverCount, 1)
+})
+
 test('account failover is bounded and never reselects an excluded account', async () => {
   const accounts = [selection('account-1'), selection('account-2'), selection('account-3')]
   const attempted: string[] = []

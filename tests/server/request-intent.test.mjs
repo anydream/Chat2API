@@ -110,14 +110,40 @@ test('a nested LiteLLM protocol envelope identifies context compaction', () => {
   assert.ok(result.signals.includes('nested_protocol_compaction_marker'))
 })
 
-test('a top-level system compaction instruction is detected', () => {
+test('a top-level system compaction mention is diagnostic but not decisive', () => {
   const result = classifyChatRequest({
     model: 'Qwen3.8-Max-Preview',
     system: 'Create a context summary by compressing the conversation history.',
     messages: [{ role: 'user', content: 'continue' }],
   })
 
-  assert.equal(result.intent, 'context_compaction')
+  assert.equal(result.intent, 'normal')
+  assert.equal(result.reason, 'no_compaction_signal')
+  assert.ok(result.signals.includes('system_compaction_marker'))
+})
+
+test('Claude Code system documentation does not strip tools from an ordinary tool request', () => {
+  const result = classifyChatRequest({
+    model: 'Qwen3.8-Max',
+    stream: true,
+    tools: [
+      { type: 'function', function: { name: 'Bash' } },
+      { type: 'function', function: { name: 'Read' } },
+    ],
+    system: [
+      {
+        type: 'text',
+        text: 'You are Claude Code. Context compaction may summarize the conversation history when the context window is full.',
+      },
+    ],
+    messages: [
+      { role: 'user', content: 'Use Bash to run pwd, then report the exact output.' },
+    ],
+  })
+
+  assert.equal(result.intent, 'normal')
+  assert.equal(result.reason, 'no_compaction_signal')
+  assert.equal(result.toolCount, 2)
   assert.ok(result.signals.includes('system_compaction_marker'))
 })
 

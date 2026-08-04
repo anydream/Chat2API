@@ -19,15 +19,15 @@ export const qwenAiConfig: BuiltinProviderConfig = {
     Accept: 'application/json, text/plain, */*',
     Referer: 'https://chat.qwen.ai/',
     source: 'web',
-    Version: '0.2.35',
+    Version: '0.2.67',
   },
   supportedModels: [
-    'Qwen3.8-Max-Preview',
+    'Qwen3.8-Max',
     'Qwen3.7-Plus',
     'Qwen3.7-Max',
-    'Qwen3.6-Plus',
   ],
   modelMappings: {
+    'Qwen3.8-Max': 'qwen3.8-max',
     'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
     'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',

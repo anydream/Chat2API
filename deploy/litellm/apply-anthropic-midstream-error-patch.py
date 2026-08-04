@@ -19,6 +19,9 @@ RESPONSES_MAIN_MODULE_PATH = Path("litellm/responses/main.py")
 ANTHROPIC_ADAPTER_MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py"
 )
+ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH = Path(
+    "litellm/llms/anthropic/experimental_pass_through/responses_adapters/transformation.py"
+)
 TOKEN_COUNTER_MODULE_PATH = Path("litellm/litellm_core_utils/token_counter.py")
 PROXY_SERVER_MODULE_PATH = Path("litellm/proxy/proxy_server.py")
 ANTHROPIC_ENDPOINTS_MODULE_PATH = Path("litellm/proxy/anthropic_endpoints/endpoints.py")
@@ -1108,6 +1111,28 @@ ANTHROPIC_ADAPTER_TOOL_ERROR_FORWARD_PATCH = '''            if len(tool_message_
                 new_messages.extend(tool_message_list)
 '''
 
+ANTHROPIC_RESPONSES_TOOL_ERROR_MARKER = 'tool_result_item["is_error"] = is_error'
+ANTHROPIC_RESPONSES_TOOL_ERROR_ANCHOR = '''                            # tool_result is a top-level item, not inside the message
+                            input_items.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": tool_use_id,
+                                    "output": output_text,
+                                }
+                            )
+'''
+ANTHROPIC_RESPONSES_TOOL_ERROR_PATCH = '''                            # Preserve Anthropic's tool failure bit as a Chat2API extension.
+                            tool_result_item: Dict[str, Any] = {
+                                "type": "function_call_output",
+                                "call_id": tool_use_id,
+                                "output": output_text,
+                            }
+                            is_error = block.get("is_error")
+                            if isinstance(is_error, bool):
+                                tool_result_item["is_error"] = is_error
+                            input_items.append(tool_result_item)
+'''
+
 
 def replace_exact(source: str, old: str, new: str, description: str) -> str:
     occurrences = source.count(old)
@@ -1397,6 +1422,23 @@ def patch_anthropic_adapter_source(source: str) -> str:
     return patched
 
 
+def patch_anthropic_responses_transformation_source(source: str) -> str:
+    if ANTHROPIC_RESPONSES_TOOL_ERROR_MARKER in source:
+        raise RuntimeError(
+            "LiteLLM already contains the Anthropic Responses tool-result error bridge patch; "
+            "review the base image before removing this build patch."
+        )
+
+    patched = replace_exact(
+        source,
+        ANTHROPIC_RESPONSES_TOOL_ERROR_ANCHOR,
+        ANTHROPIC_RESPONSES_TOOL_ERROR_PATCH,
+        "Anthropic Responses tool-result error anchor",
+    )
+    compile(patched, str(ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH), "exec")
+    return patched
+
+
 def resolve_installed_target(relative_path: Path) -> Path:
     candidates = [Path(root) / relative_path for root in site.getsitepackages()]
     existing = [candidate for candidate in candidates if candidate.is_file()]
@@ -1419,6 +1461,7 @@ def resolve_targets() -> list[Path]:
         resolve_installed_target(RESPONSES_MODULE_PATH),
         resolve_installed_target(RESPONSES_MAIN_MODULE_PATH),
         resolve_installed_target(ANTHROPIC_ADAPTER_MODULE_PATH),
+        resolve_installed_target(ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH),
         resolve_installed_target(TOKEN_COUNTER_MODULE_PATH),
         resolve_installed_target(PROXY_SERVER_MODULE_PATH),
         resolve_installed_target(ANTHROPIC_ENDPOINTS_MODULE_PATH),
@@ -1435,6 +1478,8 @@ def main() -> None:
             patched = patch_responses_main_source(source)
         elif target_path.endswith(ANTHROPIC_ADAPTER_MODULE_PATH.as_posix()):
             patched = patch_anthropic_adapter_source(source)
+        elif target_path.endswith(ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH.as_posix()):
+            patched = patch_anthropic_responses_transformation_source(source)
         elif target_path.endswith(TOKEN_COUNTER_MODULE_PATH.as_posix()):
             patched = patch_token_counter_source(source)
         elif target_path.endswith(PROXY_SERVER_MODULE_PATH.as_posix()):

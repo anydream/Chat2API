@@ -43,8 +43,9 @@ ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
 # Keep one effective governor slot available for ordinary client requests
 # while a context-compaction map/reduce is active.
 ENV CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS=1
-# Managed-tool validation buffering is opt-in; the default preserves live SSE.
-ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false
+# Managed answers and tool arguments remain private until terminal validation.
+# Genuine Qwen reasoning is forwarded live while account failover stays active.
+ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3

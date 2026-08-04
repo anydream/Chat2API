@@ -25,6 +25,22 @@ function loadAccountFailoverModule() {
 
 const accountFailoverModule = loadAccountFailoverModule()
 
+function loadDeferredStreamModule() {
+  const source = fs.readFileSync('src/main/proxy/qwenAiDeferredStream.ts', 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      esModuleInterop: true,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', output)(runtimeRequire, module, module.exports)
+  return module.exports
+}
+
+const deferredStreamModule = loadDeferredStreamModule()
+
 function loadResponsesRoute(createResult, options = {}) {
   const source = fs.readFileSync('src/main/proxy/routes/responses.ts', 'utf8')
   const output = ts.transpileModule(source, {
@@ -46,6 +62,7 @@ function loadResponsesRoute(createResult, options = {}) {
     attemptedAccountIds: [],
     failoverLimitInputs: [],
     maxFailovers: [],
+    forwardContexts: [],
   }
   const qwenAiProvider = options.qwenAiProvider !== false
   const activeAccountCount = Math.max(1, options.activeAccountCount ?? 1)
@@ -144,9 +161,15 @@ function loadResponsesRoute(createResult, options = {}) {
   const localModules = {
     '@koa/router': MockRouter,
     '../forwarder': {
+      shouldDeferQwenAiManagedStreamCommit: request => Boolean(
+        request.stream === true
+        && request.tools?.length
+        && request.tool_choice !== 'none'
+      ),
       requestForwarder: {
-        forwardChatCompletion: async (_request, account, provider, actualModel) => {
+        forwardChatCompletion: async (_request, account, provider, actualModel, context) => {
           calls.attemptedAccountIds.push(account.id)
+          calls.forwardContexts.push(context)
           return createResult({
             account,
             provider,
@@ -165,6 +188,7 @@ function loadResponsesRoute(createResult, options = {}) {
           _preferredAccountId,
           excludedAccountIds = new Set(),
         ) => poolSelections.find(selection => !excludedAccountIds.has(selection.account.id)) ?? null,
+        hasCompleteQwenAiWebSession: () => false,
         clearAccountFailure: accountId => calls.cleared.push(accountId),
         markAccountFailed: accountId => calls.failed.push(accountId),
       },
@@ -179,6 +203,7 @@ function loadResponsesRoute(createResult, options = {}) {
         return accountFailoverModule.resolveAccountFailoverLimit(input)
       },
     },
+    '../qwenAiDeferredStream': deferredStreamModule,
     '../qwenAiRequestGovernor': {
       qwenAiRequestGovernor: {
         reportAccountFailover: (accountId, details) => {
@@ -232,6 +257,14 @@ function loadResponsesRoute(createResult, options = {}) {
       isClientCancellationError: () => false,
       sanitizeForwardedErrorHeaders: headers => headers,
     },
+    '../utils/sseKeepAlive': {
+      SseKeepAliveStream: class SseKeepAliveStream extends PassThrough {
+        constructor() {
+          super()
+          this.push(': keep-alive\n\n')
+        }
+      },
+    },
     '../responses/compat': {
       ResponsesCompatibilityError: MockCompatibilityError,
       responsesRequestToChatCompletion: request => ({
@@ -239,6 +272,8 @@ function loadResponsesRoute(createResult, options = {}) {
           model: request.model,
           messages: [{ role: 'user', content: String(request.input || '') }],
           stream: request.stream === true,
+          tools: request.tools,
+          tool_choice: request.tool_choice,
         },
         conversationMessages: [],
       }),
@@ -402,6 +437,49 @@ test('Responses stream completion reads late effective-account metadata before u
   assert.deepEqual(calls.usage, ['account-effective'])
   assert.deepEqual(calls.cleared, ['account-effective'])
   assertEffectiveStats(calls, true)
+})
+
+test('managed Qwen Responses route returns keep-alive output before account validation completes', async () => {
+  const upstream = new PassThrough()
+  let resolveForward
+  const pendingForward = new Promise(resolve => {
+    resolveForward = resolve
+  })
+  const { handler, calls } = loadResponsesRoute(() => pendingForward)
+  const ctx = createContext({
+    model: 'claude-client-model',
+    input: 'use the tool',
+    stream: true,
+    tools: [{ type: 'function', name: 'lookup', parameters: {} }],
+  })
+
+  const invocation = handler(ctx)
+  await Promise.race([
+    invocation,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('Responses route waited for managed account validation')),
+      200,
+    )),
+  ])
+
+  assert.equal(calls.forwardContexts.length, 1)
+  assert.equal(calls.forwardContexts[0].deferManagedStreamCommit, true)
+  assert.ok(ctx.body instanceof PassThrough)
+
+  const output = []
+  ctx.body.on('data', chunk => output.push(String(chunk)))
+  const ended = once(ctx.body, 'end')
+  resolveForward({
+    success: true,
+    status: 200,
+    stream: upstream,
+    skipTransform: true,
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  upstream.end('data: [DONE]\n\n')
+  await ended
+
+  assert.match(output.join(''), /: keep-alive/)
 })
 
 test('Responses deferred Qwen failure cools down and logs the late effective account', async () => {

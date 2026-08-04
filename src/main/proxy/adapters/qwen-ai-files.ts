@@ -135,6 +135,8 @@ interface NormalizedInputFile {
   data?: Buffer
   localPath?: string
   localMtimeMs?: number
+  /** Stable identity for in-memory or downloaded content. */
+  contentHash?: string
   sizeBytes: number
   filename: string
   mimeType: string
@@ -160,6 +162,12 @@ export interface PreparedQwenAiMessage {
   files: any[]
 }
 
+export type QwenAiMessageTransport = 'inline' | 'document'
+
+export interface PrepareQwenAiMultimodalMessageOptions {
+  transport?: QwenAiMessageTransport
+}
+
 interface QwenAiDocumentEvidence {
   filename: string
   mimeType: string
@@ -182,8 +190,9 @@ interface QwenAiFileCacheRecord {
   key: string
   providerId: string
   accountId: string
-  localPath: string
-  localMtimeMs: number
+  localPath?: string
+  localMtimeMs?: number
+  contentHash?: string
   sizeBytes: number
   filename: string
   mimeType: string
@@ -403,9 +412,24 @@ class QwenAiFileCache {
   private loaded = false
 
   createKey(scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile): string | null {
-    if (!QWEN_AI_FILE_CACHE_ENABLED || !file.localPath || file.localMtimeMs === undefined) {
+    if (!QWEN_AI_FILE_CACHE_ENABLED) {
       return null
     }
+
+    if (file.contentHash) {
+      return JSON.stringify([
+        'qwen-ai-file-cache-content-v1',
+        scope.providerId,
+        scope.accountId,
+        file.contentHash,
+        file.sizeBytes,
+        normalizeMimeType(file.mimeType),
+        file.coarseType,
+        file.fileClass,
+      ])
+    }
+
+    if (!file.localPath || file.localMtimeMs === undefined) return null
 
     return JSON.stringify([
       'qwen-ai-file-cache-v1',
@@ -429,11 +453,16 @@ class QwenAiFileCache {
     }
 
     const expired = Date.now() - record.createdAt > QWEN_AI_FILE_CACHE_TTL_MS
+    const sourceChanged = file.contentHash
+      ? record.contentHash !== file.contentHash
+      : !file.localPath
+        || file.localMtimeMs === undefined
+        || record.localPath !== path.resolve(file.localPath)
+        || record.localMtimeMs !== file.localMtimeMs
     const changed =
       record.providerId !== scope.providerId ||
       record.accountId !== scope.accountId ||
-      record.localPath !== path.resolve(file.localPath || '') ||
-      record.localMtimeMs !== file.localMtimeMs ||
+      sourceChanged ||
       record.sizeBytes !== file.sizeBytes ||
       normalizeMimeType(record.mimeType) !== normalizeMimeType(file.mimeType) ||
       record.coarseType !== file.coarseType ||
@@ -451,7 +480,7 @@ class QwenAiFileCache {
   }
 
   set(key: string, scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile, fileItem: any): void {
-    if (!file.localPath || file.localMtimeMs === undefined) {
+    if (!file.contentHash && (!file.localPath || file.localMtimeMs === undefined)) {
       return
     }
 
@@ -462,8 +491,9 @@ class QwenAiFileCache {
       key,
       providerId: scope.providerId,
       accountId: scope.accountId,
-      localPath: path.resolve(file.localPath),
+      localPath: file.localPath ? path.resolve(file.localPath) : undefined,
       localMtimeMs: file.localMtimeMs,
+      contentHash: file.contentHash,
       sizeBytes: file.sizeBytes,
       filename: file.filename,
       mimeType: file.mimeType,
@@ -892,6 +922,7 @@ function extractDataUrl(
 
   return {
     data,
+    contentHash: createHash('sha256').update(data).digest('hex'),
     sizeBytes: data.length,
     filename: safeFilename,
     mimeType,
@@ -900,21 +931,23 @@ function extractDataUrl(
 }
 
 function extractInputAudio(part: ChatMessageContent): NormalizedInputFile {
-  const data = part.input_audio?.data
-  if (!data) {
+  const encodedData = part.input_audio?.data
+  if (!encodedData) {
     throw new Error('Missing data for input_audio content part')
   }
 
-  const parsedData = parseDataUrlPayload(data)
+  const parsedData = parseDataUrlPayload(encodedData)
   const mimeType = normalizeAudioMimeType(part.input_audio?.format, part.mime_type || parsedData.mimeType)
   const filename = ensureExtension(
     sanitizeFilename(part.filename || `input-audio-${uuid()}`),
     mimeType,
   )
 
+  const data = Buffer.from(parsedData.base64, 'base64')
   return {
-    data: Buffer.from(parsedData.base64, 'base64'),
-    sizeBytes: Buffer.byteLength(parsedData.base64, 'base64'),
+    data,
+    contentHash: createHash('sha256').update(data).digest('hex'),
+    sizeBytes: data.length,
     filename,
     mimeType,
     coarseType: 'audio',
@@ -1726,7 +1759,11 @@ export class QwenAiFileUploader {
     this.cacheScope = safeCacheScope(cacheScope)
   }
 
-  async uploadPart(part: ChatMessageContent, evidenceQueryText = ''): Promise<UploadedQwenAiPart> {
+  async uploadPart(
+    part: ChatMessageContent,
+    evidenceQueryText = '',
+    options: { includeEvidence?: boolean } = {},
+  ): Promise<UploadedQwenAiPart> {
     const startedAt = Date.now()
     console.log(`[QwenAI][File] resolve start type=${part.type}`)
     const directUrl = part.type === 'input_audio' ? '' : extractPartUrl(part)
@@ -1754,7 +1791,9 @@ export class QwenAiFileUploader {
       throw new Error(`Qwen AI file upload exceeds ${MAX_FILE_SIZE} bytes: ${file.filename}`)
     }
 
-    const evidence = createDocumentEvidence(file, evidenceQueryText)
+    const evidence = options.includeEvidence === false
+      ? undefined
+      : createDocumentEvidence(file, evidenceQueryText)
     const cacheKey = qwenAiFileCache.createKey(this.cacheScope, file)
     if (cacheKey) {
       const cached = qwenAiFileCache.get(cacheKey, this.cacheScope, file)
@@ -1943,9 +1982,11 @@ export class QwenAiFileUploader {
     const safeFilename = ensureExtension(filename, mimeType)
     const classification = classifyFile(String(mimeType), part.type)
 
+    const data = Buffer.from(response.data)
     return {
-      data: Buffer.from(response.data),
-      sizeBytes: Buffer.byteLength(response.data),
+      data,
+      contentHash: createHash('sha256').update(data).digest('hex'),
+      sizeBytes: data.length,
       filename: safeFilename,
       mimeType: String(mimeType),
       sourceUrl: url,
@@ -2110,17 +2151,53 @@ export class QwenAiFileUploader {
   }
 }
 
+function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
+  const data = Buffer.from(content, 'utf8')
+  const contentHash = createHash('sha256').update(data).digest('hex')
+  return {
+    type: 'file',
+    filename: `chat2api-conversation-${contentHash.slice(0, 16)}.txt`,
+    mime_type: 'text/plain',
+    file_url: {
+      url: `data:text/plain;base64,${data.toString('base64')}`,
+    },
+  }
+}
+
+function qwenAiTranscriptDocumentInstruction(filename: string): string {
+  return [
+    `The complete conversation transcript is attached as ${filename}.`,
+    'Read the attachment in full and treat it as the authoritative conversation context.',
+    'Preserve every role, system instruction, tool declaration, tool call, tool result, and original attachment, then continue the final pending user task.',
+  ].join(' ')
+}
+
 export async function prepareQwenAiMultimodalMessage(
   messages: ChatMessage[],
   uploader: QwenAiFileUploader,
+  options: PrepareQwenAiMultimodalMessageOptions = {},
 ): Promise<PreparedQwenAiMessage> {
   const { content: userContent, fileParts } = buildQwenAiTranscript(messages)
   const uniqueFileParts = deduplicateQwenFileParts(fileParts)
+  const transport = options.transport ?? 'inline'
+  const transcriptDocument = transport === 'document'
+    ? createQwenAiTranscriptDocument(userContent)
+    : undefined
+  const uploadedParts = transcriptDocument
+    ? [...uniqueFileParts, transcriptDocument]
+    : uniqueFileParts
+  const inlineContent = transcriptDocument
+    ? qwenAiTranscriptDocumentInstruction(transcriptDocument.filename || 'the attached transcript')
+    : userContent
 
   const files: any[] = []
   const evidences: QwenAiDocumentEvidence[] = []
-  for (const part of uniqueFileParts) {
-    const uploaded = await uploader.uploadPart(part, userContent)
+  for (const part of uploadedParts) {
+    const uploaded = await uploader.uploadPart(part, inlineContent, {
+      // This transport exists specifically to avoid re-sending the large
+      // transcript inline. Qwen still receives every source attachment.
+      includeEvidence: transport !== 'document',
+    })
     files.push(uploaded.file)
     if (uploaded.evidence) {
       evidences.push(uploaded.evidence)
@@ -2129,8 +2206,8 @@ export async function prepareQwenAiMultimodalMessage(
 
   const documentEvidence = renderDocumentEvidence(evidences)
   const content = documentEvidence
-    ? `${userContent}\n\n${documentEvidence}`
-    : userContent
+    ? `${inlineContent}\n\n${documentEvidence}`
+    : inlineContent
 
   return {
     content,

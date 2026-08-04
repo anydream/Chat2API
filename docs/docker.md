@@ -184,7 +184,7 @@ QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
-CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=3
+CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
 # explicit retry cap (0 disables busy-chat recovery).
@@ -236,10 +236,13 @@ forwards the complete rendered transcript without applying a proxy-side size
 limit or compacting messages, tool arguments, or tool results.
 When a managed-tool response reaches a semantic terminal without a tool call,
 Chat2API starts a new user-turn continuation in the same Qwen chat instead of
-replaying that completed response branch. The generic continuation is bounded
-by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `3`); set it to
-`0` to disable this semantic recovery. The new turn is parented to Qwen's
-latest `response_id` and does not resend the original messages or files.
+replaying that completed response branch. By default,
+`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` is blank: genuine Qwen
+progress remains authoritative, while the shared no-progress recovery budget
+still bounds stalled admission and empty retry loops. Set a positive integer
+only to impose a deployment-specific turn cap, or `0` to disable semantic
+recovery. The new turn is parented to Qwen's latest `response_id` and does not
+resend the original messages or files.
 If Qwen is still finalizing the parent response, its continuation endpoint
 returns HTTP 200 JSON with `code=CHAT_IN_PROGRESS` instead of an SSE stream.
 Chat2API waits with exponential backoff and retries the exact same continuation

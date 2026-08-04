@@ -74,7 +74,7 @@ test('Responses request translates Codex messages, function history, strict tool
         name: 'weather',
         arguments: '{"city":"Shanghai"}',
       },
-      { type: 'function_call_output', call_id: 'call_prior', output: '{"temp":31}' },
+      { type: 'function_call_output', call_id: 'call_prior', output: '{"temp":31}', is_error: true },
       { role: 'assistant', content: [{ type: 'output_text', text: 'It is warm.' }] },
     ],
     tools: [{
@@ -104,6 +104,7 @@ test('Responses request translates Codex messages, function history, strict tool
     role: 'tool',
     tool_call_id: 'call_prior',
     content: '{"temp":31}',
+    is_error: true,
   })
   assert.equal((chatRequest.tools?.[0].function as any).strict, true)
   assert.deepEqual(chatRequest.tools?.map(tool => tool.function.name), ['weather', 'read_file'])
@@ -522,6 +523,41 @@ test('text streaming emits the official typed event sequence and complete respon
   assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index))
   assert.equal(events.at(-1).response.output[0].content[0].text, 'Hello')
   assert.equal(events.at(-1).response.usage.total_tokens, 3)
+})
+
+test('reasoning streaming emits live Responses deltas before answer text', async () => {
+  const events = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"role":"assistant","reasoning_content":"first "}}]}\n\n',
+    'data: {"choices":[{"delta":{"reasoning_content":"second"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"final"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ])
+
+  assert.deepEqual(events.map((event) => event.type), [
+    'response.created',
+    'response.in_progress',
+    'response.output_item.added',
+    'response.reasoning_summary_text.delta',
+    'response.reasoning_summary_text.delta',
+    'response.reasoning_summary_text.done',
+    'response.reasoning_summary_part.done',
+    'response.output_item.done',
+    'response.output_item.added',
+    'response.content_part.added',
+    'response.output_text.delta',
+    'response.output_text.done',
+    'response.content_part.done',
+    'response.output_item.done',
+    'response.completed',
+  ])
+  assert.deepEqual(events.map((event) => event.sequence_number), events.map((_, index) => index))
+  assert.equal(events[3].delta, 'first ')
+  assert.equal(events[4].delta, 'second')
+  assert.equal(events[5].text, 'first second')
+  assert.equal(events.at(-1).response.output[0].type, 'reasoning')
+  assert.equal(events.at(-1).response.output[0].summary[0].text, 'first second')
+  assert.equal(events.at(-1).response.output[1].content[0].text, 'final')
 })
 
 test('function streaming merges cumulative arguments and emits argument events', async () => {

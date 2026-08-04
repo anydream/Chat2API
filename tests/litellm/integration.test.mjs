@@ -33,6 +33,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   const config = fs.readFileSync('deploy/litellm/config.yaml', 'utf8')
   const compose = fs.readFileSync('docker-compose.litellm.yml', 'utf8')
   const dockerfile = fs.readFileSync('deploy/litellm/Dockerfile', 'utf8')
+  const docs = fs.readFileSync('docs/litellm.md', 'utf8')
   const patcher = fs.readFileSync(
     'deploy/litellm/apply-anthropic-midstream-error-patch.py',
     'utf8',
@@ -47,6 +48,8 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(config, /allowed_openai_params:\s*\[["']reasoning_effort["']\]/)
   assert.match(config, /model_info:\s*\r?\n(?:\s*#.*\r?\n)*\s+supports_native_streaming:\s*true\b/)
   assert.doesNotMatch(config, /api\.anthropic\.com|claude-[\w-]+/i)
+  assert.match(docs, /"CLAUDE_ENABLE_STREAM_WATCHDOG": "false"/)
+  assert.match(docs, /independent of `API_FORCE_IDLE_TIMEOUT`/)
 
   assert.doesNotMatch(config, /CHAT2API_CONNECTIVITY_MODEL/)
   assert.doesNotMatch(compose, /CHAT2API_CONNECTIVITY_MODEL/)
@@ -99,6 +102,8 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /ANTHROPIC_ADAPTER_MODULE_PATH/)
   assert.match(patcher, /tool_result_error_by_id/)
   assert.match(patcher, /\["is_error"\] = tool_result_error_by_id/)
+  assert.match(patcher, /ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH/)
+  assert.match(patcher, /tool_result_item\["is_error"\] = is_error/)
   assert.match(patcher, /TOKEN_COUNTER_MODULE_PATH/)
   assert.match(patcher, /PROXY_SERVER_MODULE_PATH/)
   assert.match(patcher, /ANTHROPIC_ENDPOINTS_MODULE_PATH/)
@@ -1510,6 +1515,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.ok(functionOutput, JSON.stringify(ingressInput))
     assert.equal(functionOutput.call_id, toolUseId)
     assert.equal(functionOutput.output, 'Sunny, 25 C')
+    assert.equal(functionOutput.is_error, true)
 
     const call = mock.calls.at(-1)
     const assistantMessage = call.body.messages.find((message) =>
@@ -1528,7 +1534,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.ok(toolMessage, JSON.stringify(call.body.messages))
     assert.equal(toolMessage.tool_call_id, toolUseId)
     assert.equal(toolMessage.content, 'Sunny, 25 C')
-    assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
+    assert.equal(toolMessage.is_error, true)
   })
 
   await t.test('preserves tool_result call IDs and contents through Responses', async () => {
@@ -1581,13 +1587,22 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       ))
       assert.ok(functionOutput, JSON.stringify(ingressCalls[0].body.input))
       assert.equal(functionOutput.output, expectedOutput)
+      if (isError === undefined) {
+        assert.equal(Object.prototype.hasOwnProperty.call(functionOutput, 'is_error'), false)
+      } else {
+        assert.equal(functionOutput.is_error, isError)
+      }
 
       const toolMessage = mock.calls.at(-1)?.body?.messages?.find((message) =>
         message.role === 'tool' && message.tool_call_id === toolUseId
       )
       assert.ok(toolMessage, JSON.stringify(mock.calls.at(-1)?.body?.messages))
       assert.equal(toolMessage.content, expectedOutput)
-      assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
+      if (isError === undefined) {
+        assert.equal(Object.prototype.hasOwnProperty.call(toolMessage, 'is_error'), false)
+      } else {
+        assert.equal(toolMessage.is_error, isError)
+      }
     }
   })
 

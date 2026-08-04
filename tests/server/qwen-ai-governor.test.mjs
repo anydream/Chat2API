@@ -82,7 +82,7 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
   return module.exports.QwenAiRequestGovernor
 }
 
-function loadLoadBalancerForRuntimeTest() {
+function loadLoadBalancerForRuntimeTest(storeOverrides = {}) {
   const source = fs.readFileSync('src/main/proxy/loadbalancer.ts', 'utf8')
   const output = ts.transpileModule(source, {
     compilerOptions: {
@@ -91,10 +91,14 @@ function loadLoadBalancerForRuntimeTest() {
     },
   }).outputText
   const module = { exports: {} }
+  const storeManager = { ...storeOverrides }
   const testRequire = specifier => {
-    if (specifier === '../store/store') return { storeManager: {} }
+    if (specifier === '../store/store') return { storeManager }
     if (specifier === './adapters/providerModelOptions') {
       return { normalizeProviderModelForMatch: value => value }
+    }
+    if (specifier === './adapters/qwen-ai-token-refresh') {
+      return { hasQwenAiSessionCookie: cookies => /(?:^|;\s*)token=[^;]+/.test(cookies || '') }
     }
     if (specifier === './qwenAiRequestGovernor') {
       return { qwenAiRequestGovernor: { isAccountImmediatelyAvailable: () => true } }
@@ -117,7 +121,7 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
 
   assert.match(forwarderSource, /qwenAiRequestGovernor/)
   assert.match(forwarderSource, /qwenAiRequestGovernor\.run\(account\.id/)
-  assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context\)/)
+  assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context, \{[\s\S]*requestTimeoutMs: options\.qwenAiRequestTimeoutMs/)
   assert.match(forwarderSource, /signal: context\.signal/)
   assert.match(forwarderSource, /CHAT2API_QWEN_AI_RETRY_COUNT/)
   assert.match(forwarderSource, /QwenAiAdapter\.isQwenAiProvider\(provider\)[\s\S]*qwenAiRetryCountFromEnv\(recoverManagedToolStream\)/)
@@ -793,7 +797,7 @@ test('Qwen AI capacity 429s do not open the global risk circuit', async () => {
   assert.equal(status.recentRiskAccounts, 0)
 })
 
-test('three distinct Qwen AI risk-control 403s open the global circuit', async () => {
+test('a global risk circuit admits one healthy half-open probe and closes on success', async () => {
   const Governor = loadGovernorForRuntimeTest(1_000, {
     maxConcurrent: 1,
     globalMinIntervalMs: 0,
@@ -835,14 +839,70 @@ test('three distinct Qwen AI risk-control 403s open the global circuit', async (
   })
   const status = governor.getStatus(accounts, providers)
 
-  assert.equal(fourthRequestStarted, false)
-  assert.equal(fourthResult.status, 429)
-  assert.equal(fourthResult.errorCode, 'qwen_ai_global_risk_circuit')
-  assert.equal(fourthResult.accountFault, false)
-  assert.equal(fourthResult.retryScope, undefined)
-  assert.ok(status.globalCooldownInMs > 0)
+  assert.equal(fourthRequestStarted, true)
+  assert.equal(fourthResult.success, true)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.globalRecoveryProbeActive, false)
   assert.equal(status.recentRiskEvents, 3)
   assert.equal(status.recentRiskAccounts, 3)
+})
+
+test('a failed half-open probe keeps the exhausted-pool circuit open and blocks the next request', async () => {
+  const accounts = ['account-1', 'account-2', 'account-3', 'account-4', 'account-5'].map(id => ({
+    id,
+    name: id,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 5_000,
+    maxGlobalRiskCooldownMs: 5_000,
+    riskWindowMs: 5_000,
+    globalRiskThreshold: 3,
+  }, { accounts, providers })
+  const governor = new Governor()
+  const risk = {
+    success: false,
+    status: 403,
+    error: 'FAIL_SYS_USER_VALIDATE challenge required',
+    errorCode: 'qwen_ai_risk_control',
+    retryable: false,
+    accountFault: true,
+    retryScope: 'next-account',
+  }
+
+  for (const account of accounts) {
+    const result = await governor.run(account.id, async () => ({ ...risk }))
+    assert.equal(result.errorCode, 'qwen_ai_risk_control')
+  }
+
+  await new Promise(resolve => setTimeout(resolve, 30))
+  let probeStarted = false
+  const probeResult = await governor.run('account-1', async () => {
+    probeStarted = true
+    return { ...risk }
+  })
+  let nextRequestStarted = false
+  const nextResult = await governor.run('account-2', async () => {
+    nextRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(probeStarted, true)
+  assert.equal(probeResult.errorCode, 'qwen_ai_risk_control')
+  assert.equal(nextRequestStarted, false)
+  assert.equal(nextResult.status, 429)
+  assert.equal(nextResult.errorCode, 'qwen_ai_global_risk_circuit')
+  assert.equal(status.globalRecoveryProbeActive, false)
+  assert.ok(status.globalRecoveryNextInMs > 0)
+  assert.ok(status.globalCooldownInMs > 0)
 })
 
 test('a large Qwen account pool keeps healthy accounts available after isolated risks', async () => {
@@ -896,6 +956,56 @@ test('a large Qwen account pool keeps healthy accounts available after isolated 
   assert.equal(status.globalCooldownInMs, 0)
   assert.equal(status.recentRiskAccounts, 3)
   assert.equal(status.effectiveConfig.healthyAccountCount, 96)
+})
+
+test('a large Qwen pool stays open for healthy accounts after risk reaches ten percent', async () => {
+  const accounts = Array.from({ length: 99 }, (_, index) => ({
+    id: `account-${index + 1}`,
+    name: `Account ${index + 1}`,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 5_000,
+    maxGlobalRiskCooldownMs: 5_000,
+    riskWindowMs: 5_000,
+    globalRiskThreshold: 3,
+  }, { accounts, providers })
+  const governor = new Governor()
+
+  for (const account of accounts.slice(0, 10)) {
+    await governor.run(account.id, async () => ({
+      success: false,
+      status: 403,
+      error: 'FAIL_SYS_USER_VALIDATE challenge required',
+      errorCode: 'qwen_ai_risk_control',
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    }))
+  }
+
+  const beforeHealthyRequest = governor.getStatus(accounts, providers)
+  assert.equal(beforeHealthyRequest.globalCooldownInMs, 0)
+
+  let healthyRequestStarted = false
+  const healthyResult = await governor.run('account-11', async () => {
+    healthyRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(healthyRequestStarted, true)
+  assert.equal(healthyResult.success, true)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.recentRiskAccounts, 10)
+  assert.equal(status.effectiveConfig.healthyAccountCount, 89)
 })
 
 test('Qwen AI global risk circuit is account-neutral and never requests account failover', async () => {
@@ -1106,6 +1216,136 @@ test('Qwen AI cancellation and timeout paths are not retried or logged as succes
 
   const geminiRouteSource = fs.readFileSync('src/main/proxy/routes/gemini.ts', 'utf8')
   assert.match(geminiRouteSource, /ctx\.res\.once\('close',[\s\S]*!ctx\.res\.writableEnded/)
+})
+
+test('Qwen AI load balancing prefers a complete web session over an incomplete imported session', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const incomplete = {
+    id: 'account-incomplete',
+    name: 'Incomplete',
+    providerId: provider.id,
+    status: 'active',
+    credentials: {
+      token: 'jwt-value',
+      cookies: 'cnaui=auxiliary; x-ap=value',
+    },
+  }
+  const complete = {
+    id: 'account-complete',
+    name: 'Complete',
+    providerId: provider.id,
+    status: 'active',
+    credentials: {
+      token: 'jwt-value',
+      cookies: 'cnaui=auxiliary; token=session-value; x-ap=value',
+    },
+  }
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => [incomplete, complete],
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+  const loadBalancer = new LoadBalancer()
+
+  const selected = loadBalancer.selectAccount('Qwen3.8-Max-Preview')
+
+  assert.equal(selected.account.id, complete.id)
+})
+
+test('Qwen AI load balancing can still repair an incomplete session when no ready session exists', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const incomplete = {
+    id: 'account-incomplete',
+    name: 'Incomplete',
+    providerId: provider.id,
+    status: 'active',
+    credentials: {
+      token: 'jwt-value',
+      cookies: 'cnaui=auxiliary; x-ap=value',
+    },
+  }
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => [incomplete],
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+  const loadBalancer = new LoadBalancer()
+
+  const selected = loadBalancer.selectAccount('Qwen3.8-Max-Preview')
+
+  assert.equal(selected.account.id, incomplete.id)
+})
+
+test('Qwen AI complete-session failover never falls through to an incomplete session', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const accounts = [
+    {
+      id: 'account-complete-1',
+      name: 'Complete 1',
+      providerId: provider.id,
+      status: 'active',
+      credentials: { token: 'jwt-value', cookies: 'token=session-1; x-ap=value' },
+    },
+    {
+      id: 'account-complete-2',
+      name: 'Complete 2',
+      providerId: provider.id,
+      status: 'active',
+      credentials: { token: 'jwt-value', cookies: 'token=session-2; x-ap=value' },
+    },
+    {
+      id: 'account-incomplete',
+      name: 'Incomplete',
+      providerId: provider.id,
+      status: 'active',
+      credentials: { token: 'jwt-value', cookies: 'cnaui=auxiliary; x-ap=value' },
+    },
+  ]
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => accounts,
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+  const loadBalancer = new LoadBalancer()
+  const constraints = { qwenAiWebSessionTier: 'complete' }
+
+  const secondReady = loadBalancer.selectAccount(
+    'Qwen3.8-Max-Preview',
+    'fill-first',
+    provider.id,
+    undefined,
+    new Set(['account-complete-1']),
+    constraints,
+  )
+  const exhausted = loadBalancer.selectAccount(
+    'Qwen3.8-Max-Preview',
+    'fill-first',
+    provider.id,
+    undefined,
+    new Set(['account-complete-1', 'account-complete-2']),
+    constraints,
+  )
+
+  assert.equal(secondReady.account.id, 'account-complete-2')
+  assert.equal(exhausted, null)
 })
 
 test('Qwen AI production logs avoid dumping full prompts by default', () => {

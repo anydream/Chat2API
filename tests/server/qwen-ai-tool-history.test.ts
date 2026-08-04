@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
-import { prepareQwenAiMultimodalMessage } from '../../src/main/proxy/adapters/qwen-ai-files.ts'
+import {
+  prepareQwenAiMultimodalMessage,
+  QwenAiFileUploader,
+} from '../../src/main/proxy/adapters/qwen-ai-files.ts'
 
 function assistantToolCall(id: string, name: string, round: number) {
   return {
@@ -402,4 +408,110 @@ test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn',
   assert.ok(invokePosition >= 0)
   assert.ok(resultPosition > invokePosition)
   assert.match(prepared.content, /Tool execution failed \(is_error=true\)/)
+})
+
+test('Qwen AI document transport uploads the complete converted transcript and keeps original attachments', async () => {
+  const longHistory = `long-history-start:${'x'.repeat(160_000)}:long-history-end`
+  const originalAttachmentUrl = 'data:text/plain;base64,b3JpZ2luYWwtYXR0YWNobWVudA=='
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'SYSTEM_SENTINEL\nTOOL_SCHEMA_SENTINEL: declared_dynamic_tool(input: string)',
+    },
+    { role: 'user' as const, content: longHistory },
+    assistantToolCall('document-call', 'declared_dynamic_tool', 7),
+    {
+      role: 'tool' as const,
+      tool_call_id: 'document-call',
+      content: 'TOOL_RESULT_SENTINEL',
+    },
+    {
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: 'FINAL_PENDING_TASK_SENTINEL' },
+        {
+          type: 'file' as const,
+          filename: 'original.txt',
+          mime_type: 'text/plain',
+          file_url: { url: originalAttachmentUrl },
+        },
+      ],
+    },
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: Array<{
+    part: any
+    evidenceQueryText: string
+    options: { includeEvidence?: boolean }
+  }> = []
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any, evidenceQueryText: string, options: { includeEvidence?: boolean }) => {
+      uploads.push({ part, evidenceQueryText, options })
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, { transport: 'document' })
+
+  assert.equal(uploads.length, 2, 'the original attachment and generated transcript must both be uploaded')
+  assert.equal(uploads[0].part.file_url.url, originalAttachmentUrl)
+  assert.match(uploads[1].part.filename, /^chat2api-conversation-[a-f0-9]{16}\.txt$/)
+  assert.ok(uploads.every(upload => upload.options.includeEvidence === false))
+  assert.ok(uploads.every(upload => upload.evidenceQueryText === prepared.content))
+
+  const transcriptUrl = uploads[1].part.file_url.url as string
+  const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
+  assert.match(transcript, /SYSTEM_SENTINEL/)
+  assert.match(transcript, /TOOL_SCHEMA_SENTINEL/)
+  assert.ok(transcript.includes(longHistory), 'the large history must be byte-for-byte present')
+  assert.match(transcript, /name="declared_dynamic_tool"/)
+  assert.match(transcript, /TOOL_RESULT_SENTINEL/)
+  assert.match(transcript, /FINAL_PENDING_TASK_SENTINEL/)
+  assert.doesNotMatch(transcript, /Earlier conversation omitted|\[\.\.\. truncated \.\.\.\]/)
+
+  assert.ok(prepared.content.length < 700, 'the inline prompt must remain a short attachment instruction')
+  assert.match(prepared.content, /complete conversation transcript is attached/i)
+  assert.doesNotMatch(prepared.content, /long-history-start|TOOL_RESULT_SENTINEL/)
+  assert.equal(prepared.files.length, 2)
+  assert.deepEqual(messages, snapshot, 'document transport must not mutate caller messages')
+})
+
+test('Qwen AI content-hash cache reuses an in-memory transcript upload for the same account', async () => {
+  const temporaryDataDir = mkdtempSync(join(tmpdir(), 'chat2api-qwen-cache-'))
+  const previousDataDir = process.env.CHAT2API_DATA_DIR
+  process.env.CHAT2API_DATA_DIR = temporaryDataDir
+
+  try {
+    const uploader = new QwenAiFileUploader(
+      {} as any,
+      () => ({}),
+      undefined,
+      { providerId: 'qwen-ai-cache-test', accountId: 'account-cache-test' },
+    )
+    let physicalUploads = 0
+    ;(uploader as any).uploadResolvedFile = async (file: any) => {
+      physicalUploads += 1
+      return {
+        id: `physical-upload-${physicalUploads}`,
+        name: file.filename,
+        file: { id: `physical-upload-${physicalUploads}` },
+      }
+    }
+    const data = Buffer.from('stable complete transcript bytes', 'utf8').toString('base64')
+    const part = {
+      type: 'file' as const,
+      filename: 'conversation.txt',
+      mime_type: 'text/plain',
+      file_url: { url: `data:text/plain;base64,${data}` },
+    }
+
+    const first = await uploader.uploadPart(part, '', { includeEvidence: false })
+    const second = await uploader.uploadPart(part, '', { includeEvidence: false })
+
+    assert.equal(physicalUploads, 1)
+    assert.equal(first.file.file.id, second.file.file.id)
+    assert.notEqual(first.file.itemId, second.file.itemId)
+  } finally {
+    if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
+    else process.env.CHAT2API_DATA_DIR = previousDataDir
+    rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
 })

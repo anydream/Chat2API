@@ -403,6 +403,7 @@ export function responsesInputToChatMessages(
         role: 'tool',
         tool_call_id: callId,
         content: output.text || (output.attachments.length > 0 ? 'Tool output attachment follows.' : ''),
+        ...(typeof item.is_error === 'boolean' ? { is_error: item.is_error } : {}),
       }]
       if (output.attachments.length > 0) {
         pendingAttachmentMessages = [

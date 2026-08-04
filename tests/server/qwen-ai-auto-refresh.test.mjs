@@ -120,17 +120,43 @@ test('Qwen AI token refresher persists signin Set-Cookie values for web sessions
   assert.match(refresherSource, /\.\.\.\(cookies \? \{ cookies \} : \{\}\)/)
 })
 
-test('Qwen AI keeps a fresh JWT without requiring a web session cookie', async () => {
+test('Qwen AI repairs an incomplete web session even when its JWT is fresh', async () => {
   let signInCalls = 0
   const { QwenAiTokenRefresher } = loadTokenRefreshModule({
     post: async () => {
       signInCalls += 1
-      throw new Error('signin should not run for a fresh JWT')
+      return {
+        status: 200,
+        data: { data: { token: 'refreshed-jwt' } },
+        headers: { 'set-cookie': ['token=session-cookie; Path=/; HttpOnly'] },
+      }
     },
   })
   const account = qwenAccount({
     token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
     cookies: 'cnaui=auxiliary-cookie; x-ap=auxiliary-value',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  const result = await new QwenAiTokenRefresher().refreshIfNeeded(account)
+
+  assert.equal(signInCalls, 1)
+  assert.equal(result.credentials.token, 'refreshed-jwt')
+  assert.equal(result.credentials.cookies, 'cnaui=auxiliary-cookie; x-ap=auxiliary-value; token=session-cookie')
+})
+
+test('Qwen AI keeps a fresh desktop JWT that has no web cookies', async () => {
+  let signInCalls = 0
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    post: async () => {
+      signInCalls += 1
+      throw new Error('signin should not run for a fresh desktop JWT')
+    },
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: '',
     email: 'fixture@example.test',
     password: 'fixture-password',
   })
@@ -255,6 +281,57 @@ test('Qwen AI refresh maps credential rejection to account failover metadata wit
     },
   )
   assert.deepEqual(calls, ['https://chat.qwen.ai/api/v2/auths/signin'])
+})
+
+test('Qwen AI refresh treats a successful HTTP response without a token as an account failure', async () => {
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    post: async () => ({
+      status: 200,
+      data: { data: { details: 'account is not registered' } },
+      headers: {},
+    }),
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: 'cnaui=auxiliary-cookie',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  await assert.rejects(
+    new QwenAiTokenRefresher().refreshIfNeeded(account),
+    error => error.status === 401
+      && error.code === 'qwen_ai_token_refresh_failed'
+      && error.retryable === false
+      && error.accountFault === true
+      && error.retryScope === 'next-account'
+      && /not registered/.test(error.message),
+  )
+})
+
+test('Qwen AI refresh treats a WAF challenge as account-neutral and stops account sweeping', async () => {
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    post: async () => ({
+      status: 403,
+      data: '<meta name="aliyun_waf_aa"> FAIL_SYS_USER_VALIDATE challenge',
+      headers: {},
+    }),
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: 'cnaui=auxiliary-cookie',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  await assert.rejects(
+    new QwenAiTokenRefresher().refreshIfNeeded(account),
+    error => error.status === 403
+      && error.code === 'qwen_ai_token_refresh_failed'
+      && error.retryable === false
+      && error.accountFault === false
+      && error.retryScope === undefined,
+  )
 })
 
 test('Qwen AI refresh distinguishes upstream failure and cancellation', async () => {

@@ -288,6 +288,13 @@ export interface ProxyContext {
   signal?: AbortSignal
   /** Internal request intent detected before provider forwarding. */
   requestIntent?: 'normal' | 'context_compaction'
+  /**
+   * The HTTP route already owns a keep-alive stream, so a managed Qwen branch
+   * can remain private until terminal validation and account failover finish.
+   */
+  deferManagedStreamCommit?: boolean
+  /** Forward only genuine Qwen reasoning while the managed answer stays private. */
+  onQwenAiProgressFrame?: (frame: string) => void
 }
 
 /**

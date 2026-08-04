@@ -58,7 +58,9 @@ services:
       # Both values are deployment controls; no request or session is special-cased.
       CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS: ${CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3}
       CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS: ${CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000}
-      CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-3}
+      # Blank/default follows genuine Qwen progress without imposing a turn
+      # count. Set a non-negative integer only for an explicit deployment cap.
+      CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS-}
       # One cumulative no-progress budget covers transport resumes and
       # workflow continuations; normal active generation is not counted.
       CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000}

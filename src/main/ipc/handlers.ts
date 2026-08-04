@@ -48,6 +48,7 @@ const clearChatsHandlers: Record<string, (provider: Provider, account: Account) 
 export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Promise<void> {
   try {
     await storeManager.initialize()
+    await storeManager.syncDynamicBuiltinProviderModels()
   } catch (error) {
     console.error('[IPC] Failed to initialize storage:', error)
     

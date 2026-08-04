@@ -193,7 +193,14 @@ function explicitCompactionMarker(
 
   const customPattern = readCustomPattern()
   if (customPattern?.test(text)) signals.push('custom_compaction_pattern')
-  return { matched: signals.length > 0, signals }
+
+  // Claude Code's ordinary system prompt describes context compaction as one
+  // of the client's capabilities. Keep that marker for diagnostics, but do
+  // not let documentation in a system prompt turn a normal tool-enabled turn
+  // into a compaction request. Protocol/metadata fields, an operator-supplied
+  // custom pattern, or the complete terminal instruction remain decisive.
+  const decisiveSignals = signals.filter(signal => signal !== 'system_compaction_marker')
+  return { matched: decisiveSignals.length > 0, signals }
 }
 
 function isShortContinuation(text: string): boolean {

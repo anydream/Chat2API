@@ -135,6 +135,11 @@ export class ChatCompletionsToResponsesStream extends Transform {
   private text = ''
   private textOutputIndex = -1
   private readonly textItemId: string
+  private reasoningStarted = false
+  private reasoningFinished = false
+  private reasoning = ''
+  private reasoningOutputIndex = -1
+  private readonly reasoningItemId: string
   private toolStates = new Map<string, ToolStreamState>()
   private images: ChatResponseImage[] = []
   private indexedOutputs: IndexedOutput[] = []
@@ -152,6 +157,7 @@ export class ChatCompletionsToResponsesStream extends Transform {
     this.onIncomplete = options.onIncomplete
     this.onFailure = options.onFailure
     this.textItemId = `msg_${responseIdSuffix(this.responseId)}`
+    this.reasoningItemId = `rs_${responseIdSuffix(this.responseId)}`
   }
 
   start(): this {
@@ -256,16 +262,22 @@ export class ChatCompletionsToResponsesStream extends Transform {
       }
       const delta = choice.delta ?? {}
 
+      if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) {
+        this.appendReasoning(delta.reasoning_content)
+      }
       if (typeof delta.content === 'string' && delta.content.length > 0) {
+        this.finishReasoning()
         this.appendText(delta.content)
       }
       if (Array.isArray(delta.tool_calls)) {
+        if (delta.tool_calls.length > 0) this.finishReasoning()
         delta.tool_calls.forEach((call: Record<string, any>, index: number) => {
           this.appendToolCall(call, index)
         })
       }
       const newImages = extractChatResponseImages(delta.images)
       if (newImages.length > 0) {
+        this.finishReasoning()
         const existingUrls = new Set(this.images.map((image) => this.imageUrl(image)))
         this.images = [
           ...this.images,
@@ -273,6 +285,68 @@ export class ChatCompletionsToResponsesStream extends Transform {
         ]
       }
     }
+  }
+
+  private ensureReasoningStarted(): void {
+    if (this.reasoningStarted || this.reasoningFinished) return
+    this.reasoningStarted = true
+    this.reasoningOutputIndex = this.nextOutputIndex
+    this.nextOutputIndex += 1
+    this.enqueueEvent('response.output_item.added', {
+      output_index: this.reasoningOutputIndex,
+      item: {
+        id: this.reasoningItemId,
+        type: 'reasoning',
+        status: 'in_progress',
+        summary: [],
+      },
+    })
+  }
+
+  private appendReasoning(delta: string): void {
+    if (this.reasoningFinished) return
+    this.ensureReasoningStarted()
+    this.reasoning += delta
+    this.enqueueEvent('response.reasoning_summary_text.delta', {
+      item_id: this.reasoningItemId,
+      output_index: this.reasoningOutputIndex,
+      summary_index: 0,
+      delta,
+    })
+  }
+
+  private finishReasoning(): void {
+    if (!this.reasoningStarted || this.reasoningFinished) return
+    this.reasoningFinished = true
+    const part = {
+      type: 'summary_text',
+      text: this.reasoning,
+    }
+    const item = {
+      id: this.reasoningItemId,
+      type: 'reasoning',
+      summary: [{ ...part }],
+    }
+    this.enqueueEvent('response.reasoning_summary_text.done', {
+      item_id: this.reasoningItemId,
+      output_index: this.reasoningOutputIndex,
+      summary_index: 0,
+      text: this.reasoning,
+    })
+    this.enqueueEvent('response.reasoning_summary_part.done', {
+      item_id: this.reasoningItemId,
+      output_index: this.reasoningOutputIndex,
+      summary_index: 0,
+      part,
+    })
+    this.enqueueEvent('response.output_item.done', {
+      output_index: this.reasoningOutputIndex,
+      item,
+    })
+    this.indexedOutputs = [
+      ...this.indexedOutputs,
+      { outputIndex: this.reasoningOutputIndex, item },
+    ]
   }
 
   private ensureTextStarted(): void {
@@ -540,9 +614,10 @@ export class ChatCompletionsToResponsesStream extends Transform {
         ? 'content_filter'
         : undefined
     const itemStatus = incompleteReason ? 'incomplete' : 'completed'
-    if (!this.textStarted && this.toolStates.size === 0 && this.images.length === 0) {
+    if (!this.textStarted && !this.reasoningStarted && this.toolStates.size === 0 && this.images.length === 0) {
       this.ensureTextStarted()
     }
+    this.finishReasoning()
     this.finishText(itemStatus)
     this.finishTools(itemStatus)
     try {

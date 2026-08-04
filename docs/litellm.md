@@ -125,7 +125,8 @@ For example, the user-level `~/.claude/settings.json` can contain:
     "ANTHROPIC_MODEL": "your-chat2api-model",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "your-chat2api-model",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "your-chat2api-model",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "your-chat2api-model"
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "your-chat2api-model",
+    "CLAUDE_ENABLE_STREAM_WATCHDOG": "false"
   },
   "permissions": {
     "defaultMode": "bypassPermissions"
@@ -138,6 +139,16 @@ For example, the user-level `~/.claude/settings.json` can contain:
 where a mid-stream failure could otherwise replay the same tool workflow as a
 non-streaming request. With this setting, the streaming error reaches Claude
 Code's retry layer instead.
+
+Claude Code 2.1.220 and later also have a semantic-event stream watchdog that
+is independent of `API_FORCE_IDLE_TIMEOUT`. Standard Anthropic `ping` events
+keep the byte transport alive but do not prevent that watchdog from expiring
+when a validated managed branch has not emitted model content. Set
+`CLAUDE_ENABLE_STREAM_WATCHDOG=false` for this bridge so Chat2API's Qwen
+meaningful-progress timeout owns provider liveness. Claude Code's byte-level
+watchdog remains enabled, and the bundled LiteLLM heartbeat keeps a healthy
+transport active. Restart existing Claude Code processes after changing this
+environment value.
 
 The `permissions` block is optional. `bypassPermissions` disables local tool
 approval checks, so use it only in directories whose contents and commands you
@@ -218,13 +229,15 @@ is known to be idempotent.
 The adapter covers regular messages, streaming SSE, Anthropic tool use, tool results, and token counting. Actual support for thinking, images, tools, and other model features still depends on the provider selected by Chat2API. When a provider such as Qwen returns generated-image URLs, Chat2API includes stable Markdown image links in the assistant text; those links survive the Responses-to-Anthropic conversion and are visible to Claude and Claude Code. Structured `image_generation_call` items are additional Responses metadata and should not be the only representation relied on by Anthropic clients.
 
 For Qwen AI managed-tool requests, atomic SSE validation is the default.
-Chat2API withholds the managed branch until terminal validation completes, and
-LiteLLM emits Anthropic ping events while the upstream response is quiet.
-Validation failures can then be retried before any bytes are committed. Set
+Chat2API immediately opens a protocol keep-alive stream, withholds the managed
+branch until terminal validation completes, and performs account failover in
+the background. Neither the keep-alive nor a failed account's partial branch
+becomes model content. Validation failures can then be retried before any model
+bytes are committed. Set
 `CHAT2API_QWEN_AI_RETRY_COUNT=0` to disable the opt-in recovery retry or use an
 integer from `1` to `10` to override its count.
-Set `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false` only when delayed first-byte
-delivery is less acceptable than losing transparent recovery after output.
+Set `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false` only to opt out of atomic
+managed-stream recovery.
 
 Before live forwarding, Chat2API waits for the first client-visible SSE frame
 or a terminal provider failure. This preserves a pre-output failure's HTTP
@@ -278,10 +291,12 @@ to `0` to disable recovery and return the original upstream failure.
 Chat2API forwards the complete rendered Qwen transcript without applying a
 proxy-side size limit or compacting messages, tool arguments, or tool results.
 For managed-tool semantic terminals, the proxy submits a generic continuation
-user turn in the same Qwen chat, parented to the latest response id. This path
-is bounded by `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` (default `3`),
-does not replay the original prompt or uploaded files, and can be disabled with
-`0`.
+user turn in the same Qwen chat, parented to the latest response id. The
+`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is blank, so genuine
+Qwen progress can continue past an arbitrary turn count while the shared
+no-progress budget still bounds stalled admission and empty retry loops. A
+positive integer imposes an explicit deployment cap; `0` disables this path.
+The continuation does not replay the original prompt or uploaded files.
 Qwen can briefly reject that continuation with HTTP 200 and
 `code=CHAT_IN_PROGRESS` while it finalizes the parent response. The proxy then
 retries the exact same continuation payload in the same chat with exponential

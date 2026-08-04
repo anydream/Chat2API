@@ -7,9 +7,15 @@ import { Account, Provider, LoadBalanceStrategy } from '../store/types'
 import { AccountSelection } from './types'
 import { storeManager } from '../store/store'
 import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
+import { hasQwenAiSessionCookie } from './adapters/qwen-ai-token-refresh'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 
 const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
+
+export interface AccountSelectionConstraints {
+  /** Keep one failover chain inside accounts with an established Qwen web session. */
+  qwenAiWebSessionTier?: 'complete'
+}
 
 type AccountFailureState = {
   count: number
@@ -151,6 +157,7 @@ export class LoadBalancer {
     preferredProviderId?: string,
     preferredAccountId?: string,
     excludedAccountIds: ReadonlySet<string> = new Set(),
+    constraints: AccountSelectionConstraints = {},
   ): AccountSelection | null {
     let candidates = this.getAvailableAccounts(
       model,
@@ -159,6 +166,10 @@ export class LoadBalancer {
       excludedAccountIds,
     )
 
+    if (constraints.qwenAiWebSessionTier === 'complete') {
+      candidates = candidates.filter(candidate => this.hasCompleteQwenAiWebSession(candidate))
+    }
+
     if (candidates.length === 0) {
       candidates = this.getAvailableAccounts(
         model,
@@ -166,6 +177,9 @@ export class LoadBalancer {
         false,
         excludedAccountIds,
       )
+      if (constraints.qwenAiWebSessionTier === 'complete') {
+        candidates = candidates.filter(candidate => this.hasCompleteQwenAiWebSession(candidate))
+      }
     }
 
     if (candidates.length === 0) {
@@ -183,6 +197,15 @@ export class LoadBalancer {
         )
       ) {
         return preferred
+      }
+    }
+
+    if (constraints.qwenAiWebSessionTier !== 'complete') {
+      const sessionReadyCandidates = candidates.filter(candidate => (
+        !this.hasIncompleteQwenAiWebSession(candidate)
+      ))
+      if (sessionReadyCandidates.length > 0) {
+        candidates = sessionReadyCandidates
       }
     }
 
@@ -309,6 +332,22 @@ export class LoadBalancer {
 
   private isQwenAiProvider(provider: Provider): boolean {
     return provider.id === 'qwen-ai' || provider.apiEndpoint.includes('chat.qwen.ai')
+  }
+
+  hasCompleteQwenAiWebSession(candidate: AccountSelection): boolean {
+    if (!this.isQwenAiProvider(candidate.provider)) return false
+
+    const credentials = candidate.account.credentials || {}
+    const cookies = String(credentials.cookies || credentials.cookie || '').trim()
+    return hasQwenAiSessionCookie(cookies)
+  }
+
+  private hasIncompleteQwenAiWebSession(candidate: AccountSelection): boolean {
+    if (!this.isQwenAiProvider(candidate.provider)) return false
+
+    const credentials = candidate.account.credentials || {}
+    const cookies = String(credentials.cookies || credentials.cookie || '').trim()
+    return Boolean(cookies && !hasQwenAiSessionCookie(cookies))
   }
 
   /**

@@ -29,9 +29,12 @@ import {
   QwenAiAdapter,
   QwenAiStreamHandler,
   findModelCapability as findQwenAiModelCapability,
+  isQwenAiUpstreamBusyMessage,
+  qwenAiRequestTimeoutMsFromEnv,
   type QwenAiOutputStream,
   createQwenAiResumableStream,
 } from './adapters/qwen-ai'
+import type { QwenAiMessageTransport } from './adapters/qwen-ai-files'
 import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
@@ -129,6 +132,21 @@ function retryAfterMsFromResult(result: ForwardResult): number | undefined {
   if (value === undefined) return undefined
   const seconds = Number(value)
   return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : undefined
+}
+
+function isQwenAiUpstreamBusyResult(result: ForwardResult): boolean {
+  return !result.success
+    && result.errorCode === 'qwen_ai_upstream_busy'
+    && result.accountFault === false
+}
+
+function qwenAiUpstreamBusyRetryDelayMs(
+  result: ForwardResult,
+  retryIndex: number,
+): number {
+  const retryAfterMs = retryAfterMsFromResult(result)
+  if (retryAfterMs !== undefined) return retryAfterMs
+  return Math.min(30_000, 1_000 * (2 ** Math.min(5, retryIndex)))
 }
 
 function errorCodeFromError(error: unknown): string | undefined {
@@ -445,7 +463,11 @@ function awaitQwenAiStreamPreflight(
 }
 
 function isQwenRiskControlText(value: string | undefined): boolean {
-  return Boolean(value && /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(value))
+  return Boolean(
+    value
+    && !isQwenAiUpstreamBusyMessage(value)
+    && /qwen_ai_risk_control|FAIL_SYS_USER_VALIDATE|RGV587|bxpunish|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(value),
+  )
 }
 
 function qwenAiRetryCountFromEnv(recoverManagedToolStream: boolean): number {
@@ -488,16 +510,24 @@ function validatedSseMaxHoldMsFromEnv(): number {
 }
 
 /**
- * Fully buffer managed branches, including reasoning. When disabled, the Qwen
- * handler still stages answer/tool candidates while forwarding reasoning live.
+ * Keep managed answers and tool arguments private for validation and account
+ * failover. Deferred routes may still forward genuine Qwen reasoning live.
  */
-function qwenAiBufferManagedStreamsFromEnv(): boolean {
+export function qwenAiBufferManagedStreamsFromEnv(): boolean {
   const raw = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
   return raw === undefined || /^(?:1|true|yes|on)$/i.test(raw.trim())
 }
 
 function requestUsesManagedTools(request: ChatCompletionRequest): boolean {
   return Boolean(request.tools?.length && request.tool_choice !== 'none')
+}
+
+export function shouldDeferQwenAiManagedStreamCommit(
+  request: ChatCompletionRequest,
+): boolean {
+  return request.stream === true
+    && requestUsesManagedTools(request)
+    && qwenAiBufferManagedStreamsFromEnv()
 }
 
 function qwenAiCompactionThinkingFromEnv(): boolean | undefined {
@@ -667,6 +697,10 @@ type QwenAiForwardOptions = {
   forceContextCompaction?: boolean
   /** Prevent an already planned internal request from being planned again. */
   skipCompactionPlanning?: boolean
+  /** Remaining time in the outer Qwen request budget. */
+  requestTimeoutMs?: number
+  /** Complete-message transport selected from an observed upstream response. */
+  messageTransport?: QwenAiMessageTransport
 }
 
 /**
@@ -740,6 +774,8 @@ type ProviderForwarder = {
 
 type ForwardAttemptOptions = {
   qwenAiRecoveryBypassAccountInterval?: boolean
+  qwenAiRequestTimeoutMs?: number
+  qwenAiMessageTransport?: QwenAiMessageTransport
   attempt?: number
 }
 
@@ -978,8 +1014,61 @@ export class RequestForwarder {
     let lastRetryScope: ForwardResult['retryScope']
     let previousRecoveryHint: ForwardResult['recoveryHint']
     let recoveryBypassUsed = false
+    const qwenAiRequestDeadline = isQwenAiProvider
+      ? startTime + qwenAiRequestTimeoutMsFromEnv()
+      : undefined
+    let attempt = 0
+    let standardRetriesUsed = 0
+    let qwenAiBusyRetries = 0
+    let nextRetryDelayMs = 0
+    let qwenAiMessageTransport: QwenAiMessageTransport = 'inline'
 
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const scheduleQwenAiBusyRetry = (result: ForwardResult): boolean => {
+      if (
+        !isQwenAiUpstreamBusyResult(result)
+        || qwenAiRequestDeadline === undefined
+      ) {
+        return false
+      }
+
+      const observedAt = Date.now()
+      const delayMs = qwenAiUpstreamBusyRetryDelayMs(result, qwenAiBusyRetries)
+      const remainingBudgetMs = Math.max(0, qwenAiRequestDeadline - observedAt)
+      const willRetry = !context.signal?.aborted
+        && observedAt + delayMs < qwenAiRequestDeadline
+      const nextMessageTransport: QwenAiMessageTransport = qwenAiMessageTransport === 'inline'
+        ? 'document'
+        : qwenAiMessageTransport
+      console.info('[QwenAI] upstream-busy response', JSON.stringify({
+        requestId: context.requestId,
+        accountId: account.id,
+        attempt: attempt + 1,
+        busyResponseCount: qwenAiBusyRetries + 1,
+        observedAt: new Date(observedAt).toISOString(),
+        status: result.status,
+        errorCode: result.errorCode,
+        elapsedMs: observedAt - startTime,
+        remainingBudgetMs,
+        retryDelayMs: willRetry ? delayMs : 0,
+        messageTransport: qwenAiMessageTransport,
+        nextMessageTransport: willRetry ? nextMessageTransport : undefined,
+        willRetry,
+        stopReason: context.signal?.aborted
+          ? 'client_aborted'
+          : willRetry
+            ? undefined
+            : 'request_budget_exhausted',
+      }))
+      if (!willRetry) return false
+
+      qwenAiBusyRetries += 1
+      qwenAiMessageTransport = nextMessageTransport
+      nextRetryDelayMs = delayMs
+      attempt += 1
+      return true
+    }
+
+    while (true) {
       if (context.signal?.aborted) {
         lastStatus = 499
         lastHeaders = undefined
@@ -991,13 +1080,19 @@ export class RequestForwarder {
 
       const useRecoveryBypass = attempt > 0
         && !recoveryBypassUsed
-        && previousRecoveryHint === 'managed_tool_stream_validation'
+        && (
+          previousRecoveryHint === 'managed_tool_stream_validation'
+          || (
+            qwenAiBusyRetries > 0
+            && qwenAiMessageTransport === 'document'
+          )
+        )
       if (useRecoveryBypass) {
         recoveryBypassUsed = true
       }
 
       if (attempt > 0) {
-        const delayCompleted = await this.delay(5000, context.signal)
+        const delayCompleted = await this.delay(nextRetryDelayMs, context.signal)
         if (!delayCompleted) {
           lastStatus = 499
           lastHeaders = undefined
@@ -1006,6 +1101,10 @@ export class RequestForwarder {
           lastAccountFault = undefined
           break
         }
+      }
+
+      if (qwenAiRequestDeadline !== undefined && Date.now() >= qwenAiRequestDeadline) {
+        break
       }
 
       let modifiedRequest = request
@@ -1068,6 +1167,10 @@ export class RequestForwarder {
           context,
           {
             qwenAiRecoveryBypassAccountInterval: useRecoveryBypass,
+            qwenAiRequestTimeoutMs: qwenAiRequestDeadline === undefined
+              ? undefined
+              : Math.max(1, qwenAiRequestDeadline - Date.now()),
+            qwenAiMessageTransport,
             attempt: attempt + 1,
           },
         )
@@ -1096,6 +1199,10 @@ export class RequestForwarder {
           }
         }
 
+        if (scheduleQwenAiBusyRetry(result)) {
+          continue
+        }
+
         const canRecoverManagedToolStream = recoverManagedToolStream
           && result.status === 502
           && result.recoveryHint === 'managed_tool_stream_validation'
@@ -1119,6 +1226,11 @@ export class RequestForwarder {
         if (result.status && result.status < 500 && result.status !== 429) {
           break
         }
+
+        if (standardRetriesUsed >= maxRetries) break
+        standardRetriesUsed += 1
+        nextRetryDelayMs = 5000
+        attempt += 1
       } catch (error) {
         lastError = error instanceof Error ? error.message : 'Unknown error'
         lastStatus = statusFromError(error)
@@ -1147,6 +1259,18 @@ export class RequestForwarder {
             lastErrorCode = undefined
           }
         }
+        if (scheduleQwenAiBusyRetry({
+          success: false,
+          status: lastStatus,
+          headers: lastHeaders,
+          error: lastError,
+          retryable: lastRetryable,
+          errorCode: lastErrorCode,
+          accountFault: lastAccountFault,
+          retryScope: lastRetryScope,
+        })) {
+          continue
+        }
         if (
           lastRetryable === false
           || context.signal?.aborted
@@ -1155,6 +1279,11 @@ export class RequestForwarder {
         ) {
           break
         }
+
+        if (standardRetriesUsed >= maxRetries) break
+        standardRetriesUsed += 1
+        nextRetryDelayMs = 5000
+        attempt += 1
       }
     }
 
@@ -1732,6 +1861,10 @@ export class RequestForwarder {
           context,
           plan,
           capability,
+          {
+            requestTimeoutMs: options.qwenAiRequestTimeoutMs,
+            messageTransport: options.qwenAiMessageTransport,
+          },
         )
       }
     }
@@ -1741,7 +1874,10 @@ export class RequestForwarder {
       : 'normal'
 
     const runGoverned = () => qwenAiRequestGovernor.run(account.id,
-      () => this.forwardQwenAi(request, account, provider, actualModel, startTime, context),
+      () => this.forwardQwenAi(request, account, provider, actualModel, startTime, context, {
+        requestTimeoutMs: options.qwenAiRequestTimeoutMs,
+        messageTransport: options.qwenAiMessageTransport,
+      }),
       {
         signal: context.signal,
         // Ordinary client traffic may use the shared FIFO queue. Internal
@@ -1786,6 +1922,7 @@ export class RequestForwarder {
     context: ProxyContext | undefined,
     plan: ReturnType<typeof planQwenAiCompactionChunks>,
     capability?: ReturnType<typeof findQwenAiModelCapability>,
+    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'messageTransport'> = {},
   ): Promise<ForwardResult> {
     const result = await this.executeQwenAiCompactionInChunks(
       request,
@@ -1796,6 +1933,7 @@ export class RequestForwarder {
       context,
       plan,
       capability,
+      options,
     )
     if (!result.success || request.stream !== true) return result
     if (!result.stream) {
@@ -1826,6 +1964,7 @@ export class RequestForwarder {
     context: ProxyContext | undefined,
     plan: ReturnType<typeof planQwenAiCompactionChunks>,
     capability?: ReturnType<typeof findQwenAiModelCapability>,
+    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'messageTransport'> = {},
   ): Promise<ForwardResult> {
     const elapsed = () => Date.now() - startTime
     const failure = (
@@ -2082,6 +2221,8 @@ export class RequestForwarder {
                   preparedRequest: summaryRequest,
                   forceContextCompaction: true,
                   skipCompactionPlanning: true,
+                  requestTimeoutMs: options.requestTimeoutMs,
+                  messageTransport: options.messageTransport,
                 },
               ),
               {
@@ -2653,6 +2794,10 @@ export class RequestForwarder {
         context,
         plan,
         capability,
+        {
+          requestTimeoutMs: options.requestTimeoutMs,
+          messageTransport: options.messageTransport,
+        },
       )
     }
     const providerRequest = options.preparedRequest
@@ -2693,6 +2838,7 @@ export class RequestForwarder {
       }
       const createChatCompletionRequest = (messages: ChatCompletionRequest['messages']) => ({
         model: actualModel,
+        requestId: context?.requestId,
         originalModel: providerRequest.model,
         messages: messages as any,
         stream: providerRequest.stream,
@@ -2705,6 +2851,8 @@ export class RequestForwarder {
         thinking_budget: providerRequest.thinking_budget,
         image_generation: providerRequest.image_generation,
         signal: context?.signal,
+        timeoutMs: options.requestTimeoutMs,
+        messageTransport: options.messageTransport,
       })
       const { response, chatId, parentId } = await adapter.chatCompletion(
         createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
@@ -2741,18 +2889,6 @@ export class RequestForwarder {
         && transformed.plan.allowedToolNames?.size
         && typeof (adapter as any).continueChatCompletion === 'function',
       )
-      const workflowContinuationMessage = canContinueManagedWorkflow
-        ? createToolWorkflowContinuationMessage({
-            failedToolResultPending: transformed.plan.failedToolResultPending,
-            requireManagedToolCall: true,
-            plan: transformed.plan,
-          })
-        : undefined
-      const workflowContinuationContent = typeof workflowContinuationMessage?.content === 'string'
-        ? workflowContinuationMessage.content
-        : workflowContinuationMessage
-          ? JSON.stringify(workflowContinuationMessage.content)
-          : ''
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
         getResponseId: () => handler.getResponseId(),
@@ -2773,24 +2909,38 @@ export class RequestForwarder {
                 const currentChatId = activeChatId || chatId
 
                 const recoveryCode = errorCodeFromError(recoveryError)
+                const requireManagedToolCall = transformed.plan.failedToolResultPending
+                  || transformed.plan.toolChoiceMode === 'required'
+                  || transformed.plan.toolChoiceMode === 'forced'
+                  || recoveryCode === 'qwen_ai_invalid_tool_arguments'
+                  || recoveryCode === 'undeclared_native_tool_call'
+                  || recoveryCode === 'malformed_tool_call'
+                const workflowContinuationMessage = createToolWorkflowContinuationMessage({
+                  failedToolResultPending: transformed.plan.failedToolResultPending,
+                  requireManagedToolCall,
+                  plan: transformed.plan,
+                })
+                const workflowContinuationContent = typeof workflowContinuationMessage.content === 'string'
+                  ? workflowContinuationMessage.content
+                  : JSON.stringify(workflowContinuationMessage.content)
                 const restartFromFreshChat = recoveryCode === 'undeclared_native_tool_call'
                   || (
                     (recoveryCode === 'qwen_ai_semantic_incomplete'
                       || recoveryCode === 'qwen_ai_semantic_empty')
-                    && transformed.plan.workflowContinuation
                     && !transformed.plan.failedToolResultPending
                   )
 
                 // A semantically completed Qwen branch can remain busy even
                 // after its response became unusable. Replay the complete,
                 // dynamically transformed history in a fresh temporary chat
-                // and append one schema-derived recovery turn. This keeps the
-                // active task and declared tool contract intact without
-                // relying on a provider-specific chat continuation endpoint.
+                // and append a recovery turn derived from the current tool
+                // policy. This keeps the active task and declared tool
+                // contract intact without relying on a provider-specific chat
+                // continuation endpoint.
                 if (restartFromFreshChat) {
                   // workflowContinuation is set only when the tool engine
                   // appended its own trailing user turn. The recovery prompt
-                  // below can be stricter than that original turn, so use the
+                  // below can differ from that original turn, so use the
                   // structural plan state instead of comparing prompt text.
                   const replayMessages = transformed.plan.workflowContinuation
                     ? transformed.messages.slice(0, -1)
@@ -2841,6 +2991,7 @@ export class RequestForwarder {
         let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
           bufferManagedBranch: bufferManagedStream,
+          onProgressFrame: context?.onQwenAiProgressFrame,
           onFailure: () => cleanupChat(activeChatId || chatId),
           recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
           recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
@@ -2855,9 +3006,12 @@ export class RequestForwarder {
         await awaitQwenAiStreamPreflight(transformedStream, context?.signal)
 
         if (bufferManagedStream) {
+          const validationHoldMs = context?.deferManagedStreamCommit
+            ? undefined
+            : validatedSseMaxHoldMsFromEnv()
           transformedStream = await bufferValidatedSseStream(transformedStream, {
             maxBytes: qwenAiValidatedStreamMaxBytesFromEnv(),
-            maxHoldMs: validatedSseMaxHoldMsFromEnv(),
+            ...(validationHoldMs === undefined ? {} : { maxHoldMs: validationHoldMs }),
             signal: context?.signal,
             forwardEvents: [QWEN_AI_STREAM_FAILURE_EVENT],
             forwardProperties: ['qwenAiFailure'],

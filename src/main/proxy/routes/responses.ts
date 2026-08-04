@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto'
-import type { Readable } from 'node:stream'
+import { PassThrough, type Readable } from 'node:stream'
 import Router from '@koa/router'
 import type { Context } from 'koa'
-import { requestForwarder } from '../forwarder'
+import {
+  requestForwarder,
+  shouldDeferQwenAiManagedStreamCommit,
+} from '../forwarder'
 import { loadBalancer } from '../loadbalancer'
 import { forwardWithAccountFailover, resolveAccountFailoverLimit } from '../accountFailover'
+import { createDeferredQwenAiFailoverStream } from '../qwenAiDeferredStream'
 import { qwenAiRequestGovernor } from '../qwenAiRequestGovernor'
 import {
   QwenAiAdapter,
@@ -17,6 +21,7 @@ import { streamHandler } from '../stream'
 import type { AccountSelection, ChatMessage, ProxyContext } from '../types'
 import { storeManager } from '../../store/store'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
+import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 import {
   chatCompletionToResponse,
   responseOutputToChatMessages,
@@ -124,6 +129,26 @@ router.post('/responses', async (ctx: Context) => {
   const abort = createClientAbortController(ctx)
   const request = ctx.request.body as ResponseCreateRequest
 
+  const responseInputItems = Array.isArray(request?.input) ? request.input : []
+  const toolResultItems = responseInputItems.filter((item): item is Record<string, any> => (
+    Boolean(item)
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && (
+      (item as Record<string, any>).type === 'function_call_output'
+      || (item as Record<string, any>).type === 'custom_tool_call_output'
+    )
+  ))
+  if (toolResultItems.length > 0) {
+    console.info('[Responses] tool-result ingress', JSON.stringify({
+      requestId: responseId,
+      toolResultCount: toolResultItems.length,
+      isErrorTrueCount: toolResultItems.filter(item => item.is_error === true).length,
+      isErrorFalseCount: toolResultItems.filter(item => item.is_error === false).length,
+      isErrorMissingCount: toolResultItems.filter(item => typeof item.is_error !== 'boolean').length,
+    }))
+  }
+
   let previousMessages: ChatMessage[] = []
   if (typeof request?.previous_response_id === 'string' && request.previous_response_id) {
     const stored = responsesConversationStore.get(request.previous_response_id)
@@ -156,6 +181,16 @@ router.post('/responses', async (ctx: Context) => {
   const chatRequest = {
     ...translated.chatRequest,
     signal: abort.controller.signal,
+  }
+  const translatedToolResults = chatRequest.messages.filter(message => message.role === 'tool')
+  if (translatedToolResults.length > 0) {
+    console.info('[Responses] tool-result translated', JSON.stringify({
+      requestId: responseId,
+      toolResultCount: translatedToolResults.length,
+      isErrorTrueCount: translatedToolResults.filter(message => message.is_error === true).length,
+      isErrorFalseCount: translatedToolResults.filter(message => message.is_error === false).length,
+      isErrorMissingCount: translatedToolResults.filter(message => typeof message.is_error !== 'boolean').length,
+    }))
   }
   const requestIntent = classifyChatRequest(chatRequest)
   console.info('[Responses] request-intent', JSON.stringify({
@@ -190,7 +225,11 @@ router.post('/responses', async (ctx: Context) => {
     return
   }
 
-  const createProxyContext = (selection: AccountSelection): ProxyContext => ({
+  const createProxyContext = (
+    selection: AccountSelection,
+    deferManagedStreamCommit = false,
+    onQwenAiProgressFrame?: (frame: string) => void,
+  ): ProxyContext => ({
     requestId: responseId,
     providerId: selection.provider.id,
     accountId: selection.account.id,
@@ -201,12 +240,18 @@ router.post('/responses', async (ctx: Context) => {
     clientIP: clientIp(ctx),
     signal: abort.controller.signal,
     requestIntent: requestIntent.intent,
+    ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
+    ...(onQwenAiProgressFrame ? { onQwenAiProgressFrame } : {}),
   })
   let { account, provider, actualModel } = initialSelection
   let qwenAiStream: QwenAiOutputStream | undefined
   proxyStatusManager.recordRequestStart(chatRequest.model, provider.id, account.id)
 
   const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
+  const failoverSelectionConstraints = initialProviderIsQwenAi
+    && loadBalancer.hasCompleteQwenAiWebSession(initialSelection)
+    ? { qwenAiWebSessionTier: 'complete' as const }
+    : undefined
   const activeAccountCount = initialProviderIsQwenAi
     ? storeManager.getAccountsByProviderId(initialSelection.provider.id)
       .filter(candidate => candidate.status === 'active')
@@ -218,6 +263,12 @@ router.post('/responses', async (ctx: Context) => {
     activeAccountCount,
     qwenAiMaxAccountFailovers: process.env.CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS,
   })
+  const deferManagedStreamCommit = initialProviderIsQwenAi
+    && shouldDeferQwenAiManagedStreamCommit(chatRequest)
+  const qwenAiProgressStream = deferManagedStreamCommit ? new PassThrough() : undefined
+  const onQwenAiProgressFrame = qwenAiProgressStream
+    ? (frame: string) => { qwenAiProgressStream.write(frame) }
+    : undefined
 
   const applyEffectiveSelection = (
     effectiveAccountId?: string,
@@ -250,11 +301,33 @@ router.post('/responses', async (ctx: Context) => {
     )
   }
 
+  let responsesChunkCount = 0
+  let lastResponsesChunkAt = 0
+  let clientChunkCount = 0
+  let lastClientChunkAt = 0
+  let streamDeliveryLogged = false
+  const logStreamDelivery = (outcome: 'completed' | 'failed', status: number, error?: Error) => {
+    if (streamDeliveryLogged || chatRequest.stream !== true) return
+    streamDeliveryLogged = true
+    console.info('[Responses] stream-delivery', JSON.stringify({
+      requestId: responseId,
+      outcome,
+      status,
+      errorCode: streamFailureCode(error),
+      elapsedMs: Date.now() - startedAt,
+      responsesChunkCount,
+      lastResponsesChunkAt,
+      clientChunkCount,
+      lastClientChunkAt,
+    }))
+  }
+
   let outcomeRecorded = false
   const recordSuccess = () => {
     if (outcomeRecorded) return
     refreshEffectiveStreamSelection()
     outcomeRecorded = true
+    logStreamDelivery('completed', 200)
     const latency = Date.now() - startedAt
     loadBalancer.clearAccountFailure(account.id)
     proxyStatusManager.recordRequestSuccess(latency)
@@ -279,6 +352,7 @@ router.post('/responses', async (ctx: Context) => {
     if (outcomeRecorded) return
     refreshEffectiveStreamSelection()
     outcomeRecorded = true
+    logStreamDelivery('failed', status, error)
     const latency = Date.now() - startedAt
     const accountFault = streamFailureAccountFault(error)
     const shouldPenalizeAccount = penalizeAccount && accountFault !== false
@@ -325,7 +399,7 @@ router.post('/responses', async (ctx: Context) => {
   }
 
   try {
-    const outcome = await forwardWithAccountFailover({
+    const failoverPromise = forwardWithAccountFailover({
       initialSelection,
       maxFailovers,
       signal: abort.controller.signal,
@@ -334,7 +408,11 @@ router.post('/responses', async (ctx: Context) => {
         selection.account,
         selection.provider,
         selection.actualModel,
-        createProxyContext(selection),
+        createProxyContext(
+          selection,
+          deferManagedStreamCommit,
+          onQwenAiProgressFrame,
+        ),
       ),
       selectNext: excludedAccountIds => loadBalancer.selectAccount(
         chatRequest.model,
@@ -342,6 +420,7 @@ router.post('/responses', async (ctx: Context) => {
         preferredProviderId,
         preferredAccountId,
         excludedAccountIds,
+        failoverSelectionConstraints,
       ),
       onFailedAttempt: ({ selection, attempt }, result) => {
         if (QwenAiAdapter.isQwenAiProvider(selection.provider)) {
@@ -370,6 +449,23 @@ router.post('/responses', async (ctx: Context) => {
         })
       },
     })
+    const outcome = deferManagedStreamCommit
+      ? {
+          selection: initialSelection,
+          result: {
+            success: true,
+            status: 200,
+            stream: createDeferredQwenAiFailoverStream(
+              failoverPromise,
+              abort.controller.signal,
+              qwenAiProgressStream,
+            ),
+            skipTransform: true,
+          },
+          failoverCount: 0,
+          excludedAccountIds: new Set<string>(),
+        }
+      : await failoverPromise
     account = outcome.selection.account
     provider = outcome.selection.provider
     actualModel = outcome.selection.actualModel
@@ -479,6 +575,16 @@ router.post('/responses', async (ctx: Context) => {
           recordFailure(error, status, !imageResolutionFailure, !imageResolutionFailure)
         },
       }).start()
+      const clientStream = new SseKeepAliveStream()
+
+      responsesStream.on('data', () => {
+        responsesChunkCount += 1
+        lastResponsesChunkAt = Date.now()
+      })
+      clientStream.on('data', () => {
+        clientChunkCount += 1
+        lastClientChunkAt = Date.now()
+      })
 
       const sourceError = (error: Error) => {
         const status = streamFailureStatus(error, abort.controller.signal.aborted)
@@ -503,6 +609,7 @@ router.post('/responses', async (ctx: Context) => {
         )
         destroyStream(rawStream)
         if (chatStream !== rawStream) destroyStream(chatStream)
+        destroyStream(clientStream)
       })
       responsesStream.once('end', abort.cleanup)
       abort.controller.signal.addEventListener('abort', () => {
@@ -511,10 +618,12 @@ router.post('/responses', async (ctx: Context) => {
         destroyStream(rawStream)
         if (chatStream !== rawStream) destroyStream(chatStream)
         destroyStream(responsesStream)
+        destroyStream(clientStream)
       }, { once: true })
 
+      responsesStream.pipe(clientStream)
       chatStream.pipe(responsesStream)
-      ctx.body = responsesStream
+      ctx.body = clientStream
       return
     }
 

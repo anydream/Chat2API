@@ -74,6 +74,8 @@ function loadRequestForwarder(overrides = {}) {
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
       findQwenAiModelCapability: overrides.findQwenAiModelCapability || (() => undefined),
+      isQwenAiUpstreamBusyMessage: value => /qwen_ai_upstream_busy/i.test(String(value || '')),
+      qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
     },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
@@ -95,7 +97,7 @@ function loadRequestForwarder(overrides = {}) {
     },
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
-      bufferValidatedSseStream: async stream => stream,
+      bufferValidatedSseStream: overrides.bufferValidatedSseStream || (async stream => stream),
     },
     './utils/errors': {
       isClientCancellationError: () => false,
@@ -490,6 +492,125 @@ test('an explicit retry count does not enable ordinary Qwen stream retries', asy
   }
 })
 
+test('Qwen upstream busy retries the same account and can recover within the request budget', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  const delays = []
+  forwarder.delay = async delayMs => {
+    delays.push(delayMs)
+    return true
+  }
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    if (attempts.length === 1) {
+      return {
+        success: false,
+        status: 503,
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.equal(attempts.length, 2)
+  assert.deepEqual(attempts.map(item => item.attempt), [1, 2])
+  assert.deepEqual(
+    attempts.map(item => item.qwenAiMessageTransport),
+    ['inline', 'document'],
+    'only a real upstream-busy result should switch the complete request to document transport',
+  )
+  assert.deepEqual(
+    attempts.map(item => item.qwenAiRecoveryBypassAccountInterval),
+    [false, true],
+    'the one transport fallback must not wait behind the completed inline attempt account interval',
+  )
+  assert.ok(attempts.every(item => item.qwenAiRequestTimeoutMs > 0))
+  assert.ok(attempts[1].qwenAiRequestTimeoutMs <= attempts[0].qwenAiRequestTimeoutMs)
+  assert.deepEqual(delays, [1000])
+})
+
+test('Qwen upstream busy stops at the cumulative request budget', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 500 })
+  const forwarder = new RequestForwarder()
+  let attempts = 0
+  let delayCalls = 0
+  forwarder.delay = async () => {
+    delayCalls += 1
+    return true
+  }
+  forwarder.doForward = async () => {
+    attempts += 1
+    return {
+      success: false,
+      status: 503,
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.errorCode, 'qwen_ai_upstream_busy')
+  assert.equal(result.accountFault, false)
+  assert.equal(attempts, 1)
+  assert.equal(delayCalls, 0)
+})
+
+test('Qwen upstream busy retry stops immediately when the client aborts', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+  const forwarder = new RequestForwarder()
+  const controller = new AbortController()
+  let attempts = 0
+  forwarder.delay = async () => {
+    controller.abort()
+    return false
+  }
+  forwarder.doForward = async () => {
+    attempts += 1
+    return {
+      success: false,
+      status: 503,
+      error: 'Qwen AI upstream is busy',
+      errorCode: 'qwen_ai_upstream_busy',
+      retryable: true,
+      accountFault: false,
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: controller.signal },
+  )
+
+  assert.equal(result.status, 499)
+  assert.equal(attempts, 1)
+})
+
 test('live managed-tool forwarding deletes its temporary chat only after stream termination', async (t) => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
   process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
@@ -571,7 +692,85 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
   assert.deepEqual(deleteCalls, ['temporary-chat-1'])
 })
 
-test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn', async (t) => {
+test('deferred managed-tool validation has no time-based release threshold', async (t) => {
+  const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  const previousHold = process.env.CHAT2API_VALIDATED_SSE_MAX_HOLD_MS
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
+  process.env.CHAT2API_VALIDATED_SSE_MAX_HOLD_MS = '12345'
+  t.after(() => {
+    if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+    else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer
+    if (previousHold === undefined) delete process.env.CHAT2API_VALIDATED_SSE_MAX_HOLD_MS
+    else process.env.CHAT2API_VALIDATED_SSE_MAX_HOLD_MS = previousHold
+  })
+
+  const output = new PassThrough()
+  const validationOptions = []
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-atomic',
+        parentId: null,
+      }
+    }
+
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter,
+    QwenAiStreamHandler,
+    bufferValidatedSseStream: async (stream, options) => {
+      validationOptions.push(options)
+      return stream
+    },
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: true },
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    {
+      model: 'model-1',
+      messages: [],
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    {
+      signal: new AbortController().signal,
+      deferManagedStreamCommit: true,
+    },
+  )
+
+  output.write('data: {"choices":[{"delta":{"content":"validated"}}]}\n\n')
+  const result = await resultPromise
+
+  assert.equal(result.success, true)
+  assert.equal(validationOptions.length, 1)
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(validationOptions[0], 'maxHoldMs'),
+    false,
+  )
+
+  output.destroy()
+})
+
+test('Qwen AI forwarder keeps malformed-tool recovery in the same chat', async (t) => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
   process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
   t.after(() => {
@@ -582,6 +781,7 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
   const initialUpstream = new PassThrough()
   const continuedUpstream = new PassThrough()
   const continuationCalls = []
+  const continuationMessageOptions = []
   const resumeCalls = []
   const bridgeOptions = []
   const handlingOptions = []
@@ -629,17 +829,25 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
       bridgeOptions.push(options)
       return stream
     },
-    createToolWorkflowContinuationMessage: () => ({
-      role: 'user',
-      content: 'generic workflow continuation',
-    }),
+    createToolWorkflowContinuationMessage: options => {
+      continuationMessageOptions.push(options)
+      return {
+        role: 'user',
+        content: 'generic workflow continuation',
+      }
+    },
   })
   const forwarder = new RequestForwarder()
   forwarder.transformRequestForPromptToolUse = request => ({
     messages: request.messages,
     plan: {
+      protocol: 'managed_xml',
+      tools: [],
       shouldParseResponse: true,
       allowedToolNames: new Set(['lookup']),
+      toolChoiceMode: 'auto',
+      workflowContinuation: false,
+      failedToolResultPending: false,
     },
   })
 
@@ -667,14 +875,20 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
   assert.equal(typeof options.continueWorkflow, 'function')
   assert.equal(typeof options.onWorkflowContinuation, 'function')
   assert.equal(typeof options.resume, 'function')
+  assert.equal(continuationMessageOptions.length, 0)
 
-  const continuation = await options.continueWorkflow('response-parent-42')
+  const recoveryError = Object.assign(new Error('managed tool call needs correction'), {
+    code: 'malformed_tool_call',
+  })
+  const continuation = await options.continueWorkflow('response-parent-42', recoveryError)
   assert.equal(continuation.data, continuedUpstream)
   assert.equal(continuationCalls.length, 1)
   assert.equal(continuationCalls[0].chatId, 'temporary-chat-continuation')
   assert.equal(continuationCalls[0].parentId, 'response-parent-42')
   assert.equal(continuationCalls[0].content, 'generic workflow continuation')
   assert.equal(continuationCalls[0].messages, undefined)
+  assert.equal(continuationMessageOptions.length, 1)
+  assert.equal(continuationMessageOptions[0].requireManagedToolCall, true)
 
   options.onWorkflowContinuation()
   assert.equal(resetCalls, 1)
@@ -686,7 +900,122 @@ test('Qwen AI forwarder wires semantic recovery to a same-chat continuation turn
   continuedUpstream.destroy()
 })
 
-test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat with full context', async () => {
+test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => {
+  const scenarios = [
+    {
+      name: 'required tool choice',
+      toolChoiceMode: 'required',
+      failedToolResultPending: false,
+      recoveryCode: 'qwen_ai_semantic_incomplete',
+    },
+    {
+      name: 'failed tool result',
+      toolChoiceMode: 'auto',
+      failedToolResultPending: true,
+      recoveryCode: 'qwen_ai_semantic_incomplete',
+    },
+    {
+      name: 'invalid tool arguments',
+      toolChoiceMode: 'auto',
+      failedToolResultPending: false,
+      recoveryCode: 'qwen_ai_invalid_tool_arguments',
+    },
+  ]
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const output = new PassThrough()
+      const initialUpstream = new PassThrough()
+      const continuedUpstream = new PassThrough()
+      const bridgeOptions = []
+      const continuationMessageOptions = []
+
+      class QwenAiAdapter {
+        static isQwenAiProvider() { return true }
+
+        async chatCompletion() {
+          return {
+            response: { status: 200, data: initialUpstream, headers: {} },
+            chatId: `initial-${scenario.name}`,
+            parentId: null,
+          }
+        }
+
+        async continueChatCompletion() {
+          return { data: continuedUpstream }
+        }
+
+        async deleteChat() { return true }
+      }
+
+      class QwenAiStreamHandler {
+        setChatId() {}
+        getResponseId() { return 'mandatory-recovery-response' }
+        isComplete() { return false }
+        prepareForWorkflowContinuation() {}
+        async handleStream() { return output }
+      }
+
+      const RequestForwarder = loadRequestForwarder({
+        QwenAiAdapter,
+        QwenAiStreamHandler,
+        createQwenAiResumableStream: (stream, options) => {
+          bridgeOptions.push(options)
+          return stream
+        },
+        createToolWorkflowContinuationMessage: options => {
+          continuationMessageOptions.push(options)
+          return { role: 'user', content: 'mandatory workflow continuation' }
+        },
+      })
+      const forwarder = new RequestForwarder()
+      forwarder.transformRequestForPromptToolUse = request => ({
+        messages: request.messages,
+        plan: {
+          protocol: 'managed_xml',
+          tools: [],
+          shouldParseResponse: true,
+          allowedToolNames: new Set(['lookup']),
+          toolChoiceMode: scenario.toolChoiceMode,
+          workflowContinuation: false,
+          failedToolResultPending: scenario.failedToolResultPending,
+        },
+      })
+
+      const resultPromise = forwarder.forwardQwenAi(
+        {
+          model: 'model-1',
+          messages: [{ role: 'user', content: 'finish the active operation' }],
+          stream: true,
+          tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+        },
+        { id: 'account-1' },
+        { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+        'model-1',
+        Date.now(),
+        { signal: new AbortController().signal },
+      )
+
+      output.write('data: {"choices":[{"delta":{"content":"ready"}}]}\n\n')
+      const result = await resultPromise
+      assert.equal(result.success, true)
+
+      const recoveryError = Object.assign(new Error('managed branch did not complete'), {
+        code: scenario.recoveryCode,
+      })
+      await bridgeOptions[0].continueWorkflow('mandatory-recovery-response', recoveryError)
+
+      assert.equal(continuationMessageOptions.length, 1)
+      assert.equal(continuationMessageOptions[0].requireManagedToolCall, true)
+
+      output.destroy()
+      initialUpstream.destroy()
+      continuedUpstream.destroy()
+    })
+  }
+})
+
+test('Qwen AI forwarder replays auto semantic-empty recovery with a completion-capable prompt', async () => {
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
   const restartedUpstream = new PassThrough()
@@ -706,6 +1035,7 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
     }],
     shouldParseResponse: true,
     allowedToolNames: new Set(['lookup']),
+    toolChoiceMode: 'auto',
     workflowContinuation: true,
     failedToolResultPending: false,
   }
@@ -713,15 +1043,15 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
     failedToolResultPending: false,
     plan,
   })
-  const schemaDerivedRecovery = createRealToolWorkflowContinuationMessage({
+  const completionCapableRecovery = createRealToolWorkflowContinuationMessage({
     failedToolResultPending: false,
-    requireManagedToolCall: true,
+    requireManagedToolCall: false,
     plan,
   })
-  assert.notEqual(
+  assert.equal(
     originallyInjectedContinuation.content,
-    schemaDerivedRecovery.content,
-    'managed XML recovery must exercise the stricter prompt used by the forwarder',
+    completionCapableRecovery.content,
+    'auto recovery must preserve the option to return a verified final answer',
   )
 
   class QwenAiAdapter {
@@ -830,14 +1160,12 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
       }],
     },
     { role: 'tool', tool_call_id: 'inspect-call', content: 'folder inspected' },
-    schemaDerivedRecovery,
+    completionCapableRecovery,
   ])
-  assert.equal(
-    chatCalls[1].messages.some(
-      message => message.content === originallyInjectedContinuation.content,
-    ),
-    false,
-    'fresh-chat replay must remove the superseded continuation prompt',
+  assert.notEqual(
+    chatCalls[1].messages.at(-1),
+    originallyInjectedContinuation,
+    'fresh-chat replay must replace the superseded continuation message',
   )
 
   await new Promise(resolve => setImmediate(resolve))
@@ -847,7 +1175,7 @@ test('Qwen AI forwarder replays semantic-empty workflow recovery in a fresh chat
   restartedUpstream.destroy()
 })
 
-test('Qwen AI forwarder does not fresh-replay prose without a structural continuation', async () => {
+test('Qwen AI forwarder fresh-replays semantic recovery without a structural continuation flag', async () => {
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
   const restartedUpstream = new PassThrough()
@@ -966,13 +1294,12 @@ test('Qwen AI forwarder does not fresh-replay prose without a structural continu
     recoveryError,
   )
   assert.equal(continued.data, restartedUpstream)
-  assert.equal(chatCalls.length, 1)
-  assert.equal(continuationCalls.length, 1)
-  assert.equal(continuationCalls[0].chatId, 'initial-active-chat')
-  assert.equal(continuationCalls[0].parentId, 'active-workflow-response')
+  assert.equal(chatCalls.length, 2)
+  assert.equal(continuationCalls.length, 0)
+  assert.deepEqual(chatCalls[1].messages.slice(0, -1), transformedMessages)
 
   await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(deleteCalls, [])
+  assert.deepEqual(deleteCalls, ['initial-active-chat'])
   output.destroy()
   initialUpstream.destroy()
   restartedUpstream.destroy()

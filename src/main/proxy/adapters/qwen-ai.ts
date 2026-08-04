@@ -23,6 +23,7 @@ import {
   prepareQwenAiMultimodalMessage,
   type QwenAiDirectUploadInput,
   type QwenAiDirectUploadStartResult,
+  type QwenAiMessageTransport,
 } from './qwen-ai-files'
 import { createBaseChunk } from '../utils/streamToolHandler'
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
@@ -102,7 +103,8 @@ const DEFAULT_HEADERS = {
 const MODEL_ALIASES: Record<string, string> = {
   qwen: 'qwen3.7-max',
   qwen3: 'qwen3.7-max',
-  'qwen3.8': 'qwen3.8-max-preview',
+  'qwen3.8': 'qwen3.8-max',
+  'qwen3.8-max': 'qwen3.8-max',
   'qwen3.8-max-preview': 'qwen3.8-max-preview',
   'qwen3.7': 'qwen3.7-max',
   'qwen3.7-plus': 'qwen3.7-plus',
@@ -124,6 +126,8 @@ type StreamHandlingOptions = {
   allowReasoningOnlyOutput?: boolean
   /** Emit accepted reasoning-only text as assistant content for summary turns. */
   reasoningOnlyAsContent?: boolean
+  /** Publish genuine reasoning outside a deferred managed-answer buffer. */
+  onProgressFrame?: (frame: string) => void
   onFailure?: (error: Error) => void
   recoverFromIdle?: QwenAiRecoveryCallback
   recoverFromSemanticEmpty?: QwenAiRecoveryCallback
@@ -166,6 +170,8 @@ export type QwenAiResumableStream = PassThrough & {
 
 interface ChatCompletionRequest {
   model: string
+  /** Correlation identifier generated at the OpenAI-compatible boundary. */
+  requestId?: string
   /** Original model name before mapping (used for feature detection like thinking mode) */
   originalModel?: string
   messages: QwenAiMessage[]
@@ -184,6 +190,10 @@ interface ChatCompletionRequest {
   }
   chatId?: string
   signal?: AbortSignal
+  /** Remaining budget supplied by the outer same-account busy retry loop. */
+  timeoutMs?: number
+  /** Selects how the complete converted conversation reaches Qwen. */
+  messageTransport?: QwenAiMessageTransport
 }
 
 interface QwenAiWorkflowContinuationRequest {
@@ -218,6 +228,20 @@ function nonNegativeIntegerFromEnv(name: string, fallback: number): number {
   return Number.isInteger(value) && value >= 0 ? value : fallback
 }
 
+function estimateQwenAiTranscriptTokens(value: string): number {
+  let asciiChars = 0
+  let nonAsciiCodePoints = 0
+  for (const codePoint of value) {
+    if ((codePoint.codePointAt(0) || 0) <= 0x7f) asciiChars += 1
+    else nonAsciiCodePoints += 1
+  }
+  return Math.ceil(asciiChars / 3) + nonAsciiCodePoints
+}
+
+export function qwenAiRequestTimeoutMsFromEnv(): number {
+  return QWEN_AI_REQUEST_TIMEOUT_MS
+}
+
 export function qwenAiStreamResumeAttemptsFromEnv(): number {
   return Math.min(
     10,
@@ -232,11 +256,14 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
   )
 }
 
-export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
-  return Math.min(
-    3,
-    nonNegativeIntegerFromEnv('CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS', 3),
-  )
+export function qwenAiWorkflowContinuationAttemptsFromEnv(): number | undefined {
+  const raw = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
+  if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
+    return undefined
+  }
+
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 /**
@@ -449,7 +476,8 @@ function isResumableQwenAiTransportError(error: unknown): boolean {
 /**
  * Keep a Qwen SSE response alive across recoverable provider failures.
  * Interrupted generations resume by response id; semantically completed but
- * unfinished managed-tool turns may start one bounded same-chat continuation.
+ * unfinished managed-tool turns may start same-chat continuations while Qwen
+ * keeps making meaningful progress.
  * Keeping both paths below the protocol adapter makes them transparent to
  * compatible downstream clients.
  */
@@ -460,10 +488,11 @@ export function createQwenAiResumableStream(
   const bridge = new PassThrough() as QwenAiResumableStream
   const maxAttempts = Math.max(0, options.maxAttempts ?? qwenAiStreamResumeAttemptsFromEnv())
   const delayMs = Math.max(0, options.delayMs ?? qwenAiStreamResumeDelayMsFromEnv())
-  const maxWorkflowContinuationAttempts = Math.max(
-    0,
-    options.workflowContinuationAttempts ?? qwenAiWorkflowContinuationAttemptsFromEnv(),
-  )
+  const configuredWorkflowContinuationAttempts = options.workflowContinuationAttempts
+    ?? qwenAiWorkflowContinuationAttemptsFromEnv()
+  const workflowContinuationAttemptLimit = configuredWorkflowContinuationAttempts === undefined
+    ? undefined
+    : Math.max(0, Math.floor(configuredWorkflowContinuationAttempts))
 
   let source = initialStream
   let sourceGeneration = 0
@@ -796,15 +825,19 @@ export function createQwenAiResumableStream(
     }
 
     // A response-id GET can only continue the provider's existing generation.
-    // For a managed-tool semantic terminal, start one bounded continuation
-    // user turn in the same chat instead of replaying that branch. This path
-    // is deliberately opt-in: ordinary transport failures and providers
-    // without a continuation callback still use the normal recovery budget.
+    // For a managed-tool semantic terminal, start a continuation user turn in
+    // the same chat instead of replaying that branch. By default, meaningful
+    // provider progress remains authoritative; the cumulative no-progress
+    // recovery budget still bounds admission failures and empty loops. A
+    // deployment may configure an explicit attempt limit, including zero.
     if (
       !settled
       && semanticRecoveryEligible
       && options.continueWorkflow
-      && workflowContinuationAttempts < maxWorkflowContinuationAttempts
+      && (
+        workflowContinuationAttemptLimit === undefined
+        || workflowContinuationAttempts < workflowContinuationAttemptLimit
+      )
     ) {
       const parentResponseId = options.getResponseId().trim()
       if (parentResponseId) {
@@ -820,7 +853,9 @@ export function createQwenAiResumableStream(
           console.warn('[QwenAI] Starting managed workflow continuation', JSON.stringify({
             parentResponseId,
             attempt: workflowContinuationAttempts,
-            maxAttempts: maxWorkflowContinuationAttempts,
+            ...(workflowContinuationAttemptLimit === undefined
+              ? { limitMode: 'provider_progress' }
+              : { maxAttempts: workflowContinuationAttemptLimit }),
           }))
           const continued = await options.continueWorkflow(parentResponseId, lastError, recoverySignal)
           const nextStream = continued?.data ?? continued
@@ -1640,6 +1675,7 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
     || code === 'qwen_ai_semantic_incomplete'
     || code === 'qwen_ai_invalid_tool_arguments'
     || code === 'undeclared_native_tool_call'
+    || code === 'malformed_tool_call'
 }
 
 function createQwenAiToolValidationError(
@@ -1681,12 +1717,12 @@ function isQwenAiInternalNativeTool(name: string): boolean {
 
 function createQwenAiIncompleteNativeToolError(names: string[]): QwenAiUpstreamError {
   const uniqueNames = [...new Set(names.filter(Boolean))]
-  return createQwenAiToolValidationError({
+  return markQwenAiNextAccountReplay(createQwenAiToolValidationError({
     message: `Provider returned declared native tool call${uniqueNames.length === 1 ? '' : 's'} with incomplete JSON arguments: ${uniqueNames.join(', ')}`,
     type: 'tool_call_parse_error',
     param: 'tool_calls',
     code: 'malformed_tool_call',
-  })
+  }))
 }
 
 function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
@@ -1746,8 +1782,16 @@ function enforceQwenAiFailoverBoundary(
   return error
 }
 
+export function isQwenAiUpstreamBusyMessage(message: string): boolean {
+  const hasValidationEnvelope = /FAIL_SYS_USER_VALIDATE|RGV587/i.test(message)
+  const hasBusySignal = /被挤爆|挤爆|请稍后重试|服务繁忙|系统繁忙|当前服务繁忙|(?:service|server|system) busy|overload(?:ed|ing)?|try again later|鍝庡摕鍠倈琚尋鐖唡鏈嶅姟绻佸繖|绯荤粺绻佸繖/i.test(message)
+  const hasChallengeSignal = /challenge|captcha|x5sec|bxpunish|baxia|punish|验证码|人机验证/i.test(message)
+  return hasValidationEnvelope && hasBusySignal && !hasChallengeSignal
+}
+
 function isQwenAiRiskControlMessage(message: string): boolean {
-  return /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(message)
+  return !isQwenAiUpstreamBusyMessage(message)
+    && /FAIL_SYS_USER_VALIDATE|RGV587|risk-control|challenge|captcha|x5sec|baxia|punish/i.test(message)
 }
 
 function isQwenAiRateLimitMessage(message: string): boolean {
@@ -1911,15 +1955,20 @@ function createQwenAiStreamEnvelopeError(
   if (!record) {
     if (!eventLooksLikeError) return undefined
     const message = typeof data === 'string' ? data.trim() : raw.trim()
+    const isUpstreamBusy = isQwenAiUpstreamBusyMessage(message)
     const isRiskControl = isQwenAiRiskControlMessage(message)
-    const isRateLimited = isQwenAiRateLimitMessage(message)
-    if (!message && !isRiskControl && !isRateLimited) return undefined
+    const isRateLimited = !isUpstreamBusy && isQwenAiRateLimitMessage(message)
+    if (!message && !isUpstreamBusy && !isRiskControl && !isRateLimited) return undefined
     const error = new Error(
       `Qwen AI upstream stream rejected the request: ${redactQwenAiErrorText(message) || 'unknown error'}`,
     ) as QwenAiUpstreamError
-    error.status = isRiskControl ? 403 : isRateLimited ? 429 : 502
+    error.status = isUpstreamBusy ? 503 : isRiskControl ? 403 : isRateLimited ? 429 : 502
     error.retryable = false
-    if (isRiskControl) {
+    if (isUpstreamBusy) {
+      error.code = 'qwen_ai_upstream_busy'
+      error.retryable = true
+      error.accountFault = false
+    } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
       error.retryable = true
       markQwenAiNextAccountFailure(error)
@@ -1986,34 +2035,45 @@ function createQwenAiStreamEnvelopeError(
 
   const classificationEvidence = [
     structuredMessage,
+    qwenAiErrorValueText(record.ret),
     qwenAiErrorValueText(record.error),
     qwenAiErrorValueText(record.errors),
+    qwenAiErrorValueText(record.data),
     qwenAiErrorValueText(record.code),
     qwenAiErrorValueText(record.type),
   ].filter(Boolean).join('; ')
-  const isRiskControl = hasErrorSignal && isQwenAiRiskControlMessage(classificationEvidence)
-  const isRateLimited = explicitStatus === 429 || (
+  const isUpstreamBusy = hasErrorSignal && isQwenAiUpstreamBusyMessage(classificationEvidence)
+  const isRiskControl = !isUpstreamBusy
+    && hasErrorSignal
+    && isQwenAiRiskControlMessage(classificationEvidence)
+  const isRateLimited = !isUpstreamBusy && (explicitStatus === 429 || (
     hasErrorSignal
     && isQwenAiRateLimitMessage(classificationEvidence)
-  )
+  ))
   const isChatInProgress = isQwenAiChatInProgressEnvelope(record)
 
-  if (!isRiskControl && !hasErrorSignal && !isRateLimited) return undefined
+  if (!isUpstreamBusy && !isRiskControl && !hasErrorSignal && !isRateLimited) return undefined
 
   const message = redactQwenAiErrorText(structuredMessage || raw)
   const error = new Error(`Qwen AI upstream stream rejected the request: ${message || 'unknown error'}`) as QwenAiUpstreamError
-  error.status = isRiskControl ? 403 : isRateLimited ? 429 : explicitStatus ?? 502
+  error.status = isUpstreamBusy ? 503 : isRiskControl ? 403 : isRateLimited ? 429 : explicitStatus ?? 502
   error.retryable = envelopeMetadata.retryable ?? false
   if (envelopeMetadata.type) error.type = envelopeMetadata.type
   if (envelopeMetadata.param) error.param = envelopeMetadata.param
-  if (isRiskControl) {
+  if (isUpstreamBusy) {
+    error.code = 'qwen_ai_upstream_busy'
+    error.retryable = true
+    error.accountFault = false
+  } else if (isRiskControl) {
     error.code = 'qwen_ai_risk_control'
   } else if (isRateLimited) {
     error.code = 'qwen_ai_capacity_limit'
   } else if (envelopeMetadata.code) {
     error.code = envelopeMetadata.code
   }
-  if (error.status === 401 || isRiskControl || isRateLimited) {
+  if (isUpstreamBusy) {
+    // Provider congestion is tied to this request shape, not the credential.
+  } else if (error.status === 401 || isRiskControl || isRateLimited) {
     markQwenAiNextAccountFailure(error)
   } else if (isChatInProgress) {
     error.accountFault = false
@@ -2424,10 +2484,19 @@ export class QwenAiAdapter {
       envelopeError = createQwenAiStreamEnvelopeError(body, body, 'error')
     }
 
-    const isRiskControl = envelopeError?.status === 403
+    // Qwen can attach generic validation/challenge headers to a structured
+    // provider-congestion response. The body is more specific: an explicit
+    // RGV587 busy envelope must remain request-scoped instead of cooling the
+    // account merely because the response also carried those headers.
+    const isUpstreamBusy = (
+      envelopeError?.code === 'qwen_ai_upstream_busy'
+      || isQwenAiUpstreamBusyMessage(upstreamMessage)
+    )
+    const isRiskControl = !isUpstreamBusy && (envelopeError?.status === 403
       || this.isRiskControlMessage(upstreamMessage)
-      || reason.includes('risk-control')
-    const isCapacityLimit = response.status === 429 || envelopeError?.status === 429
+      || reason.includes('risk-control'))
+    const isCapacityLimit = !isUpstreamBusy
+      && (response.status === 429 || envelopeError?.status === 429)
     const upstreamStatus = response.status >= 400 && response.status <= 599
       ? response.status
       : 502
@@ -2435,12 +2504,16 @@ export class QwenAiAdapter {
     // Preserve only retry pacing metadata. The governor uses Retry-After to
     // distinguish ordinary quota throttling without exposing upstream cookies
     // or transport headers to the client.
-    error.status = isRiskControl ? 403 : isCapacityLimit ? 429 : upstreamStatus
+    error.status = isUpstreamBusy ? 503 : isRiskControl ? 403 : isCapacityLimit ? 429 : upstreamStatus
     error.headers = sanitizeForwardedErrorHeaders(response.headers)
     error.retryable = envelopeError?.retryable ?? false
     if (envelopeError?.type) error.type = envelopeError.type
     if (envelopeError?.param) error.param = envelopeError.param
-    if (isRiskControl) {
+    if (isUpstreamBusy) {
+      error.code = 'qwen_ai_upstream_busy'
+      error.retryable = true
+      error.accountFault = false
+    } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
     } else if (isCapacityLimit) {
       error.code = 'qwen_ai_capacity_limit'
@@ -2455,7 +2528,9 @@ export class QwenAiAdapter {
     } else if (envelopeError?.code) {
       error.code = envelopeError.code
     }
-    if (error.status === 401 || isRiskControl || isCapacityLimit) {
+    if (isUpstreamBusy) {
+      // Keep the outer retry on this account; do not enter pool failover.
+    } else if (error.status === 401 || isRiskControl || isCapacityLimit) {
       markQwenAiNextAccountFailure(error)
     } else if (chatInProgress) {
       error.accountFault = false
@@ -2737,7 +2812,9 @@ export class QwenAiAdapter {
         this.postWithRefreshRetry.bind(this),
         { providerId: this.provider.id, accountId: this.account.id },
       )
-      const preparedUserMessage = await prepareQwenAiMultimodalMessage(messages, uploader)
+      const preparedUserMessage = await prepareQwenAiMultimodalMessage(messages, uploader, {
+        transport: request.messageTransport,
+      })
       const qwenFiles = preparedUserMessage.files
 
     const fid = uuid()
@@ -2752,6 +2829,21 @@ export class QwenAiAdapter {
       forceThinking,
       modelCapability,
     )
+
+    console.info('[QwenAI] upstream request shape', JSON.stringify({
+      requestId: request.requestId,
+      accountId: this.account.id,
+      model: modelId,
+      sourceMessageCount: messages.length,
+      transcriptChars: preparedUserMessage.content.length,
+      transcriptUtf8Bytes: Buffer.byteLength(preparedUserMessage.content, 'utf8'),
+      conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
+      fileCount: qwenFiles.length,
+      messageTransport: request.messageTransport ?? 'inline',
+      thinkingEnabled: shouldEnableThinking,
+      modelMaxContextTokens: modelCapability?.maxContextLength,
+      modelMaxSummaryTokens: modelCapability?.maxSummaryGenerationLength,
+    }))
     
     const featureConfig: Record<string, any> = {
       thinking_enabled: shouldEnableThinking,
@@ -2816,13 +2908,17 @@ export class QwenAiAdapter {
       console.log('[QwenAI] Request headers:', JSON.stringify(this.sanitizeHeadersForLog(this.getHeaders(chatId)), null, 2))
     }
 
+    const requestTimeoutMs = Math.max(
+      1,
+      Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, request.timeoutMs ?? QWEN_AI_REQUEST_TIMEOUT_MS),
+    )
     const response = await this.postWithRefreshRetry(url, payload, () => ({
       headers: {
         ...this.getHeaders(chatId),
         'x-accel-buffering': 'no',
       },
       responseType: 'stream',
-      timeout: QWEN_AI_REQUEST_TIMEOUT_MS,
+      timeout: requestTimeoutMs,
       signal: request.signal,
       validateStatus: () => true,
     }))
@@ -2834,6 +2930,7 @@ export class QwenAiAdapter {
 
     await this.assertChatCompletionStreamResponse(response, {
       signal: request.signal,
+      previewTimeoutMs: requestTimeoutMs,
     })
 
       return {
@@ -3628,8 +3725,18 @@ export class QwenAiStreamHandler {
     let answerFrameCommitted = false
     let managedBranchFrames: string[] = []
     let managedBranchBytes = 0
+    let publishedProgressFrameCount = 0
+    let lastPublishedProgressAt = 0
+    let downstreamFrameCount = 0
+    let lastDownstreamFrameAt = 0
     let parser: ReturnType<typeof createParser>
     const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
+
+    const writeDownstreamFrame = (frame: string): boolean => {
+      downstreamFrameCount += 1
+      lastDownstreamFrameAt = Date.now()
+      return transStream.write(frame)
+    }
 
     const discardManagedBranchFrames = () => {
       managedBranchFrames = []
@@ -3639,7 +3746,7 @@ export class QwenAiStreamHandler {
     const flushManagedBranchFrames = () => {
       if (!buffersManagedCandidate || managedBranchFrames.length === 0) return
       for (const frame of managedBranchFrames) {
-        transStream.write(frame)
+        writeDownstreamFrame(frame)
       }
       visibleFrameCommitted = true
       answerFrameCommitted = true
@@ -3710,6 +3817,12 @@ export class QwenAiStreamHandler {
         responseId: this.responseId || undefined,
         sawUpstreamCompletion,
         clientAborted: upstreamError.status === 499,
+        publishedProgressFrameCount,
+        lastPublishedProgressAt,
+        downstreamFrameCount,
+        lastDownstreamFrameAt,
+        bufferedManagedFrameCount: managedBranchFrames.length,
+        bufferedManagedBytes: managedBranchBytes,
       }))
       if (!recordStreamFailure(upstreamError)) return
       discardManagedBranchFrames()
@@ -3797,6 +3910,27 @@ export class QwenAiStreamHandler {
       progressVisible = answerVisible,
     ): boolean => {
       if (finalChunkSent) return false
+      if (
+        bufferManagedBranch
+        && progressVisible
+        && !answerVisible
+        && options.onProgressFrame
+      ) {
+        try {
+          options.onProgressFrame(frame)
+          publishedProgressFrameCount += 1
+          lastPublishedProgressAt = Date.now()
+          downstreamFrameCount += 1
+          lastDownstreamFrameAt = lastPublishedProgressAt
+          if (publishedProgressFrameCount === 1) {
+            console.info('[QwenAI] Publishing live reasoning while managed answer validation remains deferred')
+          }
+        } catch (error) {
+          console.warn('[QwenAI] Managed reasoning progress publisher failed:', describeErrorForLog(error))
+        }
+        if (!finalChunkSent) refreshIdleTimer()
+        return true
+      }
       if (bufferManagedBranch || (stageManagedAnswer && answerVisible)) {
         const frameBytes = Buffer.byteLength(frame)
         if (managedBranchBytes + frameBytes > QWEN_AI_MANAGED_BRANCH_MAX_BYTES) {
@@ -3810,7 +3944,7 @@ export class QwenAiStreamHandler {
         if (!finalChunkSent) refreshIdleTimer()
         return true
       }
-      transStream.write(frame)
+      writeDownstreamFrame(frame)
       if (progressVisible) visibleFrameCommitted = true
       if (answerVisible) answerFrameCommitted = true
       // Upstream events, parser buffering, and protocol fragments are not
@@ -3994,7 +4128,7 @@ export class QwenAiStreamHandler {
 
       const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
       if (incompleteDeclaredNativeToolNames.length > 0) {
-        failStream(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
+        recoverFromSemanticEmpty(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
         return
       }
 
@@ -4108,7 +4242,7 @@ export class QwenAiStreamHandler {
         created: this.created,
       }
       flushManagedBranchFrames()
-      transStream.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+      writeDownstreamFrame(`data: ${JSON.stringify(finalChunk)}\n\n`)
       transStream.end('data: [DONE]\n\n')
       completeStream()
 
@@ -4286,6 +4420,7 @@ export class QwenAiStreamHandler {
                       created: this.created,
                     })}\n\n`,
                     false,
+                    true,
                   )
                 }
               }
@@ -4557,7 +4692,7 @@ export class QwenAiStreamHandler {
 
         const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
         if (incompleteDeclaredNativeToolNames.length > 0) {
-          rejectOnce(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
+          recoverFromSemanticEmpty(createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames))
           return
         }
 
@@ -4909,6 +5044,11 @@ export class QwenAiStreamHandler {
     const invalidNativeToolArguments = this.getInvalidNativeToolArgumentIssues()
     if (invalidNativeToolArguments.length > 0) {
       return createQwenAiInvalidNativeToolArgumentsError(invalidNativeToolArguments)
+    }
+
+    const incompleteDeclaredNativeToolNames = this.getIncompleteDeclaredNativeToolNames()
+    if (incompleteDeclaredNativeToolNames.length > 0) {
+      return createQwenAiIncompleteNativeToolError(incompleteDeclaredNativeToolNames)
     }
 
     return undefined

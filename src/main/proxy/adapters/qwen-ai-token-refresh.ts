@@ -206,6 +206,15 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
       message: `Qwen AI token refresh failed (risk-control)${detailSuffix}`,
       status: 403,
       retryable: false,
+      accountFault: false,
+    })
+  }
+
+  if (upstreamStatus >= 200 && upstreamStatus < 300) {
+    return createRefreshError({
+      message: `Qwen AI credentials were rejected during token refresh${detailSuffix}`,
+      status: 401,
+      retryable: false,
       accountFault: true,
       retryScope: 'next-account',
     })
@@ -285,9 +294,11 @@ export class QwenAiTokenRefresher {
   }
 
   async refreshIfNeeded(account: Account, signal?: AbortSignal): Promise<Account> {
+    const cookies = String(account.credentials.cookies || account.credentials.cookie || '').trim()
+    const incompleteWebSession = Boolean(cookies) && !hasQwenAiSessionCookie(cookies)
     if (
       !this.canRefresh(account) ||
-      !this.isTokenExpiringSoon(account.credentials.token || '')
+      (!incompleteWebSession && !this.isTokenExpiringSoon(account.credentials.token || ''))
     ) {
       return account
     }

@@ -78,7 +78,7 @@ test('Qwen AI long text documents add generic evidence excerpts near the user re
   assert.match(source, /KEY_VALUE_CONTEXT_PATTERN/)
   assert.match(source, /PATH_VALUE_CONTEXT_PATTERN/)
   assert.match(source, /Use only values that are present in the excerpts or the attached documents/)
-  assert.match(source, /content = documentEvidence\s*\?\s*`\$\{userContent\}\\n\\n\$\{documentEvidence\}`/)
+  assert.match(source, /content = documentEvidence\s*\?\s*`\$\{inlineContent\}\\n\\n\$\{documentEvidence\}`/)
 })
 
 test('Qwen AI document evidence is bounded and configurable instead of hard-coded to one fixture', () => {
@@ -209,6 +209,8 @@ test('Qwen AI local file uploads are cached per account to avoid repeat OSS uplo
   assert.match(source, /cache hit/)
   assert.match(source, /cache miss/)
   assert.match(source, /cloneCachedQwenFileItem/)
+  assert.match(source, /qwen-ai-file-cache-content-v1/)
+  assert.match(source, /contentHash:\s*createHash\('sha256'\)/)
   assert.match(adapterSource, /providerId:\s*this\.provider\.id,\s*accountId:\s*this\.account\.id/)
 })
 

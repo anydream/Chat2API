@@ -263,6 +263,8 @@ function loadRequestForwarder(overrides = {}) {
       QwenAiStreamHandler: MockQwenAiStreamHandler,
       createQwenAiResumableStream: stream => stream,
       findModelCapability: () => ({ maxContextLength: 100, maxSummaryGenerationLength: 10 }),
+      isQwenAiUpstreamBusyMessage: () => false,
+      qwenAiRequestTimeoutMsFromEnv: () => 600_000,
     },
     './adapters/zai': { ZaiAdapter: class { static isZaiProvider() { return false } }, ZaiStreamHandler: class {} },
     './adapters/minimax': { MiniMaxAdapter: class { static isMiniMaxProvider() { return false } }, MiniMaxStreamHandler: class {} },

@@ -29,6 +29,7 @@ async function main(): Promise<void> {
   })
 
   await storeManager.initialize()
+  await storeManager.syncDynamicBuiltinProviderModels()
   const config = applyServerConfigOverrides()
 
   const started = await proxyServer.start(config.proxyPort, config.proxyHost)

@@ -105,6 +105,10 @@ export interface QwenAiGovernorStatus {
   globalCooldownInMs: number
   globalCooldownReason?: string
   globalFailures: number
+  globalRecoveryProbeActive: boolean
+  globalRecoveryProbeAccountId?: string
+  globalRecoveryNextAt?: number
+  globalRecoveryNextInMs: number
   recentRiskEvents: number
   recentRiskAccounts: number
   accounts: QwenAiGovernorAccountStatus[]

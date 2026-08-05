@@ -82,7 +82,7 @@ const QWEN_AI_RECOVERY_MAX_BUDGET_MS = 30 * 60 * 1_000
 // Once semantic recovery starts, every replacement branch belongs to one
 // logical recovery episode. Bound its total wall time even while Qwen keeps
 // producing progress that would otherwise pause the no-progress budget.
-const QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS = 300_000
+const QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS = 540_000
 const QWEN_AI_WORKFLOW_RECOVERY_MAX_TIMEOUT_MS = 30 * 60 * 1_000
 
 export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
@@ -620,10 +620,10 @@ export function createQwenAiResumableStream(
     workflowRecoveryController = undefined
     workflowRecoveryStartedAt = undefined
     workflowRecoveryEffectiveTimeoutMs = 0
-    releaseLinkedRecoverySignal()
     if (abortInFlight && controller && !controller.signal.aborted) {
       controller.abort()
     }
+    releaseLinkedRecoverySignal()
   }
 
   const startRecoveryBudget = (): AbortSignal | undefined => {
@@ -727,7 +727,6 @@ export function createQwenAiResumableStream(
     workflowRecoveryTimer = setTimeout(() => {
       if (settled) return
       workflowRecoveryExpired = true
-      workflowRecoveryController?.abort()
       fail(effectiveWorkflowRecoveryTimeoutError())
     }, Math.max(1, Math.ceil(workflowRecoveryEffectiveTimeoutMs)))
     return workflowRecoveryController.signal
@@ -740,7 +739,6 @@ export function createQwenAiResumableStream(
       && performance.now() - workflowRecoveryStartedAt >= workflowRecoveryEffectiveTimeoutMs
     ) {
       workflowRecoveryExpired = true
-      workflowRecoveryController?.abort()
       throw effectiveWorkflowRecoveryTimeoutError()
     }
   }
@@ -1237,6 +1235,14 @@ export function createQwenAiResumableStream(
     }
     if (complete) {
       finish()
+      return
+    }
+    if (workflowRecoveryExpired) {
+      fail(effectiveWorkflowRecoveryTimeoutError())
+      return
+    }
+    if (recoveryBudgetExpired) {
+      fail(effectiveRecoveryBudgetError())
       return
     }
     const semanticRecoveryError = getSemanticRecoveryError()
@@ -3692,17 +3698,67 @@ export class QwenAiStreamHandler {
   private summaryToolResultGuard: ManagedToolResultGuard
   private wrapperLeakDetected = false
   private wrapperLeakLogged = false
+  private readonly promptTokens: number
 
-  constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
+  constructor(
+    model: string,
+    onEnd?: (chatId: string) => void,
+    toolCallingPlan?: ToolCallingPlan,
+    promptTokens = 1,
+  ) {
     this.model = model
     this.created = Math.floor(Date.now() / 1000)
     this.onEnd = onEnd
     this.toolCallingPlan = toolCallingPlan
+    this.promptTokens = Number.isSafeInteger(promptTokens) && promptTokens > 0
+      ? promptTokens
+      : 1
     this.toolCallIdPrefix = `call_${uuid().replace(/-/g, '')}`
     this.answerToolResultGuard = this.createAnswerToolResultGuard()
     this.reasoningToolResultGuard = new ManagedToolResultGuard(null)
     this.summaryToolResultGuard = new ManagedToolResultGuard(null)
     this.resetToolStreamParser()
+  }
+
+  private createEstimatedUsage(
+    content: unknown,
+    reasoning?: unknown,
+    toolCalls?: unknown,
+  ): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
+    const serializedParts = [content, reasoning, toolCalls]
+      .filter(value => value !== undefined && value !== null && value !== '')
+      .map(value => {
+        if (typeof value === 'string') return value
+        try {
+          return JSON.stringify(value)
+        } catch {
+          return String(value)
+        }
+      })
+    const completionTokens = Math.max(
+      1,
+      serializedParts.reduce(
+        (total, value) => total + estimateQwenAiTranscriptTokens(value),
+        0,
+      ),
+    )
+    return {
+      prompt_tokens: this.promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: this.promptTokens + completionTokens,
+    }
+  }
+
+  private withEstimatedUsage(response: any): any {
+    const message = response?.choices?.[0]?.message
+    return {
+      ...response,
+      usage: this.createEstimatedUsage(
+        message?.content,
+        message?.reasoning_content,
+        message?.tool_calls,
+      ),
+    }
   }
 
   private resetToolStreamParser(): void {
@@ -4003,7 +4059,10 @@ export class QwenAiStreamHandler {
     return true
   }
 
-  private sendToolCalls(transStream: PassThrough): boolean {
+  private sendToolCalls(
+    transStream: PassThrough,
+    usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number },
+  ): boolean {
     if (this.toolCallsSent) return true
     
     const toolCalls = parseToolUse(this.content)
@@ -4046,7 +4105,7 @@ export class QwenAiStreamHandler {
           model: this.model,
           object: 'chat.completion.chunk',
           choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          usage,
           created: this.created,
         })}\n\n`
       )
@@ -4197,6 +4256,7 @@ export class QwenAiStreamHandler {
     transStream: PassThrough,
     toolCalls: ToolCall[],
     includeAssistantRole = true,
+    usage = this.createEstimatedUsage(this.content, undefined, toolCalls),
   ): boolean {
     if (this.toolCallsSent || toolCalls.length === 0) return false
 
@@ -4228,6 +4288,7 @@ export class QwenAiStreamHandler {
         model: this.model,
         object: 'chat.completion.chunk',
         choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+        usage,
         created: this.created,
       })}\n\n`,
     )
@@ -4829,9 +4890,19 @@ export class QwenAiStreamHandler {
 
       const completeNativeToolCalls = this.getCompleteNativeToolCalls()
       if (completeNativeToolCalls.length > 0) {
+        const usage = this.createEstimatedUsage(
+          this.content,
+          options.reasoningOnlyAsContent ? undefined : `${reasoningText}${summaryText}`,
+          completeNativeToolCalls,
+        )
         if (completeStream(() => {
           flushManagedBranchFrames()
-          return this.emitNativeToolCalls(transStream, completeNativeToolCalls, !initialChunkSent)
+          return this.emitNativeToolCalls(
+            transStream,
+            completeNativeToolCalls,
+            !initialChunkSent,
+            usage,
+          )
         })) {
           return
         }
@@ -4856,9 +4927,13 @@ export class QwenAiStreamHandler {
 
       if (hasToolUse(this.content)) {
         console.log('[QwenAI] Found legacy tool_use in stream, sending tool_calls')
+        const usage = this.createEstimatedUsage(
+          this.content,
+          options.reasoningOnlyAsContent ? undefined : `${reasoningText}${summaryText}`,
+        )
         if (completeStream(() => {
           flushManagedBranchFrames()
-          return this.sendToolCalls(transStream)
+          return this.sendToolCalls(transStream, usage)
         })) {
           return
         }
@@ -4936,6 +5011,10 @@ export class QwenAiStreamHandler {
         model: this.model,
         object: 'chat.completion.chunk',
         choices: [{ index: 0, delta: {}, finish_reason: resolvedFinishReason }],
+        usage: this.createEstimatedUsage(
+          this.content,
+          options.reasoningOnlyAsContent ? undefined : `${reasoningText}${summaryText}`,
+        ),
         created: this.created,
       }
       if (!completeStream(() => {
@@ -5222,7 +5301,7 @@ export class QwenAiStreamHandler {
             finish_reason: 'stop',
           },
         ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        usage: this.createEstimatedUsage('', ''),
         created: this.created,
       }
 
@@ -5312,7 +5391,7 @@ export class QwenAiStreamHandler {
         this.streamCompleted = true
         cleanup()
         destroyReadableStream(stream)
-        resolve(value)
+        resolve(this.withEstimatedUsage(value))
         return true
       }
 

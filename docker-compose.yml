@@ -67,7 +67,7 @@ services:
       CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000}
       # Once semantic recovery begins, cap the full continuation chain even
       # while replacement branches keep producing incomplete progress.
-      CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-300000}
+      CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-540000}
       # A busy-chat admission response retries the exact same continuation
       # payload; it never creates another user turn or switches accounts.
       # Busy-chat admission has its own wall-clock budget; it must not inherit

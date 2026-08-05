@@ -328,6 +328,7 @@ export class GLMAdapter {
           content: toolProfile.formatToolResult({
             toolCallId: msg.tool_call_id,
             content: String(msg.content || ''),
+            isError: (msg as { is_error?: boolean }).is_error === true,
           }),
         }
       }

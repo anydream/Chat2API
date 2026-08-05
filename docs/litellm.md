@@ -300,7 +300,7 @@ Response-id resumes and managed-tool continuations share the cumulative
  remain inside the configured cumulative request deadline. Set the recovery
  budget to `0` to disable recovery and return the original upstream failure.
 Managed semantic recovery also has an absolute
-`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` deadline (default `300000` ms).
+`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` deadline (default `540000` ms).
 It starts with the first workflow continuation and keeps running across active
 replacement streams, so repeated incomplete progress cannot bypass the
 no-progress budget or reach LiteLLM's outer timeout. It is clamped to the

@@ -116,8 +116,9 @@ test('Qwen AI multimodal helper preserves full tool-call transcript instead of o
   assert.match(source, /`\$\{baseId\}__\$\{occurrence\}`/)
   assert.match(source, /msg\.role === 'tool'/)
   assert.match(source, /formatToolResult\(\{/)
-  assert.match(source, /already executed by the client/)
+  assert.match(source, /isError,/)
   assert.match(source, /Use this result to decide the next step\./)
+  assert.doesNotMatch(source, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(source, /renderCompletedToolState|Authoritative completed tool ledger|Do not repeat an already successful operation/)
   assert.match(source, /fileParts\.push\(\.\.\.messageFileParts\)/)
   assert.match(source, /buildQwenAiTranscript\(messages\)/)
@@ -300,7 +301,7 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
 
   assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
-  assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-300000\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-540000\}/)
   const transcriptEnvironmentNames = [
     'MAX_BYTES',
     'REQUEST_RESERVE_BYTES',
@@ -318,7 +319,7 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.doesNotMatch(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_REQUEST_TIMEOUT_MS/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
-  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000/)
   assert.match(dockerfile, /ENV QWEN_AI_REQUEST_TIMEOUT_MS=540000/)
   assert.match(dockerfile, /ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0/)
   assert.match(governorSource, /numberFromEnv\('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS',\s*120 \* 1000\)/)

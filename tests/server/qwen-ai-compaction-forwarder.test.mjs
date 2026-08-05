@@ -4,6 +4,9 @@ import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import {
+  sanitizeAssistantInputHistory as sanitizeRealAssistantInputHistory,
+} from '../../src/main/proxy/toolCalling/assistantInputBoundary.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 
@@ -274,6 +277,9 @@ function loadRequestForwarder(overrides = {}) {
       ToolCallingEngine: MockToolCallingEngine,
       createToolWorkflowContinuationMessage: () => ({ role: 'user', content: 'continue' }),
     },
+    './toolCalling/assistantInputBoundary': {
+      sanitizeAssistantInputHistory: sanitizeRealAssistantInputHistory,
+    },
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: {
         getStatus: () => {
@@ -403,6 +409,7 @@ function loadRequestForwarder(overrides = {}) {
       }),
     },
     './qwenAiCompactionBoundary': {
+      estimateQwenAiRequestInputTokens: () => 1,
       boundQwenAiCompactionMessages: messages => ({
         messages: messages.slice(0, 1),
         chunks: [],

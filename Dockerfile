@@ -55,7 +55,7 @@ ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
 # no-progress budget; it pauses while a replacement stream is active.
 ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
 # Semantic continuation branches also share an absolute wall-clock deadline.
-ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000
+ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
 # Busy-chat admission is bounded separately from the long generation timeout.
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000

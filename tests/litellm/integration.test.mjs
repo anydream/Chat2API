@@ -68,7 +68,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
-  assert.match(serverCompose, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-300000\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-540000\}/)
   const transcriptEnvironmentNames = [
     'MAX_BYTES',
     'REQUEST_RESERVE_BYTES',
@@ -86,7 +86,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
-  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000/)
   assert.doesNotMatch(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=/)

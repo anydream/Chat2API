@@ -11,7 +11,105 @@ const output = ts.transpileModule(source, {
 }).outputText
 const module = { exports: {} }
 new Function('require', 'module', 'exports', output)(require, module, module.exports)
-const { boundQwenAiCompactionMessages } = module.exports
+const {
+  boundQwenAiCompactionMessages,
+  estimateQwenAiRequestInputTokens,
+} = module.exports
+
+test('request input estimate includes the complete tool schema', () => {
+  const request = {
+    model: 'qwen3-coder-plus',
+    messages: [{ role: 'user', content: 'Inspect the workspace.' }],
+  }
+  const withoutTools = estimateQwenAiRequestInputTokens(request)
+  const withTools = estimateQwenAiRequestInputTokens({
+    ...request,
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'inspect_workspace',
+        description: 'Inspect files and return matching records.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'x'.repeat(30_000),
+            },
+          },
+          required: ['query'],
+        },
+      },
+    }],
+  })
+
+  assert.ok(withTools > withoutTools + 10_000)
+})
+
+test('request input estimate treats inline base64 as a bounded upload reference', () => {
+  const estimateWithPayload = payload => estimateQwenAiRequestInputTokens({
+    model: 'qwen3-vl-plus',
+    messages: [{
+      role: 'user',
+      content: [{
+        type: 'image_url',
+        image_url: { url: `data:image/png;base64,${payload}`, detail: 'high' },
+      }],
+    }],
+  })
+  const shortPayload = estimateWithPayload('AAAA')
+  const longPayload = estimateWithPayload('A'.repeat(250_000))
+
+  assert.ok(Math.abs(longPayload - shortPayload) <= 1)
+})
+
+test('request input estimate includes messages, tool calls, and tool results', () => {
+  const empty = estimateQwenAiRequestInputTokens({
+    model: 'qwen3-coder-plus',
+    messages: [],
+  })
+  const conversation = [{ role: 'user', content: 'Run the lookup.' }]
+  const messagesOnly = estimateQwenAiRequestInputTokens({
+    model: 'qwen3-coder-plus',
+    messages: conversation,
+  })
+  const withToolCall = estimateQwenAiRequestInputTokens({
+    model: 'qwen3-coder-plus',
+    messages: [
+      ...conversation,
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_lookup',
+          type: 'function',
+          function: { name: 'lookup', arguments: JSON.stringify({ query: 'x'.repeat(600) }) },
+        }],
+      },
+    ],
+  })
+  const withToolResult = estimateQwenAiRequestInputTokens({
+    model: 'qwen3-coder-plus',
+    messages: [
+      ...conversation,
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_lookup',
+          type: 'function',
+          function: { name: 'lookup', arguments: JSON.stringify({ query: 'x'.repeat(600) }) },
+        }],
+      },
+      { role: 'tool', tool_call_id: 'call_lookup', content: 'result-'.repeat(100) },
+    ],
+  })
+
+  assert.equal(empty, 1)
+  assert.ok(messagesOnly > empty)
+  assert.ok(withToolCall > messagesOnly)
+  assert.ok(withToolResult > withToolCall)
+})
 
 test('compaction boundary derives input budget and preserves complete messages', () => {
   const previous = process.env.CHAT2API_QWEN_AI_COMPACTION_METADATA_MAX_INPUT_TOKENS

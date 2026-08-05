@@ -1338,14 +1338,11 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
     const pending = pendingLocalIds.get(rawToolCallId) ?? []
     const localId = pending[0] ?? rawToolCallId
     pendingLocalIds.set(rawToolCallId, pending.slice(1))
-    const toolResultContent = isError
-      ? `Tool execution failed (is_error=true):\n${resultText}`
-      : resultText
     transcriptParts.push([
-      `Tool result for ${localId} (already executed by the client):`,
       toolProfile.formatToolResult({
         toolCallId: localId,
-        content: toolResultContent,
+        content: resultText,
+        isError,
       }),
       'Use this result to decide the next step.',
     ].join('\n'))

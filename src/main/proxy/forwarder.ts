@@ -42,6 +42,7 @@ import { PerplexityStreamHandler } from './adapters/perplexity-stream'
 import { ToolCallingEngine } from './toolCalling/ToolCallingEngine'
 import { createToolWorkflowContinuationMessage } from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
+import { sanitizeAssistantInputHistory } from './toolCalling/assistantInputBoundary'
 import {
   qwenAiRequestGovernor,
   type QwenAiRequestClass,
@@ -60,6 +61,7 @@ import {
 } from './requestIntent'
 import {
   boundQwenAiCompactionMessages as boundQwenAiMessages,
+  estimateQwenAiRequestInputTokens,
   planQwenAiCompactionChunks,
   type QwenAiCompactionChunk,
 } from './qwenAiCompactionBoundary'
@@ -997,6 +999,20 @@ export class RequestForwarder {
     const startTime = Number.isFinite(context.startTime)
       ? Math.min(observedAt, context.startTime)
       : observedAt
+    const sanitizedHistory = sanitizeAssistantInputHistory(request.messages)
+    if (sanitizedHistory.contaminatedFieldCount > 0) {
+      console.warn('[Forwarder] Removed managed tool-result wrapper from assistant input history', JSON.stringify({
+        requestId: context.requestId,
+        providerId: provider.id,
+        model: request.model,
+        contaminatedFieldCount: sanitizedHistory.contaminatedFieldCount,
+        removedMessageCount: sanitizedHistory.removedMessageCount,
+      }))
+    }
+    request = {
+      ...request,
+      messages: sanitizedHistory.messages,
+    }
     const config = storeManager.getConfig()
     const requestIntentInfo = classifyChatRequest(request)
     const requestIntent = context.requestIntent
@@ -2975,6 +2991,7 @@ export class RequestForwarder {
         },
       )
     }
+    const promptTokens = estimateQwenAiRequestInputTokens(request)
     const providerRequest = options.preparedRequest
       || prepareQwenAiCompactionRequest(request, requestIntent, provider, actualModel)
     const isContextCompaction = requestIntent === 'context_compaction'
@@ -3067,7 +3084,12 @@ export class RequestForwarder {
         }
       }
 
-      const handler = new QwenAiStreamHandler(actualModel, undefined, transformed.plan)
+      const handler = new QwenAiStreamHandler(
+        actualModel,
+        undefined,
+        transformed.plan,
+        promptTokens,
+      )
       handler.setChatId(chatId)
       const canContinueManagedWorkflow = Boolean(
         transformed.plan.shouldParseResponse

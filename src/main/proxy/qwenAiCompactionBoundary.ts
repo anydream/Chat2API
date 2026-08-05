@@ -90,6 +90,26 @@ function estimateCompactionMessageTokens(message: ChatMessage): number {
   return tokens
 }
 
+function estimateStructuredTokens(value: unknown): number {
+  try {
+    return estimateTextTokens(JSON.stringify(value))
+  } catch {
+    return 0
+  }
+}
+
+/** Estimate the prompt tokens represented by the original OpenAI-compatible request. */
+export function estimateQwenAiRequestInputTokens(request: ChatCompletionRequest): number {
+  const messageTokens = request.messages.reduce(
+    (total, message) => total + estimateCompactionMessageTokens(message),
+    0,
+  )
+  const toolTokens = request.tools?.length
+    ? estimateStructuredTokens(request.tools)
+    : 0
+  return Math.max(1, messageTokens + toolTokens)
+}
+
 function messageTextChars(message: ChatMessage): number {
   if (typeof message.content === 'string') return message.content.length
   if (Array.isArray(message.content)) {

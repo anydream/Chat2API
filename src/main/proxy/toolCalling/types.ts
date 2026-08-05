@@ -30,6 +30,7 @@ export interface NormalizedToolResult {
   toolCallId: string
   name?: string
   content: string
+  isError?: boolean
 }
 
 export interface ToolCallDiagnostics {

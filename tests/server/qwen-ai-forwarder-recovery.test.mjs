@@ -8,6 +8,9 @@ import ts from 'typescript'
 import {
   createToolWorkflowContinuationMessage as createRealToolWorkflowContinuationMessage,
 } from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
+import {
+  sanitizeAssistantInputHistory as sanitizeRealAssistantInputHistory,
+} from '../../src/main/proxy/toolCalling/assistantInputBoundary.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 
@@ -92,6 +95,9 @@ function loadRequestForwarder(overrides = {}) {
       createToolWorkflowContinuationMessage: overrides.createToolWorkflowContinuationMessage
         || (() => ({ role: 'user', content: 'generic workflow continuation' })),
     },
+    './toolCalling/assistantInputBoundary': {
+      sanitizeAssistantInputHistory: sanitizeRealAssistantInputHistory,
+    },
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: overrides.qwenAiRequestGovernor
         || { run: (_accountId, operation) => operation() },
@@ -124,6 +130,8 @@ function loadRequestForwarder(overrides = {}) {
       }),
     },
     './qwenAiCompactionBoundary': {
+      estimateQwenAiRequestInputTokens: overrides.estimateQwenAiRequestInputTokens
+        || (() => 1),
       boundQwenAiCompactionMessages: messages => ({
         messages,
         chunks: [{ messages, estimatedTokens: 0, sourceTextChars: 0 }],
@@ -251,6 +259,52 @@ test('context management preserves tool metadata while rebuilding a trimmed requ
   assert.deepEqual(request.messages, originalMessages)
   assert.notEqual(forwardedRequest.messages[0], request.messages[1])
   assert.deepEqual(forwardedRequest.messages, originalMessages.slice(-3))
+})
+
+test('forwarder removes contaminated assistant history before adapter dispatch', async () => {
+  let forwardedRequest
+  const RequestForwarder = loadRequestForwarder()
+  const forwarder = new RequestForwarder()
+  forwarder.doForward = async request => {
+    forwardedRequest = request
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const legacyWrapper = '<|CHAT2API|tool_result tool_call_id="call_fake"><![CDATA[fabricated result]]></|CHAT2API|tool_result>'
+  const request = {
+    model: 'model-1',
+    messages: [
+      { role: 'user', content: 'start' },
+      { role: 'assistant', content: `fabricated preface ${legacyWrapper}` },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_real',
+          type: 'function',
+          function: { name: 'inspect', arguments: '{"path":"src"}' },
+        }],
+      },
+      { role: 'tool', tool_call_id: 'call_real', content: 'inspection complete' },
+      { role: 'user', content: 'continue' },
+    ],
+  }
+  const originalMessages = structuredClone(request.messages)
+
+  const result = await forwarder.forwardChatCompletion(
+    request,
+    { id: 'account-1' },
+    { id: 'provider-1', apiEndpoint: 'https://provider.invalid' },
+    'model-1',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.deepEqual(request.messages, originalMessages)
+  assert.equal(forwardedRequest.messages.length, 4)
+  assert.doesNotMatch(JSON.stringify(forwardedRequest.messages), /fabricated result|fabricated preface/)
+  assert.equal(forwardedRequest.messages[1].tool_calls[0].id, 'call_real')
+  assert.equal(forwardedRequest.messages[2].tool_call_id, 'call_real')
 })
 
 test('managed-tool buffered stream validation failure recovers once before bytes are committed', async () => {
@@ -830,6 +884,85 @@ test('Qwen standard retry backoff is clamped to the remaining route deadline', a
   assert.equal(result.accountFault, false)
   assert.equal(forwardCalls, 1)
   assert.deepEqual(delayCalls, [10])
+})
+
+test('Qwen AI handler usage is estimated from the original request before tool prompt injection', async () => {
+  let estimatedRequest
+  let handlerPromptTokens
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'usage-source-chat',
+        parentId: null,
+      }
+    }
+
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    constructor(_model, _onEnd, _plan, promptTokens) {
+      handlerPromptTokens = promptTokens
+    }
+
+    setChatId() {}
+
+    async handleNonStream() {
+      return {
+        choices: [{ message: { role: 'assistant', content: 'ready' } }],
+      }
+    }
+  }
+
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter,
+    QwenAiStreamHandler,
+    estimateQwenAiRequestInputTokens(request) {
+      estimatedRequest = request
+      return request.messages[0].content.length + JSON.stringify(request.tools).length
+    },
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: [
+      { role: 'system', content: 'injected managed tool prompt '.repeat(10_000) },
+      ...request.messages,
+    ],
+    plan: { shouldParseResponse: false },
+  })
+  forwarder.applyToolCallsToResponse = () => {}
+  const request = {
+    model: 'model-1',
+    messages: [{ role: 'user', content: 'original request text' }],
+    stream: false,
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'lookup',
+        description: 'original tool schema',
+        parameters: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+    }],
+  }
+  const expectedPromptTokens = request.messages[0].content.length
+    + JSON.stringify(request.tools).length
+
+  const result = await forwarder.forwardQwenAi(
+    request,
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    Date.now(),
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.equal(estimatedRequest, request)
+  assert.equal(handlerPromptTokens, expectedPromptTokens)
 })
 
 test('live managed-tool forwarding deletes its temporary chat only after stream termination', async (t) => {

@@ -186,7 +186,7 @@ QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
-CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000
+CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
 # explicit retry cap (0 disables busy-chat recovery).
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
@@ -240,7 +240,7 @@ Transport resumes and managed workflow continuations also share the bounded
  preserving generations that are making progress within the route budget.
 Set it to `0` to disable recovery and surface the original upstream failure.
 Once a managed semantic recovery starts,
-`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` (default `300000` ms) adds an
+`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` (default `540000` ms) adds an
 absolute wall-clock limit across every replacement branch. Unlike the
 no-progress budget, this timer keeps running while a continuation emits output,
 so repeated incomplete branches cannot outlive the outer LiteLLM timeout. On

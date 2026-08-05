@@ -288,6 +288,7 @@ export function buildMimoQuery(messages: MimoMessage[]): string {
         content: toolProfile.formatToolResult({
           toolCallId: message.tool_call_id,
           content: extractTextContent(message.content),
+          isError: (message as { is_error?: boolean }).is_error === true,
         }),
       })
       continue

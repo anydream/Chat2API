@@ -601,6 +601,49 @@ test('Qwen AI rejects a continuation that returns after its workflow timer was s
   initial.destroy()
 })
 
+test('Qwen AI workflow timeout wins over synchronous continuation cancellation', async () => {
+  const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+
+  const semanticError = Object.assign(
+    new Error('managed workflow incomplete'),
+    { code: 'qwen_ai_semantic_incomplete' },
+  )
+  let continuationSignal
+  const output = createQwenAiResumableStream(initial, {
+    getResponseId: () => 'response-synchronous-timeout-cancel',
+    getSemanticRecoveryError: () => undefined,
+    isComplete: () => false,
+    continueWorkflow: async (_responseId, _error, signal) => {
+      continuationSignal = signal
+      signal?.addEventListener('abort', () => {
+        continued.emit('error', Object.assign(
+          new Error('continuation canceled by recovery deadline'),
+          { name: 'CanceledError', code: 'ERR_CANCELED' },
+        ))
+      }, { once: true })
+      return { data: continued }
+    },
+    maxAttempts: 0,
+    delayMs: 0,
+    recoveryBudgetMs: 1_000,
+    workflowRecoveryTimeoutMs: 30,
+  })
+  output.on('error', () => {})
+  const errorPromise = once(output, 'error')
+  void output.recoverFromIdle(semanticError).catch(() => {})
+
+  const [error] = await errorPromise
+  assert.equal(error.status, 504)
+  assert.equal(error.code, 'qwen_ai_workflow_recovery_timeout')
+  assert.equal(continuationSignal?.aborted, true)
+  assert.equal(continued.destroyed, true)
+  initial.destroy()
+})
+
 test('Qwen AI client cancellation aborts a hanging resume immediately', async () => {
   const { createQwenAiResumableStream } = loadQwenAiStreamHandler()
   const controller = new AbortController()
@@ -1851,7 +1894,7 @@ test('Qwen AI preserves a terminal final answer after a successful tool result',
     allowedToolNames: new Set(['declared_tool']),
     tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
     toolChoiceMode: 'auto',
-  })
+  }, 731)
   handler.setChatId('test-chat')
   const parents = []
   const bridge = createQwenAiResumableStream(initial, {
@@ -1880,6 +1923,12 @@ test('Qwen AI preserves a terminal final answer after a successful tool result',
   const result = await resultPromise
   assert.deepEqual(parents, [])
   assert.equal(result.choices[0].message.content, 'The requested work is complete.')
+  assert.equal(result.usage.prompt_tokens, 731)
+  assert.ok(result.usage.completion_tokens > 1)
+  assert.equal(
+    result.usage.total_tokens,
+    result.usage.prompt_tokens + result.usage.completion_tokens,
+  )
 })
 
 test('Qwen AI non-stream preserves prose without a structural pending state', async () => {
@@ -2780,7 +2829,7 @@ test('Qwen AI stream normalizes complete native arguments against the declared s
       },
       source: 'openai',
     }],
-  })
+  }, 643)
   const output = await handler.handleStream(upstream)
   const chunks = []
   output.on('data', chunk => chunks.push(chunk))
@@ -2810,6 +2859,13 @@ test('Qwen AI stream normalizes complete native arguments against the declared s
     content: '{"enabled":true}',
     todos: [{ subject: 'verify', status: 'pending' }],
   })
+  const terminal = events.find(event => event.choices?.[0]?.finish_reason === 'tool_calls')
+  assert.equal(terminal.usage.prompt_tokens, 643)
+  assert.ok(terminal.usage.completion_tokens > 1)
+  assert.equal(
+    terminal.usage.total_tokens,
+    terminal.usage.prompt_tokens + terminal.usage.completion_tokens,
+  )
   assert.match(Buffer.concat(chunks).toString(), /\[DONE\]/)
   assert.equal(upstream.destroyed, true)
 })
@@ -2856,7 +2912,7 @@ test('Qwen AI stream completes a managed tool call without waiting for upstream 
     shouldParseResponse: true,
     allowedToolNames: new Set(['Write']),
     toolChoiceMode: 'auto',
-  })
+  }, 887)
   const output = await handler.handleStream(upstream, {
     responseTimeoutMs: 2_000,
     idleTimeoutMs: 1_000,
@@ -2884,6 +2940,16 @@ test('Qwen AI stream completes a managed tool call without waiting for upstream 
   assert.match(body, /"finish_reason":"tool_calls"/)
   assert.match(body, /\[DONE\]/)
   assert.equal(upstream.destroyed, true)
+  const terminal = body.split('\n\n')
+    .filter(block => block.startsWith('data: ') && !block.includes('[DONE]'))
+    .map(block => JSON.parse(block.slice('data: '.length)))
+    .find(event => event.choices?.[0]?.finish_reason === 'tool_calls')
+  assert.equal(terminal.usage.prompt_tokens, 887)
+  assert.ok(terminal.usage.completion_tokens > 1)
+  assert.equal(
+    terminal.usage.total_tokens,
+    terminal.usage.prompt_tokens + terminal.usage.completion_tokens,
+  )
 })
 
 test('Qwen AI stream normalizes legacy tool_use arguments against the declared schema', async () => {
@@ -2920,7 +2986,7 @@ test('Qwen AI stream normalizes legacy tool_use arguments against the declared s
       },
       source: 'openai',
     }],
-  })
+  }, 991)
   const output = await handler.handleStream(upstream)
   const chunks = []
   output.on('data', chunk => chunks.push(chunk))
@@ -2942,6 +3008,13 @@ test('Qwen AI stream normalizes legacy tool_use arguments against the declared s
     taskId: '1',
     content: '{"enabled":true}',
   })
+  const terminal = events.find(event => event.choices?.[0]?.finish_reason === 'tool_calls')
+  assert.equal(terminal.usage.prompt_tokens, 991)
+  assert.ok(terminal.usage.completion_tokens > 1)
+  assert.equal(
+    terminal.usage.total_tokens,
+    terminal.usage.prompt_tokens + terminal.usage.completion_tokens,
+  )
 })
 
 test('Qwen AI stream applies each declared schema to parallel native tool calls', async () => {
@@ -3523,7 +3596,7 @@ test('Qwen AI stream keeps real RGV587 congestion account-neutral', async () => 
 test('Qwen AI stream does not confuse token usage 429 with an HTTP rate limit', async () => {
   const { QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler()
   const upstream = new PassThrough()
-  const handler = new QwenAiStreamHandler('qwen3.8-max-preview')
+  const handler = new QwenAiStreamHandler('qwen3.8-max-preview', undefined, undefined, 1234)
   const output = await handler.handleStream(upstream)
   const chunks = []
   let failureCount = 0
@@ -3554,7 +3627,18 @@ test('Qwen AI stream does not confuse token usage 429 with an HTTP rate limit', 
 
   assert.equal(failureCount, 0)
   assert.equal(output.qwenAiFailure, undefined)
-  assert.match(Buffer.concat(chunks).toString(), /normal answer/)
+  const body = Buffer.concat(chunks).toString()
+  assert.match(body, /normal answer/)
+  const terminal = body.split('\n\n')
+    .filter(block => block.startsWith('data: ') && !block.includes('[DONE]'))
+    .map(block => JSON.parse(block.slice('data: '.length)))
+    .find(event => event.choices?.[0]?.finish_reason === 'stop')
+  assert.equal(terminal.usage.prompt_tokens, 1234)
+  assert.ok(terminal.usage.completion_tokens > 1)
+  assert.equal(
+    terminal.usage.total_tokens,
+    terminal.usage.prompt_tokens + terminal.usage.completion_tokens,
+  )
 })
 
 test('Qwen AI stream preserves an explicit 429 error envelope', async () => {

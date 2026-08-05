@@ -359,6 +359,7 @@ export class QwenAdapter {
         conversationParts.push(toolProfile.formatToolResult({
           toolCallId: msg.tool_call_id,
           content: extractTextContent(msg.content),
+          isError: (msg as { is_error?: boolean }).is_error === true,
         }))
       }
     }

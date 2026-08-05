@@ -164,8 +164,17 @@ export interface PreparedQwenAiMessage {
 
 export type QwenAiMessageTransport = 'inline' | 'document'
 
-export interface PrepareQwenAiMultimodalMessageOptions {
+export interface QwenAiFileOperationOptions {
+  signal?: AbortSignal
+  deadlineAt?: number
+}
+
+export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperationOptions {
   transport?: QwenAiMessageTransport
+}
+
+export interface QwenAiFileUploadPartOptions extends QwenAiFileOperationOptions {
+  includeEvidence?: boolean
 }
 
 interface QwenAiDocumentEvidence {
@@ -336,8 +345,164 @@ function uuid(): string {
   })
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+type QwenAiFileOperationError = Error & {
+  status?: number
+  code?: string
+  retryable?: boolean
+  accountFault?: boolean
+}
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+function operationDeadlineAt(options: QwenAiFileOperationOptions): number | undefined {
+  return Number.isFinite(options.deadlineAt) ? options.deadlineAt : undefined
+}
+
+function createQwenAiFileDeadlineError(): QwenAiFileOperationError {
+  const error = new Error('Qwen AI request deadline exceeded during file processing.') as QwenAiFileOperationError
+  error.status = 504
+  error.code = 'qwen_ai_request_timeout'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiFileAbortError(): QwenAiFileOperationError {
+  const error = new Error('Qwen AI file processing was cancelled by the client.') as QwenAiFileOperationError
+  error.name = 'AbortError'
+  error.status = 499
+  error.code = 'ERR_CANCELED'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+function throwIfQwenAiFileOperationStopped(options: QwenAiFileOperationOptions): void {
+  if (options.signal?.aborted) {
+    throw createQwenAiFileAbortError()
+  }
+
+  const deadlineAt = operationDeadlineAt(options)
+  if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+    throw createQwenAiFileDeadlineError()
+  }
+}
+
+function normalizeQwenAiFileOperationError(
+  error: unknown,
+  options: QwenAiFileOperationOptions,
+): unknown {
+  if ((error as QwenAiFileOperationError | undefined)?.code === 'qwen_ai_request_timeout') {
+    return error
+  }
+  if ((error as QwenAiFileOperationError | undefined)?.code === 'ERR_CANCELED') {
+    return error
+  }
+  if (options.signal?.aborted) {
+    return createQwenAiFileAbortError()
+  }
+  const deadlineAt = operationDeadlineAt(options)
+  if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+    return createQwenAiFileDeadlineError()
+  }
+  return error
+}
+
+function qwenAiFileOperationTimeout(
+  configuredTimeoutMs: number,
+  options: QwenAiFileOperationOptions,
+): number {
+  throwIfQwenAiFileOperationStopped(options)
+  const safeConfiguredTimeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+    ? Math.max(1, Math.floor(configuredTimeoutMs))
+    : 1
+  const deadlineAt = operationDeadlineAt(options)
+  if (deadlineAt === undefined) {
+    return safeConfiguredTimeoutMs
+  }
+  return Math.max(1, Math.min(safeConfiguredTimeoutMs, deadlineAt - Date.now()))
+}
+
+function waitForQwenAiFileOperation<T>(
+  operation: Promise<T>,
+  options: QwenAiFileOperationOptions,
+  cancelOperation?: () => void,
+): Promise<T> {
+  try {
+    throwIfQwenAiFileOperationStopped(options)
+  } catch (error) {
+    cancelOperation?.()
+    return Promise.reject(error)
+  }
+
+  const deadlineAt = operationDeadlineAt(options)
+  if (!options.signal && deadlineAt === undefined) {
+    return operation
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    let deadlineTimer: NodeJS.Timeout | undefined
+
+    const cleanup = () => {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer)
+        deadlineTimer = undefined
+      }
+      options.signal?.removeEventListener('abort', onAbort)
+    }
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      callback()
+    }
+    const cancel = () => {
+      try {
+        cancelOperation?.()
+      } catch {
+        // The structured cancellation error remains authoritative.
+      }
+    }
+    const onAbort = () => {
+      cancel()
+      finish(() => reject(createQwenAiFileAbortError()))
+    }
+    const scheduleDeadline = () => {
+      if (deadlineAt === undefined || settled) return
+      const remainingMs = deadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        cancel()
+        finish(() => reject(createQwenAiFileDeadlineError()))
+        return
+      }
+      deadlineTimer = setTimeout(scheduleDeadline, Math.min(MAX_TIMER_DELAY_MS, remainingMs))
+    }
+
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    scheduleDeadline()
+    operation.then(
+      value => {
+        try {
+          throwIfQwenAiFileOperationStopped(options)
+          finish(() => resolve(value))
+        } catch (error) {
+          finish(() => reject(error))
+        }
+      },
+      error => finish(() => reject(normalizeQwenAiFileOperationError(error, options))),
+    )
+  })
+}
+
+function delay(ms: number, options: QwenAiFileOperationOptions = {}): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  const operation = new Promise<void>(resolve => {
+    timer = setTimeout(resolve, Math.max(0, Math.min(MAX_TIMER_DELAY_MS, ms)))
+  })
+  return waitForQwenAiFileOperation(operation, options, () => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 function elapsedSeconds(startTime: number): string {
@@ -688,18 +853,26 @@ class QwenAiFileCache {
 class QwenAiFileUploadCoordinator {
   private readonly pending = new Map<string, Promise<any>>()
 
-  async run(key: string, operation: () => Promise<any>): Promise<any> {
-    const existing = this.pending.get(key)
-    if (existing) {
+  async run(
+    key: string,
+    operation: () => Promise<any>,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<any> {
+    let sharedOperation = this.pending.get(key)
+    if (sharedOperation) {
       console.log('[QwenAI][File] cache wait for in-flight upload')
-      return existing
+      // A late waiter owns only its wait. Cancelling it must not cancel the
+      // physical upload already owned by the first caller.
+      return waitForQwenAiFileOperation(sharedOperation, options)
     }
 
-    const promise = operation().finally(() => {
-      this.pending.delete(key)
+    sharedOperation = Promise.resolve().then(operation).finally(() => {
+      if (this.pending.get(key) === sharedOperation) {
+        this.pending.delete(key)
+      }
     })
-    this.pending.set(key, promise)
-    return promise
+    this.pending.set(key, sharedOperation)
+    return waitForQwenAiFileOperation(sharedOperation, options)
   }
 }
 
@@ -1762,8 +1935,9 @@ export class QwenAiFileUploader {
   async uploadPart(
     part: ChatMessageContent,
     evidenceQueryText = '',
-    options: { includeEvidence?: boolean } = {},
+    options: QwenAiFileUploadPartOptions = {},
   ): Promise<UploadedQwenAiPart> {
+    throwIfQwenAiFileOperationStopped(options)
     const startedAt = Date.now()
     console.log(`[QwenAI][File] resolve start type=${part.type}`)
     const directUrl = part.type === 'input_audio' ? '' : extractPartUrl(part)
@@ -1781,10 +1955,12 @@ export class QwenAiFileUploader {
         )
       }
       console.log(`[QwenAI][File] direct cache hit filename="${directRecord.filename}" bytes=${directRecord.sizeBytes} account=${this.cacheScope.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+      throwIfQwenAiFileOperationStopped(options)
       return { file: cloneJson(directRecord.file) }
     }
 
-    const file = await this.resolveFile(part)
+    const file = await this.resolveFile(part, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] resolve done seconds=${elapsedSeconds(startedAt)} filename="${file.filename}" bytes=${file.sizeBytes} mime=${file.mimeType} local=${file.localPath ? 'yes' : 'no'}`)
 
     if (file.sizeBytes > MAX_FILE_SIZE) {
@@ -1794,29 +1970,43 @@ export class QwenAiFileUploader {
     const evidence = options.includeEvidence === false
       ? undefined
       : createDocumentEvidence(file, evidenceQueryText)
+    throwIfQwenAiFileOperationStopped(options)
     const cacheKey = qwenAiFileCache.createKey(this.cacheScope, file)
     if (cacheKey) {
       const cached = qwenAiFileCache.get(cacheKey, this.cacheScope, file)
       if (cached) {
         console.log(`[QwenAI][File] cache hit filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+        throwIfQwenAiFileOperationStopped(options)
         return { file: cached, evidence }
       }
       console.log(`[QwenAI][File] cache miss filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId}`)
-      const uploadedFile = await qwenAiFileUploadCoordinator.run(cacheKey, () => this.uploadResolvedFile(file, startedAt))
+      const uploadedFile = await qwenAiFileUploadCoordinator.run(
+        cacheKey,
+        () => this.uploadResolvedFile(file, startedAt, options),
+        options,
+      )
+      throwIfQwenAiFileOperationStopped(options)
       qwenAiFileCache.set(cacheKey, this.cacheScope, file, uploadedFile)
+      throwIfQwenAiFileOperationStopped(options)
       return {
         file: cloneCachedQwenFileItem(uploadedFile, file),
         evidence,
       }
     }
 
+    const uploadedFile = await this.uploadResolvedFile(file, startedAt, options)
+    throwIfQwenAiFileOperationStopped(options)
     return {
-      file: await this.uploadResolvedFile(file, startedAt),
+      file: uploadedFile,
       evidence,
     }
   }
 
-  async startDirectUpload(input: QwenAiDirectUploadInput): Promise<QwenAiDirectUploadStartResult> {
+  async startDirectUpload(
+    input: QwenAiDirectUploadInput,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<QwenAiDirectUploadStartResult> {
+    throwIfQwenAiFileOperationStopped(options)
     pruneQwenAiDirectUploadSessions()
     const startedAt = Date.now()
     const file = normalizeDirectUploadInput(input)
@@ -1837,7 +2027,8 @@ export class QwenAiFileUploader {
 
     const stsStartedAt = Date.now()
     console.log(`[QwenAI][File] direct sts start filename="${file.filename}" bytes=${file.sizeBytes} type=${file.coarseType}`)
-    const sts = await this.requestSts(file)
+    const sts = await this.requestSts(file, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] direct sts done seconds=${elapsedSeconds(stsStartedAt)} fileId=${sts.fileId}`)
 
     const sessionId = uuid()
@@ -1852,6 +2043,12 @@ export class QwenAiFileUploader {
       createdAt: Date.now(),
       expiresAt,
     })
+    try {
+      throwIfQwenAiFileOperationStopped(options)
+    } catch (error) {
+      qwenAiDirectUploadSessions.delete(sessionId)
+      throw error
+    }
 
     const multipartParams = qwenOssDirectMultipartParams(file.sizeBytes)
     return {
@@ -1893,7 +2090,11 @@ export class QwenAiFileUploader {
     }
   }
 
-  async completeDirectUpload(sessionId: string): Promise<any> {
+  async completeDirectUpload(
+    sessionId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<any> {
+    throwIfQwenAiFileOperationStopped(options)
     pruneQwenAiDirectUploadSessions()
     const session = qwenAiDirectUploadSessions.get(sessionId)
     if (!session) {
@@ -1904,10 +2105,11 @@ export class QwenAiFileUploader {
     if (session.file.fileClass === 'document') {
       const parseStartedAt = Date.now()
       console.log(`[QwenAI][File] direct parse start fileId=${session.sts.fileId}`)
-      await this.parseDocument(session.sts.fileId)
+      await this.parseDocument(session.sts.fileId, options)
       console.log(`[QwenAI][File] direct parse done seconds=${elapsedSeconds(parseStartedAt)} fileId=${session.sts.fileId}`)
     }
 
+    throwIfQwenAiFileOperationStopped(options)
     const fileItem = createQwenFileItem(session.file, session.sts)
     const record = qwenAiFileCache.setDirect(
       { providerId: session.providerId, accountId: session.accountId },
@@ -1916,36 +2118,51 @@ export class QwenAiFileUploader {
       fileItem,
     )
     qwenAiDirectUploadSessions.delete(sessionId)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] direct upload complete totalSeconds=${elapsedSeconds(startedAt)} filename="${session.file.filename}" bytes=${session.file.sizeBytes} fileId=${session.sts.fileId}`)
     return qwenAiDirectPublicFile(record)
   }
 
-  private async uploadResolvedFile(file: NormalizedInputFile, startedAt: number): Promise<any> {
+  private async uploadResolvedFile(
+    file: NormalizedInputFile,
+    startedAt: number,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<any> {
+    throwIfQwenAiFileOperationStopped(options)
     const stsStartedAt = Date.now()
     console.log(`[QwenAI][File] sts start filename="${file.filename}" bytes=${file.sizeBytes} type=${file.coarseType}`)
-    const sts = await this.requestSts(file)
+    const sts = await this.requestSts(file, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] sts done seconds=${elapsedSeconds(stsStartedAt)} fileId=${sts.fileId}`)
 
     const ossStartedAt = Date.now()
     console.log(`[QwenAI][File] oss upload start filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
-    await this.uploadToOss(file, sts)
+    await this.uploadToOss(file, sts, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] oss upload done seconds=${elapsedSeconds(ossStartedAt)} filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
 
     if (file.fileClass === 'document') {
       const parseStartedAt = Date.now()
       console.log(`[QwenAI][File] parse start fileId=${sts.fileId}`)
-      await this.parseDocument(sts.fileId)
+      await this.parseDocument(sts.fileId, options)
       console.log(`[QwenAI][File] parse done seconds=${elapsedSeconds(parseStartedAt)} fileId=${sts.fileId}`)
     }
 
+    throwIfQwenAiFileOperationStopped(options)
     const fileItem = createQwenFileItem(file, sts)
     console.log(`[QwenAI][File] upload complete totalSeconds=${elapsedSeconds(startedAt)} filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
     return fileItem
   }
 
-  private async resolveFile(part: ChatMessageContent): Promise<NormalizedInputFile> {
+  private async resolveFile(
+    part: ChatMessageContent,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<NormalizedInputFile> {
+    throwIfQwenAiFileOperationStopped(options)
     if (part.type === 'input_audio') {
-      return extractInputAudio(part)
+      const file = extractInputAudio(part)
+      throwIfQwenAiFileOperationStopped(options)
+      return file
     }
 
     const url = extractPartUrl(part)
@@ -1953,24 +2170,33 @@ export class QwenAiFileUploader {
     const explicitMimeType = part.mime_type
 
     if (isChat2ApiFileUrl(url)) {
-      return extractLocalFile(part)
+      const file = extractLocalFile(part)
+      throwIfQwenAiFileOperationStopped(options)
+      return file
     }
 
     if (isDataUrl(url)) {
-      return extractDataUrl(url, explicitFilename, explicitMimeType, part.type)
+      const file = extractDataUrl(url, explicitFilename, explicitMimeType, part.type)
+      throwIfQwenAiFileOperationStopped(options)
+      return file
     }
 
     if (!isHttpUrl(url)) {
       throw new Error(`Unsupported Qwen AI file URL scheme for ${part.type}`)
     }
 
-    const response = await this.axiosInstance.get(url, {
-      responseType: 'arraybuffer',
-      maxContentLength: MAX_FILE_SIZE,
-      maxBodyLength: MAX_FILE_SIZE,
-      timeout: 60000,
-      validateStatus: () => true,
-    })
+    const response = await waitForQwenAiFileOperation(
+      this.axiosInstance.get(url, {
+        responseType: 'arraybuffer',
+        maxContentLength: MAX_FILE_SIZE,
+        maxBodyLength: MAX_FILE_SIZE,
+        timeout: qwenAiFileOperationTimeout(60000, options),
+        signal: options.signal,
+        validateStatus: () => true,
+      }),
+      options,
+    )
+    throwIfQwenAiFileOperationStopped(options)
 
     if (response.status >= 400) {
       throw new Error(`Failed to download Qwen AI input file: HTTP ${response.status}`)
@@ -1994,7 +2220,11 @@ export class QwenAiFileUploader {
     }
   }
 
-  private async requestSts(file: NormalizedInputFile): Promise<QwenStsInfo> {
+  private async requestSts(
+    file: NormalizedInputFile,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<QwenStsInfo> {
+    throwIfQwenAiFileOperationStopped(options)
     const response = await this.postJson(
       `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
       {
@@ -2007,8 +2237,10 @@ export class QwenAiFileUploader {
         timeout: 30000,
         validateStatus: () => true,
       }),
+      options,
     )
 
+    throwIfQwenAiFileOperationStopped(options)
     if (response.status >= 400) {
       throw new Error(`Qwen AI upload STS request failed: HTTP ${response.status}`)
     }
@@ -2016,13 +2248,18 @@ export class QwenAiFileUploader {
     return normalizeStsResponse(response.data)
   }
 
-  private async uploadToOss(file: NormalizedInputFile, sts: QwenStsInfo): Promise<void> {
+  private async uploadToOss(
+    file: NormalizedInputFile,
+    sts: QwenStsInfo,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<void> {
+    throwIfQwenAiFileOperationStopped(options)
     const refreshOptions = sts.securityToken
       ? {
           refreshSTSToken: async () => {
             const refreshStartedAt = Date.now()
             console.log(`[QwenAI][File] sts refresh start filename="${file.filename}"`)
-            const refreshed = await this.requestSts(file)
+            const refreshed = await this.requestSts(file, options)
             if (!refreshed.securityToken) {
               throw new Error('Qwen AI refreshed upload STS response is missing its security token')
             }
@@ -2039,6 +2276,7 @@ export class QwenAiFileUploader {
           refreshSTSTokenInterval: OSS_STS_REFRESH_INTERVAL_MS,
         }
       : {}
+    const uploadTimeoutMs = qwenAiFileOperationTimeout(OSS_UPLOAD_TIMEOUT_MS, options)
     const client = new OSS({
       accessKeyId: sts.accessKeyId,
       accessKeySecret: sts.accessKeySecret,
@@ -2047,7 +2285,7 @@ export class QwenAiFileUploader {
       region: sts.region,
       endpoint: sts.endpoint,
       authorizationV4: true,
-      timeout: OSS_UPLOAD_TIMEOUT_MS,
+      timeout: uploadTimeoutMs,
       retryMax: OSS_UPLOAD_RETRY_MAX,
       ...refreshOptions,
     } as any)
@@ -2056,7 +2294,7 @@ export class QwenAiFileUploader {
       headers: {
         'Content-Type': file.mimeType,
       },
-      timeout: OSS_UPLOAD_TIMEOUT_MS,
+      timeout: uploadTimeoutMs,
       mime: file.mimeType,
     } as any
 
@@ -2065,19 +2303,31 @@ export class QwenAiFileUploader {
       throw new Error(`Qwen AI input file has no upload source: ${file.filename}`)
     }
 
-    if (file.sizeBytes < OSS_SINGLE_PUT_MAX_BYTES) {
-      await client.put(sts.filePath, uploadSource, uploadOptions)
-      return
-    }
+    const upload = Promise.resolve().then(async () => {
+      if (file.sizeBytes < OSS_SINGLE_PUT_MAX_BYTES) {
+        await client.put(sts.filePath, uploadSource, uploadOptions)
+        return
+      }
 
-    const multipartParams = qwenOssMultipartParams(file.sizeBytes)
-    await client.multipartUpload(sts.filePath, uploadSource, {
-      ...uploadOptions,
-      ...multipartParams,
+      const multipartParams = qwenOssMultipartParams(file.sizeBytes)
+      await client.multipartUpload(sts.filePath, uploadSource, {
+        ...uploadOptions,
+        ...multipartParams,
+      })
     })
+    await waitForQwenAiFileOperation(upload, options, () => {
+      if (typeof (client as any).cancel === 'function') {
+        ;(client as any).cancel()
+      }
+    })
+    throwIfQwenAiFileOperationStopped(options)
   }
 
-  private async parseDocument(fileId: string): Promise<void> {
+  private async parseDocument(
+    fileId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<void> {
+    throwIfQwenAiFileOperationStopped(options)
     const parseResponse = await this.postJson(
       `${QWEN_AI_BASE}/api/v2/files/parse`,
       { file_id: fileId },
@@ -2086,32 +2336,48 @@ export class QwenAiFileUploader {
         timeout: 30000,
         validateStatus: () => true,
       }),
+      options,
     )
 
+    throwIfQwenAiFileOperationStopped(options)
     if (parseResponse.status >= 400) {
       throw new Error(`Qwen AI file parse request failed: HTTP ${parseResponse.status}`)
     }
 
-    await this.waitForParse(fileId)
+    await this.waitForParse(fileId, options)
   }
 
-  private async waitForParse(fileId: string): Promise<void> {
-    const deadline = Date.now() + PARSE_POLL_TIMEOUT_MS
+  private async waitForParse(
+    fileId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<void> {
+    throwIfQwenAiFileOperationStopped(options)
+    const parseDeadlineAt = Date.now() + PARSE_POLL_TIMEOUT_MS
+    const requestDeadlineAt = operationDeadlineAt(options)
+    const pollingDeadlineAt = requestDeadlineAt === undefined
+      ? parseDeadlineAt
+      : Math.min(parseDeadlineAt, requestDeadlineAt)
     let lastStatus = ''
 
-    while (Date.now() < deadline) {
-      await delay(PARSE_POLL_INTERVAL_MS)
+    while (Date.now() < pollingDeadlineAt) {
+      const waitMs = Math.min(PARSE_POLL_INTERVAL_MS, pollingDeadlineAt - Date.now())
+      await delay(waitMs, options)
+      throwIfQwenAiFileOperationStopped(options)
+      if (Date.now() >= pollingDeadlineAt) break
 
       const response: AxiosResponse = await this.postJson(
         `${QWEN_AI_BASE}/api/v2/files/parse/status`,
         { file_id_list: [fileId] },
         () => ({
           headers: this.getHeaders(),
-          timeout: 30000,
+          timeout: Math.max(1, Math.min(30000, pollingDeadlineAt - Date.now())),
           validateStatus: () => true,
         }),
+        options,
       )
 
+      throwIfQwenAiFileOperationStopped(options)
+      if (Date.now() >= pollingDeadlineAt) break
       if (response.status >= 400) {
         throw new Error(`Qwen AI file parse status request failed: HTTP ${response.status}`)
       }
@@ -2133,6 +2399,7 @@ export class QwenAiFileUploader {
       }
     }
 
+    throwIfQwenAiFileOperationStopped(options)
     throw new Error(
       `Qwen AI file parse timed out after ${PARSE_POLL_TIMEOUT_MS}ms${lastStatus ? ` (last status: ${lastStatus})` : ''}`,
     )
@@ -2142,12 +2409,28 @@ export class QwenAiFileUploader {
     url: string,
     payload: unknown,
     createOptions: () => Record<string, any>,
+    options: QwenAiFileOperationOptions = {},
   ): Promise<AxiosResponse> {
-    if (this.postWithRefreshRetry) {
-      return this.postWithRefreshRetry(url, payload, createOptions)
+    throwIfQwenAiFileOperationStopped(options)
+    const createOperationOptions = () => {
+      throwIfQwenAiFileOperationStopped(options)
+      const requestOptions = createOptions()
+      const configuredTimeout = Number(requestOptions.timeout)
+      return {
+        ...requestOptions,
+        ...(Number.isFinite(configuredTimeout) && configuredTimeout > 0
+          ? { timeout: qwenAiFileOperationTimeout(configuredTimeout, options) }
+          : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
+      }
     }
 
-    return this.axiosInstance.post(url, payload, createOptions())
+    const operation = this.postWithRefreshRetry
+      ? this.postWithRefreshRetry(url, payload, createOperationOptions)
+      : this.axiosInstance.post(url, payload, createOperationOptions())
+    const response = await waitForQwenAiFileOperation(operation, options)
+    throwIfQwenAiFileOperationStopped(options)
+    return response
   }
 }
 
@@ -2177,6 +2460,7 @@ export async function prepareQwenAiMultimodalMessage(
   uploader: QwenAiFileUploader,
   options: PrepareQwenAiMultimodalMessageOptions = {},
 ): Promise<PreparedQwenAiMessage> {
+  throwIfQwenAiFileOperationStopped(options)
   const { content: userContent, fileParts } = buildQwenAiTranscript(messages)
   const uniqueFileParts = deduplicateQwenFileParts(fileParts)
   const transport = options.transport ?? 'inline'
@@ -2193,11 +2477,15 @@ export async function prepareQwenAiMultimodalMessage(
   const files: any[] = []
   const evidences: QwenAiDocumentEvidence[] = []
   for (const part of uploadedParts) {
+    throwIfQwenAiFileOperationStopped(options)
     const uploaded = await uploader.uploadPart(part, inlineContent, {
       // This transport exists specifically to avoid re-sending the large
       // transcript inline. Qwen still receives every source attachment.
       includeEvidence: transport !== 'document',
+      signal: options.signal,
+      deadlineAt: options.deadlineAt,
     })
+    throwIfQwenAiFileOperationStopped(options)
     files.push(uploaded.file)
     if (uploaded.evidence) {
       evidences.push(uploaded.evidence)
@@ -2205,9 +2493,11 @@ export async function prepareQwenAiMultimodalMessage(
   }
 
   const documentEvidence = renderDocumentEvidence(evidences)
+  throwIfQwenAiFileOperationStopped(options)
   const content = documentEvidence
     ? `${inlineContent}\n\n${documentEvidence}`
     : inlineContent
+  throwIfQwenAiFileOperationStopped(options)
 
   return {
     content,

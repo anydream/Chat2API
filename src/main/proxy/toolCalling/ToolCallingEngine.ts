@@ -12,6 +12,10 @@ import { buildToolCallingRuntimePlan } from './runtimePlan.ts'
 import type { NormalizedToolDefinition, ToolCallingPlan, ToolCallingTransformResult, ToolProtocolId } from './types.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
 import {
+  createManagedToolResultWrapperLeakError,
+  stripManagedToolResultWrappers,
+} from './managedToolResultGuard.ts'
+import {
   hasTrailingMatchedToolResultBatch,
   isToolResultMessage,
 } from './workflowHeuristics.ts'
@@ -128,12 +132,65 @@ export class ToolCallingEngine {
   }
 
   applyNonStreamResponse(result: any, plan: ToolCallingPlan): void {
+    const choices = Array.isArray(result?.choices) ? result.choices : []
+    const message = choices[0]?.message
+    if (!message) return
+
+    let guardedContent: string | undefined
+    for (let choiceIndex = 0; choiceIndex < choices.length; choiceIndex += 1) {
+      const choiceMessage = choices[choiceIndex]?.message
+      if (!choiceMessage || typeof choiceMessage !== 'object') continue
+
+      const assistantTextFields: Array<{
+        field: string
+        value: unknown
+        protectedProtocol: ToolProtocolId | null
+        primaryContent?: boolean
+      }> = [
+        {
+          field: 'content',
+          value: choiceMessage.content,
+          protectedProtocol: plan.shouldParseResponse ? plan.protocol : null,
+          primaryContent: choiceIndex === 0,
+        },
+        { field: 'reasoning_content', value: choiceMessage.reasoning_content, protectedProtocol: null },
+        { field: 'reasoning', value: choiceMessage.reasoning, protectedProtocol: null },
+        { field: 'thinking', value: choiceMessage.thinking, protectedProtocol: null },
+        { field: 'summary', value: choiceMessage.summary, protectedProtocol: null },
+      ]
+      appendStructuredAssistantTextFields(
+        assistantTextFields,
+        choiceMessage.content,
+        `choices[${choiceIndex}].message.content`,
+      )
+
+      for (const candidate of assistantTextFields) {
+        if (typeof candidate.value !== 'string') continue
+        const guarded = stripManagedToolResultWrappers(
+          candidate.value,
+          candidate.protectedProtocol,
+        )
+        if (guarded.wrapperLeakDetected) {
+          console.warn('[ToolCalling] Blocked leaked managed tool-result wrapper', JSON.stringify({
+            wrapperLeakDetected: true,
+            requestId: plan.diagnostics.requestId,
+            providerId: plan.diagnostics.providerId,
+            model: plan.diagnostics.actualModel || plan.diagnostics.model,
+            protocol: plan.protocol,
+            channel: candidate.field,
+          }))
+          throw createManagedToolResultWrapperLeakError(candidate.field)
+        }
+        if (candidate.primaryContent && candidate.field === 'content') {
+          guardedContent = guarded.content
+        }
+      }
+    }
+
+    if (guardedContent === undefined) return
     if (!plan.shouldParseResponse) return
 
-    const message = result?.choices?.[0]?.message
-    if (!message || typeof message.content !== 'string') return
-
-    const parseResult = parseSelectedProtocol(message.content, plan, { allowPartial: true })
+    const parseResult = parseSelectedProtocol(guardedContent, plan, { allowPartial: true })
     const deduplicated = deduplicateEquivalentToolCalls(parseResult.toolCalls)
     if (deduplicated.duplicateCount > 0) {
       console.warn(`[ToolCalling] Suppressed ${deduplicated.duplicateCount} duplicate tool call(s) in one non-stream response`)
@@ -163,9 +220,46 @@ export class ToolCallingEngine {
       id: `${callIdPrefix}_${index}`,
     }))
 
-    const choice = result.choices[0]
+    const choice = choices[0]
     choice.finish_reason = 'tool_calls'
   }
+}
+
+function appendStructuredAssistantTextFields(
+  fields: Array<{
+    field: string
+    value: unknown
+    protectedProtocol: ToolProtocolId | null
+  }>,
+  content: unknown,
+  fieldPrefix: string,
+): void {
+  if (!Array.isArray(content)) return
+
+  const visibleBlockTypes = new Set(['text', 'output_text', 'reasoning', 'thinking', 'summary'])
+  content.forEach((part, index) => {
+    if (typeof part === 'string') {
+      fields.push({
+        field: `${fieldPrefix}[${index}]`,
+        value: part,
+        protectedProtocol: null,
+      })
+      return
+    }
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return
+
+    const record = part as Record<string, unknown>
+    const type = typeof record.type === 'string' ? record.type : undefined
+    if (type && !visibleBlockTypes.has(type)) return
+    for (const key of ['text', 'content'] as const) {
+      if (typeof record[key] !== 'string') continue
+      fields.push({
+        field: `${fieldPrefix}[${index}].${key}`,
+        value: record[key],
+        protectedProtocol: null,
+      })
+    }
+  })
 }
 
 /**

@@ -608,6 +608,12 @@ test('Responses reaches account six after five Qwen 403 and 429 failures', async
       'account-pool-5',
       'account-pool-6',
     ])
+    assert.equal(calls.forwardContexts.length, 6)
+    assert.equal(Number.isFinite(calls.forwardContexts[0].startTime), true)
+    assert.deepEqual(
+      [...new Set(calls.forwardContexts.map(context => context.startTime))],
+      [calls.forwardContexts[0].startTime],
+    )
     assert.deepEqual(calls.failed, calls.attemptedAccountIds.slice(0, 5))
     assert.deepEqual(calls.cleared, ['account-pool-6'])
     assert.deepEqual(calls.usage, ['account-pool-6'])

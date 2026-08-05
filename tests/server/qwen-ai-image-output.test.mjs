@@ -5,6 +5,10 @@ import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import {
+  ManagedToolResultGuard as RealManagedToolResultGuard,
+  stripManagedToolResultWrappers as realStripManagedToolResultWrappers,
+} from '../../src/main/proxy/toolCalling/managedToolResultGuard.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3xkAAAAASUVORK5CYII='
@@ -63,6 +67,10 @@ function loadQwenAiModule() {
     },
     '../toolCalling/ToolStreamParser': {
       ToolStreamParser: class {},
+    },
+    '../toolCalling/managedToolResultGuard': {
+      ManagedToolResultGuard: RealManagedToolResultGuard,
+      stripManagedToolResultWrappers: realStripManagedToolResultWrappers,
     },
     '../toolCalling/protocols': {
       getToolProtocol: () => ({ parse: () => ({ toolCalls: [] }) }),

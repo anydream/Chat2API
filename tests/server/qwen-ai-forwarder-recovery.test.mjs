@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { once } from 'node:events'
+import { getEventListeners, once } from 'node:events'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
@@ -93,7 +93,8 @@ function loadRequestForwarder(overrides = {}) {
         || (() => ({ role: 'user', content: 'generic workflow continuation' })),
     },
     './qwenAiRequestGovernor': {
-      qwenAiRequestGovernor: { run: (_accountId, operation) => operation() },
+      qwenAiRequestGovernor: overrides.qwenAiRequestGovernor
+        || { run: (_accountId, operation) => operation() },
     },
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
@@ -611,6 +612,226 @@ test('Qwen upstream busy retry stops immediately when the client aborts', async 
   assert.equal(attempts, 1)
 })
 
+test('Qwen request deadline stays absolute across governor queue time and account attempts', async (t) => {
+  const originalNow = Date.now
+  let now = 1_000_000
+  let governorAdvanceMs = 30
+  Date.now = () => now
+  t.after(() => {
+    Date.now = originalNow
+  })
+
+  const adapterRequests = []
+  const governorDeadlines = []
+  const resumableOptions = []
+  const streamHandlingOptions = []
+  const nonStreamHandlingOptions = []
+  const streams = []
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion(request) {
+      adapterRequests.push(request)
+      const stream = new PassThrough()
+      streams.push(stream)
+      stream.end('data: {"choices":[{"delta":{"content":"ready"}}]}\n\n')
+      return {
+        response: { status: 200, data: stream, headers: {} },
+        chatId: `deadline-chat-${adapterRequests.length}`,
+        parentId: null,
+      }
+    }
+
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+    getResponseId() { return '' }
+    getPendingSemanticRecoveryError() { return undefined }
+    isComplete() { return true }
+    async handleStream(stream, options) {
+      streamHandlingOptions.push(options)
+      return stream
+    }
+    async handleNonStream(_stream, options) {
+      nonStreamHandlingOptions.push(options)
+      return {
+        choices: [{ message: { role: 'assistant', content: 'ready' } }],
+      }
+    }
+  }
+
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter,
+    QwenAiStreamHandler,
+    qwenAiRequestTimeoutMs: 100,
+    qwenAiRequestGovernor: {
+      async run(_accountId, operation, options) {
+        governorDeadlines.push(options.deadlineAt)
+        now += governorAdvanceMs
+        return operation()
+      },
+    },
+    createQwenAiResumableStream(stream, options) {
+      resumableOptions.push(options)
+      return stream
+    },
+  })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: false },
+  })
+  forwarder.applyToolCallsToResponse = () => {}
+  const firstStartedAt = now
+  const context = {
+    signal: new AbortController().signal,
+    startTime: firstStartedAt,
+  }
+  const first = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    context,
+  )
+
+  assert.equal(first.success, true)
+  assert.equal(adapterRequests[0].timeoutMs, 70)
+  assert.equal(adapterRequests[0].deadlineAt, firstStartedAt + 100)
+  assert.equal(resumableOptions[0].workflowRecoveryDeadlineAt, firstStartedAt + 100)
+  assert.equal(streamHandlingOptions[0].requestDeadlineAt, firstStartedAt + 100)
+
+  const second = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: false },
+    { id: 'account-2' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    context,
+  )
+
+  assert.equal(second.success, true)
+  assert.equal(adapterRequests[1].timeoutMs, 40)
+  assert.equal(adapterRequests[1].deadlineAt, firstStartedAt + 100)
+  assert.equal(resumableOptions[1].workflowRecoveryDeadlineAt, firstStartedAt + 100)
+  assert.equal(nonStreamHandlingOptions[0].requestDeadlineAt, firstStartedAt + 100)
+
+  governorAdvanceMs = 50
+  const expired = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [], stream: true },
+    { id: 'account-3' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    context,
+  )
+
+  assert.equal(expired.success, false)
+  assert.equal(expired.status, 504)
+  assert.equal(expired.errorCode, 'qwen_ai_request_timeout')
+  assert.equal(expired.retryable, false)
+  assert.equal(expired.accountFault, false)
+  assert.deepEqual(governorDeadlines, [
+    firstStartedAt + 100,
+    firstStartedAt + 100,
+    firstStartedAt + 100,
+  ])
+  assert.equal(adapterRequests.length, 2)
+  assert.equal(resumableOptions.length, 2)
+
+  for (const stream of streams) stream.destroy()
+})
+
+test('Qwen context management cannot outlive the cumulative request deadline', async () => {
+  const controller = new AbortController()
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 60,
+    storeConfig: {
+      retryCount: 0,
+      contextManagement: { enabled: true },
+      toolCallingConfig: {},
+    },
+    processContextMessages: async () => new Promise(() => {}),
+  })
+  const forwarder = new RequestForwarder()
+  let forwardCalls = 0
+  forwarder.doForward = async () => {
+    forwardCalls += 1
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+  const startedAt = Date.now()
+
+  const result = await forwarder.forwardChatCompletion(
+    { model: 'model-1', messages: [{ role: 'user', content: 'long context' }], stream: false },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: controller.signal, startTime: startedAt },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.status, 504)
+  assert.equal(result.errorCode, 'qwen_ai_request_timeout')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(forwardCalls, 0)
+  assert.ok(Date.now() - startedAt < 500)
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+})
+
+test('Qwen standard retry backoff is clamped to the remaining route deadline', async (t) => {
+  const originalNow = Date.now
+  let now = 2_000_000
+  Date.now = () => now
+  t.after(() => {
+    Date.now = originalNow
+  })
+
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 100 })
+  const forwarder = new RequestForwarder()
+  const delayCalls = []
+  let forwardCalls = 0
+  forwarder.delay = async (ms) => {
+    delayCalls.push(ms)
+    now += ms
+    return true
+  }
+  forwarder.doForward = async () => {
+    forwardCalls += 1
+    now += 90
+    return {
+      success: false,
+      status: 502,
+      error: 'managed validation failed',
+      retryable: true,
+      recoveryHint: 'managed_tool_stream_validation',
+    }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    {
+      model: 'model-1',
+      messages: [{ role: 'user', content: 'use a tool' }],
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'work', parameters: {} } }],
+      tool_choice: 'auto',
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'model-1',
+    { signal: new AbortController().signal, startTime: now },
+  )
+
+  assert.equal(result.success, false)
+  assert.equal(result.status, 504)
+  assert.equal(result.errorCode, 'qwen_ai_request_timeout')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(forwardCalls, 1)
+  assert.deepEqual(delayCalls, [10])
+})
+
 test('live managed-tool forwarding deletes its temporary chat only after stream termination', async (t) => {
   const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
   process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'false'
@@ -690,6 +911,66 @@ test('live managed-tool forwarding deletes its temporary chat only after stream 
   output.destroy()
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(deleteCalls, ['temporary-chat-1'])
+})
+
+test('Qwen non-stream success does not wait for temporary chat deletion', async () => {
+  const deleteCalls = []
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion() {
+      return {
+        response: { status: 200, data: new PassThrough(), headers: {} },
+        chatId: 'temporary-chat-non-stream',
+        parentId: null,
+      }
+    }
+
+    async deleteChat(chatId) {
+      deleteCalls.push(chatId)
+      return new Promise(() => {})
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId() {}
+
+    async handleNonStream() {
+      return {
+        choices: [{ message: { role: 'assistant', content: 'ready' } }],
+      }
+    }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: { shouldParseResponse: false },
+  })
+  forwarder.applyToolCallsToResponse = () => {}
+
+  let timeout
+  const result = await Promise.race([
+    forwarder.forwardQwenAi(
+      { model: 'model-1', messages: [], stream: false },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      Date.now(),
+      { signal: new AbortController().signal },
+    ),
+    new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('non-stream response waited for deleteChat')), 250)
+    }),
+  ]).finally(() => clearTimeout(timeout))
+
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(result.status, 200)
+  assert.equal(result.providerSessionId, 'temporary-chat-non-stream')
+  assert.equal(result.body.choices[0].message.content, 'ready')
+  assert.deepEqual(deleteCalls, ['temporary-chat-non-stream'])
 })
 
 test('deferred managed-tool validation has no time-based release threshold', async (t) => {
@@ -920,6 +1201,13 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
       failedToolResultPending: false,
       recoveryCode: 'qwen_ai_invalid_tool_arguments',
     },
+    {
+      name: 'managed tool-result wrapper leak',
+      toolChoiceMode: 'auto',
+      failedToolResultPending: false,
+      recoveryCode: 'qwen_ai_wrapper_leak',
+      freshChat: true,
+    },
   ]
 
   for (const scenario of scenarios) {
@@ -929,19 +1217,23 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
       const continuedUpstream = new PassThrough()
       const bridgeOptions = []
       const continuationMessageOptions = []
+      const chatCompletionCalls = []
+      const continuationCalls = []
 
       class QwenAiAdapter {
         static isQwenAiProvider() { return true }
 
-        async chatCompletion() {
+        async chatCompletion(request) {
+          chatCompletionCalls.push(request)
           return {
             response: { status: 200, data: initialUpstream, headers: {} },
-            chatId: `initial-${scenario.name}`,
+            chatId: `chat-${scenario.name}-${chatCompletionCalls.length}`,
             parentId: null,
           }
         }
 
-        async continueChatCompletion() {
+        async continueChatCompletion(request) {
+          continuationCalls.push(request)
           return { data: continuedUpstream }
         }
 
@@ -1007,6 +1299,14 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
 
       assert.equal(continuationMessageOptions.length, 1)
       assert.equal(continuationMessageOptions[0].requireManagedToolCall, true)
+      assert.equal(chatCompletionCalls.length, scenario.freshChat ? 2 : 1)
+      assert.equal(continuationCalls.length, scenario.freshChat ? 0 : 1)
+      if (scenario.freshChat) {
+        assert.equal(
+          chatCompletionCalls[1].messages.at(-1).content,
+          'mandatory workflow continuation',
+        )
+      }
 
       output.destroy()
       initialUpstream.destroy()
@@ -1015,11 +1315,12 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
   }
 })
 
-test('Qwen AI forwarder replays auto semantic-empty recovery with a completion-capable prompt', async () => {
+test('Qwen AI forwarder continues auto semantic-empty recovery without replaying the transcript', async () => {
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
   const restartedUpstream = new PassThrough()
   const chatCalls = []
+  const continuationCalls = []
   const deleteCalls = []
   const bridgeOptions = []
   const plan = {
@@ -1071,8 +1372,9 @@ test('Qwen AI forwarder replays auto semantic-empty recovery with a completion-c
       }
     }
 
-    async continueChatCompletion() {
-      throw new Error('semantic-empty workflow recovery must not use the busy chat')
+    async continueChatCompletion(request) {
+      continuationCalls.push(request)
+      return { data: restartedUpstream }
     }
 
     async deleteChat(chatId) {
@@ -1142,40 +1444,23 @@ test('Qwen AI forwarder replays auto semantic-empty recovery with a completion-c
   const recoveryError = Object.assign(new Error('reasoning ended without a tool call'), {
     code: 'qwen_ai_semantic_empty',
   })
-  const restarted = await bridgeOptions[0].continueWorkflow('semantic-empty-response', recoveryError)
-  assert.equal(restarted.data, restartedUpstream)
-  assert.equal(chatCalls.length, 2)
-  assert.deepEqual(chatCalls[1].messages, [
-    {
-      role: 'user',
-      content: 'create the requested artifact',
-    },
-    {
-      role: 'assistant',
-      content: null,
-      tool_calls: [{
-        id: 'inspect-call',
-        type: 'function',
-        function: { name: 'lookup', arguments: '{}' },
-      }],
-    },
-    { role: 'tool', tool_call_id: 'inspect-call', content: 'folder inspected' },
-    completionCapableRecovery,
-  ])
-  assert.notEqual(
-    chatCalls[1].messages.at(-1),
-    originallyInjectedContinuation,
-    'fresh-chat replay must replace the superseded continuation message',
-  )
+  const continued = await bridgeOptions[0].continueWorkflow('semantic-empty-response', recoveryError)
+  assert.equal(continued.data, restartedUpstream)
+  assert.equal(chatCalls.length, 1)
+  assert.equal(continuationCalls.length, 1)
+  assert.equal(continuationCalls[0].chatId, 'initial-chat')
+  assert.equal(continuationCalls[0].parentId, 'semantic-empty-response')
+  assert.equal(continuationCalls[0].content, completionCapableRecovery.content)
+  assert.equal(continuationCalls[0].messages, undefined)
 
   await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(deleteCalls, ['initial-chat'])
+  assert.deepEqual(deleteCalls, [])
   output.destroy()
   initialUpstream.destroy()
   restartedUpstream.destroy()
 })
 
-test('Qwen AI forwarder fresh-replays semantic recovery without a structural continuation flag', async () => {
+test('Qwen AI forwarder continues semantic recovery without replaying an unflagged transcript', async () => {
   const output = new PassThrough()
   const initialUpstream = new PassThrough()
   const restartedUpstream = new PassThrough()
@@ -1294,12 +1579,14 @@ test('Qwen AI forwarder fresh-replays semantic recovery without a structural con
     recoveryError,
   )
   assert.equal(continued.data, restartedUpstream)
-  assert.equal(chatCalls.length, 2)
-  assert.equal(continuationCalls.length, 0)
-  assert.deepEqual(chatCalls[1].messages.slice(0, -1), transformedMessages)
+  assert.equal(chatCalls.length, 1)
+  assert.equal(continuationCalls.length, 1)
+  assert.equal(continuationCalls[0].chatId, 'initial-active-chat')
+  assert.equal(continuationCalls[0].parentId, 'active-workflow-response')
+  assert.equal(continuationCalls[0].messages, undefined)
 
   await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(deleteCalls, ['initial-active-chat'])
+  assert.deepEqual(deleteCalls, [])
   output.destroy()
   initialUpstream.destroy()
   restartedUpstream.destroy()

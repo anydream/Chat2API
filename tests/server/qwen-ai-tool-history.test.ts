@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import OSS from 'ali-oss'
 
 import {
   prepareQwenAiMultimodalMessage,
@@ -513,5 +514,276 @@ test('Qwen AI content-hash cache reuses an in-memory transcript upload for the s
     if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
     else process.env.CHAT2API_DATA_DIR = previousDataDir
     rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
+})
+
+test('Qwen AI file upload rejects an expired request deadline before physical upload starts', async () => {
+  const uploader = new QwenAiFileUploader({} as any, () => ({}))
+  let physicalUploads = 0
+  ;(uploader as any).uploadResolvedFile = async () => {
+    physicalUploads += 1
+    return { id: 'unexpected-upload' }
+  }
+
+  const data = Buffer.from('deadline fixture', 'utf8').toString('base64')
+  await assert.rejects(
+    uploader.uploadPart({
+      type: 'file',
+      filename: 'deadline.txt',
+      mime_type: 'text/plain',
+      file_url: { url: `data:text/plain;base64,${data}` },
+    }, '', {
+      includeEvidence: false,
+      deadlineAt: Date.now() - 1,
+    }),
+    (error: any) => {
+      assert.equal(error.status, 504)
+      assert.equal(error.code, 'qwen_ai_request_timeout')
+      assert.equal(error.retryable, false)
+      assert.equal(error.accountFault, false)
+      return true
+    },
+  )
+  assert.equal(physicalUploads, 0)
+})
+
+test('Qwen AI HTTP file download inherits the client signal and remaining request budget', async () => {
+  const temporaryDataDir = mkdtempSync(join(tmpdir(), 'chat2api-qwen-http-deadline-'))
+  const previousDataDir = process.env.CHAT2API_DATA_DIR
+  process.env.CHAT2API_DATA_DIR = temporaryDataDir
+  const controller = new AbortController()
+  const deadlineAt = Date.now() + 5_000
+  let requestOptions: any
+
+  try {
+    const uploader = new QwenAiFileUploader({
+      get: async (_url: string, options: any) => {
+        requestOptions = options
+        return {
+          status: 200,
+          headers: { 'content-type': 'image/png' },
+          data: Buffer.from('downloaded-image-bytes'),
+        }
+      },
+    } as any, () => ({}), undefined, {
+      providerId: 'qwen-ai-http-deadline-test',
+      accountId: 'qwen-ai-http-deadline-account',
+    })
+    ;(uploader as any).uploadResolvedFile = async (file: any) => ({
+      id: 'http-upload',
+      file: { id: 'http-upload' },
+      name: file.filename,
+    })
+
+    await uploader.uploadPart({
+      type: 'image_url',
+      image_url: { url: 'https://example.test/deadline-image.png' },
+    }, '', {
+      includeEvidence: false,
+      signal: controller.signal,
+      deadlineAt,
+    })
+
+    assert.equal(requestOptions.signal, controller.signal)
+    assert.ok(requestOptions.timeout >= 1)
+    assert.ok(requestOptions.timeout <= 5_000)
+  } finally {
+    if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
+    else process.env.CHAT2API_DATA_DIR = previousDataDir
+    rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
+})
+
+test('Qwen AI file upload rejects a response that returns after the absolute deadline', async () => {
+  let physicalUploads = 0
+  const uploader = new QwenAiFileUploader({
+    get: (_url: string, _options: any) => {
+      const blockedUntil = Date.now() + 50
+      while (Date.now() < blockedUntil) {
+        // Simulate an event-loop stall between dispatch and Axios resolution.
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: { 'content-type': 'image/png' },
+        data: Buffer.from('late-image-bytes'),
+      })
+    },
+  } as any, () => ({}))
+  ;(uploader as any).uploadResolvedFile = async () => {
+    physicalUploads += 1
+    return { id: 'unexpected-late-upload' }
+  }
+
+  await assert.rejects(
+    uploader.uploadPart({
+      type: 'image_url',
+      image_url: { url: 'https://example.test/late-image.png' },
+    }, '', {
+      includeEvidence: false,
+      deadlineAt: Date.now() + 20,
+    }),
+    (error: any) => error?.status === 504 && error?.code === 'qwen_ai_request_timeout',
+  )
+  assert.equal(physicalUploads, 0, 'a late download must not advance to STS or OSS')
+})
+
+test('Qwen AI shared upload lets one waiter abort without cancelling the physical upload', async () => {
+  const temporaryDataDir = mkdtempSync(join(tmpdir(), 'chat2api-qwen-waiter-abort-'))
+  const previousDataDir = process.env.CHAT2API_DATA_DIR
+  process.env.CHAT2API_DATA_DIR = temporaryDataDir
+  let finishPhysicalUpload!: (value: any) => void
+  const physicalUpload = new Promise<any>(resolve => {
+    finishPhysicalUpload = resolve
+  })
+
+  try {
+    const uploader = new QwenAiFileUploader(
+      {} as any,
+      () => ({}),
+      undefined,
+      { providerId: 'qwen-ai-shared-wait-test', accountId: 'shared-wait-account' },
+    )
+    let physicalUploads = 0
+    ;(uploader as any).uploadResolvedFile = async () => {
+      physicalUploads += 1
+      return physicalUpload
+    }
+    const data = Buffer.from('shared upload bytes', 'utf8').toString('base64')
+    const part = {
+      type: 'file' as const,
+      filename: 'shared.txt',
+      mime_type: 'text/plain',
+      file_url: { url: `data:text/plain;base64,${data}` },
+    }
+
+    const owner = uploader.uploadPart(part, '', { includeEvidence: false })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(physicalUploads, 1)
+
+    const waiterController = new AbortController()
+    const waiter = uploader.uploadPart(part, '', {
+      includeEvidence: false,
+      signal: waiterController.signal,
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    waiterController.abort()
+
+    await assert.rejects(waiter, (error: any) => {
+      assert.equal(error.name, 'AbortError')
+      assert.equal(error.code, 'ERR_CANCELED')
+      return true
+    })
+    assert.equal(physicalUploads, 1, 'the waiter must reuse rather than restart the upload')
+
+    finishPhysicalUpload({ id: 'shared-upload', file: { id: 'shared-upload' } })
+    const ownerResult = await owner
+    assert.equal(ownerResult.file.file.id, 'shared-upload')
+    assert.equal(physicalUploads, 1, 'waiter cancellation must not cancel the upload owner')
+  } finally {
+    if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
+    else process.env.CHAT2API_DATA_DIR = previousDataDir
+    rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
+})
+
+test('Qwen AI parse polling delay exits promptly when the client aborts', async () => {
+  let statusRequests = 0
+  const uploader = new QwenAiFileUploader({
+    post: async () => {
+      statusRequests += 1
+      return { status: 200, data: { status: 'processing' } }
+    },
+  } as any, () => ({}))
+  const controller = new AbortController()
+  const startedAt = Date.now()
+  const waiting = (uploader as any).waitForParse('parse-abort-file', {
+    signal: controller.signal,
+  })
+  setTimeout(() => controller.abort(), 20)
+
+  await assert.rejects(waiting, (error: any) => {
+    assert.equal(error.name, 'AbortError')
+    assert.equal(error.code, 'ERR_CANCELED')
+    return true
+  })
+  assert.ok(Date.now() - startedAt < 500, 'abort must interrupt the two-second poll delay')
+  assert.equal(statusRequests, 0)
+})
+
+test('Qwen AI OSS upload cancels its dedicated client on client abort or deadline', async () => {
+  const originalPut = OSS.prototype.put
+  const originalCancel = (OSS.prototype as any).cancel
+  let putOptions: any
+  let cancelCalls = 0
+  OSS.prototype.put = ((_name: string, _data: any, options: any) => {
+    putOptions = options
+    return new Promise(() => {})
+  }) as any
+  ;(OSS.prototype as any).cancel = function () {
+    cancelCalls += 1
+  }
+
+  try {
+    const uploader = new QwenAiFileUploader({} as any, () => ({}))
+    const controller = new AbortController()
+    const upload = (uploader as any).uploadToOss({
+      data: Buffer.from('oss-abort-bytes'),
+      sizeBytes: 15,
+      filename: 'abort.txt',
+      mimeType: 'text/plain',
+      coarseType: 'file',
+      fileClass: 'document',
+    }, {
+      accessKeyId: 'fixture-access-key',
+      accessKeySecret: 'fixture-access-secret',
+      bucket: 'fixture-bucket',
+      region: 'oss-cn-hangzhou',
+      endpoint: 'https://oss-cn-hangzhou.aliyuncs.com',
+      fileId: 'fixture-file-id',
+      filePath: 'fixture/path.txt',
+      fileUrl: 'https://fixture-bucket.oss-cn-hangzhou.aliyuncs.com/fixture/path.txt',
+    }, {
+      signal: controller.signal,
+      deadlineAt: Date.now() + 5_000,
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    controller.abort()
+
+    await assert.rejects(upload, (error: any) => {
+      assert.equal(error.name, 'AbortError')
+      assert.equal(error.code, 'ERR_CANCELED')
+      return true
+    })
+    assert.equal(cancelCalls, 1)
+    assert.ok(putOptions.timeout >= 1 && putOptions.timeout <= 5_000)
+
+    const deadlineUpload = (uploader as any).uploadToOss({
+      data: Buffer.from('oss-deadline-bytes'),
+      sizeBytes: 18,
+      filename: 'deadline.txt',
+      mimeType: 'text/plain',
+      coarseType: 'file',
+      fileClass: 'document',
+    }, {
+      accessKeyId: 'fixture-access-key',
+      accessKeySecret: 'fixture-access-secret',
+      bucket: 'fixture-bucket',
+      region: 'oss-cn-hangzhou',
+      endpoint: 'https://oss-cn-hangzhou.aliyuncs.com',
+      fileId: 'fixture-deadline-file-id',
+      filePath: 'fixture/deadline.txt',
+      fileUrl: 'https://fixture-bucket.oss-cn-hangzhou.aliyuncs.com/fixture/deadline.txt',
+    }, {
+      deadlineAt: Date.now() + 20,
+    })
+    await assert.rejects(deadlineUpload, (error: any) => {
+      assert.equal(error.status, 504)
+      assert.equal(error.code, 'qwen_ai_request_timeout')
+      return true
+    })
+    assert.equal(cancelCalls, 2)
+  } finally {
+    OSS.prototype.put = originalPut
+    ;(OSS.prototype as any).cancel = originalCancel
   }
 })

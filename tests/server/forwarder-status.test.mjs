@@ -31,7 +31,7 @@ test('forwarder leaves ordinary Qwen account failover to the route instead of re
 test('forwarder retry backoff stops promptly when the client aborts', () => {
   const source = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
 
-  assert.match(source, /this\.delay\(nextRetryDelayMs, context\.signal\)/)
+  assert.match(source, /this\.delay\(\s*Math\.min\(nextRetryDelayMs, remainingBudgetMs\),\s*context\.signal,?\s*\)/)
   assert.match(source, /if \(!delayCompleted\) \{[\s\S]*lastStatus = 499/)
   assert.match(source, /if \(!delayCompleted\)[\s\S]*lastStatus = 499[\s\S]*lastRetryable = false/)
   assert.match(source, /private delay\(ms: number, signal\?: AbortSignal\): Promise<boolean>/)

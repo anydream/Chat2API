@@ -1,8 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import type { ToolCall } from '../types.ts'
-import type { ToolCallingPlan } from './types.ts'
+import type { ToolCallDiagnostics, ToolCallingPlan } from './types.ts'
 import { getToolProtocol } from './protocols/index.ts'
 import { deduplicateEquivalentToolCalls } from './toolCallDeduplication.ts'
+import {
+  createManagedToolResultWrapperLeakError,
+  ManagedToolResultGuard,
+  stripManagedToolResultWrappers,
+} from './managedToolResultGuard.ts'
 
 export class ToolStreamParser {
   private readonly plan: ToolCallingPlan
@@ -12,10 +17,22 @@ export class ToolStreamParser {
   private emittedToolCall = false
   private nextToolCallIndex = 0
   private sawToolProtocolMarker = false
+  private readonly toolResultGuard: ManagedToolResultGuard
+  private diagnostics: ToolCallDiagnostics
+  private suppressedInput = false
+  private rejectedByWrapperLeak = false
+  private readonly inputAlreadyGuarded: boolean
 
-  constructor(plan: ToolCallingPlan, callIdPrefix?: string) {
+  constructor(
+    plan: ToolCallingPlan,
+    callIdPrefix?: string,
+    options: { inputAlreadyGuarded?: boolean } = {},
+  ) {
     this.plan = plan
     this.callIdPrefix = callIdPrefix ?? `call_${randomUUID().replace(/-/g, '')}`
+    this.diagnostics = { ...plan.diagnostics }
+    this.toolResultGuard = new ManagedToolResultGuard(plan.protocol)
+    this.inputAlreadyGuarded = options.inputAlreadyGuarded === true
   }
 
   push(content: string, baseChunk: any, includeRole: boolean = false): any[] {
@@ -23,6 +40,29 @@ export class ToolStreamParser {
     // Once a complete block was emitted, all calls for this response are known;
     // keep the first block and avoid executing a replay a second time.
     if (!content || !this.plan.shouldParseResponse || this.emittedToolCall) return []
+    if (this.rejectedByWrapperLeak) {
+      this.suppressedInput = true
+      return []
+    }
+
+    const guarded = this.inputAlreadyGuarded
+      ? { content, suppressed: false }
+      : this.toolResultGuard.push(content)
+    if (this.toolResultGuard.hasDetectedWrapperLeak()) {
+      this.markWrapperLeakDetected()
+      this.buffer = ''
+      this.isBufferingToolCall = false
+      this.suppressedInput = true
+      return []
+    }
+
+    const chunks = this.pushGuardedContent(guarded.content, baseChunk, includeRole)
+    this.suppressedInput = guarded.suppressed && chunks.length === 0
+    return chunks
+  }
+
+  private pushGuardedContent(content: string, baseChunk: any, includeRole: boolean): any[] {
+    if (!content) return []
 
     this.buffer += content
     const chunks: any[] = []
@@ -89,6 +129,25 @@ export class ToolStreamParser {
   }
 
   flush(baseChunk: any): any[] {
+    if (this.rejectedByWrapperLeak) return []
+
+    const guarded = this.inputAlreadyGuarded
+      ? { content: '', suppressed: false }
+      : this.toolResultGuard.flush()
+    if (this.toolResultGuard.hasDetectedWrapperLeak()) {
+      this.markWrapperLeakDetected()
+      this.buffer = ''
+      this.isBufferingToolCall = false
+      this.suppressedInput = false
+      return []
+    }
+
+    const chunks = this.pushGuardedContent(guarded.content, baseChunk, false)
+    this.suppressedInput = false
+    return [...chunks, ...this.flushBufferedToolCall(baseChunk)]
+  }
+
+  private flushBufferedToolCall(baseChunk: any): any[] {
     if (!this.buffer) return []
 
     const parsed = parseFirstValidToolBlock(this.buffer, this.plan, { allowPartial: true })
@@ -122,9 +181,22 @@ export class ToolStreamParser {
   }
 
   recoverFromContent(content: string, baseChunk: any, includeRole: boolean = false): any[] {
-    if (!content || this.emittedToolCall || !this.plan.shouldParseResponse) return []
+    if (
+      !content
+      || this.emittedToolCall
+      || this.rejectedByWrapperLeak
+      || !this.plan.shouldParseResponse
+    ) return []
 
-    const parsed = parseFirstValidToolBlock(content, this.plan, { allowPartial: true })
+    const guarded = this.inputAlreadyGuarded
+      ? { content, suppressed: false, wrapperLeakDetected: false }
+      : stripManagedToolResultWrappers(content, this.plan.protocol)
+    if (guarded.wrapperLeakDetected) {
+      this.markWrapperLeakDetected()
+      return []
+    }
+
+    const parsed = parseFirstValidToolBlock(guarded.content, this.plan, { allowPartial: true })
     if (parsed.toolCalls.length === 0) return []
 
     const chunks = uniqueResponseToolCalls(parsed.toolCalls).flatMap((toolCall, index) => {
@@ -151,15 +223,58 @@ export class ToolStreamParser {
 
   isBuffering(): boolean {
     return this.isBufferingToolCall
+      || (!this.inputAlreadyGuarded && this.toolResultGuard.hasPendingCandidate())
+      || this.suppressedInput
+      || this.rejectedByWrapperLeak
   }
 
   hasPendingToolProtocol(): boolean {
-    return this.sawToolProtocolMarker || this.isBufferingToolCall || hasProtocolMarker(this.buffer, this.plan)
+    return this.rejectedByWrapperLeak
+      || this.sawToolProtocolMarker
+      || this.isBufferingToolCall
+      || hasProtocolMarker(this.buffer, this.plan)
+  }
+
+  inspectForWrapperLeak(content: string): boolean {
+    if (!content || this.rejectedByWrapperLeak) return this.rejectedByWrapperLeak
+    const guarded = stripManagedToolResultWrappers(content, this.plan.protocol)
+    if (guarded.wrapperLeakDetected) this.markWrapperLeakDetected()
+    return this.rejectedByWrapperLeak
+  }
+
+  hasDetectedWrapperLeak(): boolean {
+    return this.rejectedByWrapperLeak
+  }
+
+  getProtocolError(): Error | undefined {
+    return this.rejectedByWrapperLeak
+      ? createManagedToolResultWrapperLeakError()
+      : undefined
+  }
+
+  getDiagnostics(): ToolCallDiagnostics {
+    return { ...this.diagnostics }
   }
 
   private scopedToolCallId(parsedId: string | undefined, index: number): string {
     void parsedId
     return `${this.callIdPrefix}_${index}`
+  }
+
+  private markWrapperLeakDetected(): void {
+    if (this.rejectedByWrapperLeak) return
+    this.rejectedByWrapperLeak = true
+    this.diagnostics = {
+      ...this.diagnostics,
+      wrapperLeakDetected: true,
+    }
+    console.warn('[ToolCalling] Blocked leaked managed tool-result wrapper', JSON.stringify({
+      wrapperLeakDetected: true,
+      requestId: this.diagnostics.requestId,
+      providerId: this.diagnostics.providerId,
+      model: this.diagnostics.actualModel || this.diagnostics.model,
+      protocol: this.plan.protocol,
+    }))
   }
 }
 
@@ -256,11 +371,18 @@ function mayBecomeValidToolCall(buffer: string, plan: ToolCallingPlan): boolean 
 
 function fencedRanges(content: string): Array<{ start: number; end: number }> {
   const ranges: Array<{ start: number; end: number }> = []
-  const pattern = /```[\s\S]*?```/g
-  let match: RegExpExecArray | null
-
-  while ((match = pattern.exec(content)) !== null) {
-    ranges.push({ start: match.index, end: match.index + match[0].length })
+  let searchIndex = 0
+  while (searchIndex < content.length) {
+    const start = content.indexOf('```', searchIndex)
+    if (start === -1) break
+    const closing = content.indexOf('```', start + 3)
+    if (closing === -1) {
+      ranges.push({ start, end: content.length })
+      break
+    }
+    const end = closing + 3
+    ranges.push({ start, end })
+    searchIndex = end
   }
 
   return ranges

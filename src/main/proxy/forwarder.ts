@@ -140,6 +140,18 @@ function isQwenAiUpstreamBusyResult(result: ForwardResult): boolean {
     && result.accountFault === false
 }
 
+function createQwenAiRequestTimeoutResult(startTime: number): ForwardResult {
+  return {
+    success: false,
+    status: 504,
+    error: 'Qwen AI request exceeded its cumulative request deadline.',
+    errorCode: 'qwen_ai_request_timeout',
+    retryable: false,
+    accountFault: false,
+    latency: Math.max(0, Date.now() - startTime),
+  }
+}
+
 function qwenAiUpstreamBusyRetryDelayMs(
   result: ForwardResult,
   retryIndex: number,
@@ -699,6 +711,8 @@ type QwenAiForwardOptions = {
   skipCompactionPlanning?: boolean
   /** Remaining time in the outer Qwen request budget. */
   requestTimeoutMs?: number
+  /** Absolute outer Qwen request deadline, preserved across governor waits. */
+  requestDeadlineAt?: number
   /** Complete-message transport selected from an observed upstream response. */
   messageTransport?: QwenAiMessageTransport
 }
@@ -775,6 +789,7 @@ type ProviderForwarder = {
 type ForwardAttemptOptions = {
   qwenAiRecoveryBypassAccountInterval?: boolean
   qwenAiRequestTimeoutMs?: number
+  qwenAiRequestDeadlineAt?: number
   qwenAiMessageTransport?: QwenAiMessageTransport
   attempt?: number
 }
@@ -896,7 +911,8 @@ export class RequestForwarder {
     account: Account,
     provider: Provider,
     actualModel: string,
-    context: ProxyContext
+    context: ProxyContext,
+    qwenAiRequestDeadlineAt?: number,
   ): SummaryGenerator {
     return async (messages: ContextChatMessage[], prompt?: string): Promise<string> => {
       try {
@@ -940,7 +956,13 @@ export class RequestForwarder {
           account,
           provider,
           actualModel,
-          context
+          context,
+          {
+            qwenAiRequestTimeoutMs: qwenAiRequestDeadlineAt === undefined
+              ? undefined
+              : Math.max(1, qwenAiRequestDeadlineAt - Date.now()),
+            qwenAiRequestDeadlineAt,
+          },
         )
 
         if (result.success && result.body) {
@@ -968,7 +990,13 @@ export class RequestForwarder {
     actualModel: string,
     context: ProxyContext
   ): Promise<ForwardResult> {
-    const startTime = Date.now()
+    // Account failover re-enters this method with the same route context. Keep
+    // one cumulative Qwen deadline for the client request instead of granting
+    // every account attempt a fresh timeout window.
+    const observedAt = Date.now()
+    const startTime = Number.isFinite(context.startTime)
+      ? Math.min(observedAt, context.startTime)
+      : observedAt
     const config = storeManager.getConfig()
     const requestIntentInfo = classifyChatRequest(request)
     const requestIntent = context.requestIntent
@@ -1017,6 +1045,50 @@ export class RequestForwarder {
     const qwenAiRequestDeadline = isQwenAiProvider
       ? startTime + qwenAiRequestTimeoutMsFromEnv()
       : undefined
+    const qwenDeadlineExpired = Symbol('qwen-deadline-expired')
+    const qwenClientAborted = Symbol('qwen-client-aborted')
+    const waitWithinQwenDeadline = async <T>(
+      operation: Promise<T>,
+    ): Promise<T | typeof qwenDeadlineExpired | typeof qwenClientAborted> => {
+      if (!isQwenAiProvider) return operation
+      if (context.signal?.aborted) return qwenClientAborted
+      if (qwenAiRequestDeadline !== undefined && Date.now() >= qwenAiRequestDeadline) {
+        return qwenDeadlineExpired
+      }
+
+      let deadlineTimer: NodeJS.Timeout | undefined
+      let abortListener: (() => void) | undefined
+      const deadline = qwenAiRequestDeadline === undefined
+        ? undefined
+        : new Promise<typeof qwenDeadlineExpired>(resolve => {
+            deadlineTimer = setTimeout(
+              () => resolve(qwenDeadlineExpired),
+              Math.max(1, qwenAiRequestDeadline - Date.now()),
+            )
+          })
+      const aborted = context.signal
+        ? new Promise<typeof qwenClientAborted>(resolve => {
+            abortListener = () => resolve(qwenClientAborted)
+            context.signal?.addEventListener('abort', abortListener, { once: true })
+          })
+        : undefined
+
+      try {
+        const outcome = await Promise.race([
+          operation,
+          ...(deadline ? [deadline] : []),
+          ...(aborted ? [aborted] : []),
+        ])
+        if (context.signal?.aborted) return qwenClientAborted
+        if (qwenAiRequestDeadline !== undefined && Date.now() >= qwenAiRequestDeadline) {
+          return qwenDeadlineExpired
+        }
+        return outcome
+      } finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer)
+        if (abortListener) context.signal?.removeEventListener('abort', abortListener)
+      }
+    }
     let attempt = 0
     let standardRetriesUsed = 0
     let qwenAiBusyRetries = 0
@@ -1092,7 +1164,16 @@ export class RequestForwarder {
       }
 
       if (attempt > 0) {
-        const delayCompleted = await this.delay(nextRetryDelayMs, context.signal)
+        const remainingBudgetMs = qwenAiRequestDeadline === undefined
+          ? nextRetryDelayMs
+          : Math.max(0, qwenAiRequestDeadline - Date.now())
+        if (qwenAiRequestDeadline !== undefined && remainingBudgetMs <= 0) {
+          return createQwenAiRequestTimeoutResult(startTime)
+        }
+        const delayCompleted = await this.delay(
+          Math.min(nextRetryDelayMs, remainingBudgetMs),
+          context.signal,
+        )
         if (!delayCompleted) {
           lastStatus = 499
           lastHeaders = undefined
@@ -1104,7 +1185,7 @@ export class RequestForwarder {
       }
 
       if (qwenAiRequestDeadline !== undefined && Date.now() >= qwenAiRequestDeadline) {
-        break
+        return createQwenAiRequestTimeoutResult(startTime)
       }
 
       let modifiedRequest = request
@@ -1120,7 +1201,8 @@ export class RequestForwarder {
             account,
             provider,
             actualModel,
-            context
+            context,
+            qwenAiRequestDeadline,
           )
 
           const contextService = createContextManagementService(
@@ -1133,7 +1215,22 @@ export class RequestForwarder {
             ...msg,
           }))
 
-          const processResult = await contextService.process(contextMessages)
+          const processOutcome = await waitWithinQwenDeadline(
+            contextService.process(contextMessages),
+          )
+          if (processOutcome === qwenDeadlineExpired) {
+            return createQwenAiRequestTimeoutResult(startTime)
+          }
+          if (processOutcome === qwenClientAborted) {
+            return {
+              success: false,
+              status: 499,
+              error: 'Client disconnected during context management.',
+              retryable: false,
+              latency: Date.now() - startTime,
+            }
+          }
+          const processResult = processOutcome
 
           if (processResult.finalCount !== originalCount) {
             console.log(
@@ -1158,6 +1255,10 @@ export class RequestForwarder {
         }
       }
 
+      if (qwenAiRequestDeadline !== undefined && Date.now() >= qwenAiRequestDeadline) {
+        return createQwenAiRequestTimeoutResult(startTime)
+      }
+
       try {
         const result = await this.doForward(
           modifiedRequest,
@@ -1170,6 +1271,7 @@ export class RequestForwarder {
             qwenAiRequestTimeoutMs: qwenAiRequestDeadline === undefined
               ? undefined
               : Math.max(1, qwenAiRequestDeadline - Date.now()),
+            qwenAiRequestDeadlineAt: qwenAiRequestDeadline,
             qwenAiMessageTransport,
             attempt: attempt + 1,
           },
@@ -1285,6 +1387,14 @@ export class RequestForwarder {
         nextRetryDelayMs = 5000
         attempt += 1
       }
+    }
+
+    if (
+      qwenAiRequestDeadline !== undefined
+      && Date.now() >= qwenAiRequestDeadline
+      && !context.signal?.aborted
+    ) {
+      return createQwenAiRequestTimeoutResult(startTime)
     }
 
     return {
@@ -1846,6 +1956,9 @@ export class RequestForwarder {
     context: ProxyContext,
     options: ForwardAttemptOptions,
   ): Promise<ForwardResult> {
+    const requestDeadlineAt = options.qwenAiRequestDeadlineAt
+    const requestDeadlineExpired = () => requestDeadlineAt !== undefined
+      && Date.now() >= requestDeadlineAt
     const requestIntent = context.requestIntent
       ?? classifyChatRequest(request).intent
     if (requestIntent === 'context_compaction') {
@@ -1863,6 +1976,7 @@ export class RequestForwarder {
           capability,
           {
             requestTimeoutMs: options.qwenAiRequestTimeoutMs,
+            requestDeadlineAt: options.qwenAiRequestDeadlineAt,
             messageTransport: options.qwenAiMessageTransport,
           },
         )
@@ -1876,10 +1990,12 @@ export class RequestForwarder {
     const runGoverned = () => qwenAiRequestGovernor.run(account.id,
       () => this.forwardQwenAi(request, account, provider, actualModel, startTime, context, {
         requestTimeoutMs: options.qwenAiRequestTimeoutMs,
+        requestDeadlineAt: options.qwenAiRequestDeadlineAt,
         messageTransport: options.qwenAiMessageTransport,
       }),
       {
         signal: context.signal,
+        deadlineAt: options.qwenAiRequestDeadlineAt,
         // Ordinary client traffic may use the shared FIFO queue. Internal
         // compaction must wait in its own scheduler so it never creates a
         // hidden queue behind another stage.
@@ -1894,12 +2010,19 @@ export class RequestForwarder {
     if (requestClass === 'normal') return runGoverned()
 
     while (!context.signal?.aborted) {
+      if (requestDeadlineExpired()) {
+        return createQwenAiRequestTimeoutResult(startTime)
+      }
       const result = await runGoverned()
       if (!isQwenAiCompactionAdmissionDeferred(result)) return result
-      const waitMs = Math.max(
+      const configuredWaitMs = Math.max(
         1,
         Math.min(1000, retryAfterMsFromResult(result) ?? 1000),
       )
+      const waitMs = requestDeadlineAt === undefined
+        ? configuredWaitMs
+        : Math.min(configuredWaitMs, Math.max(0, requestDeadlineAt - Date.now()))
+      if (waitMs <= 0) return createQwenAiRequestTimeoutResult(startTime)
       if (!await this.delay(waitMs, context.signal)) break
     }
 
@@ -1922,7 +2045,7 @@ export class RequestForwarder {
     context: ProxyContext | undefined,
     plan: ReturnType<typeof planQwenAiCompactionChunks>,
     capability?: ReturnType<typeof findQwenAiModelCapability>,
-    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'messageTransport'> = {},
+    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'requestDeadlineAt' | 'messageTransport'> = {},
   ): Promise<ForwardResult> {
     const result = await this.executeQwenAiCompactionInChunks(
       request,
@@ -1964,7 +2087,7 @@ export class RequestForwarder {
     context: ProxyContext | undefined,
     plan: ReturnType<typeof planQwenAiCompactionChunks>,
     capability?: ReturnType<typeof findQwenAiModelCapability>,
-    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'messageTransport'> = {},
+    options: Pick<QwenAiForwardOptions, 'requestTimeoutMs' | 'requestDeadlineAt' | 'messageTransport'> = {},
   ): Promise<ForwardResult> {
     const elapsed = () => Date.now() - startTime
     const failure = (
@@ -1980,6 +2103,9 @@ export class RequestForwarder {
       accountFault: false,
       latency: elapsed(),
     })
+    const requestDeadlineExpired = () => options.requestDeadlineAt !== undefined
+      && Date.now() >= options.requestDeadlineAt
+    const requestTimeoutFailure = () => createQwenAiRequestTimeoutResult(startTime)
 
     if (context?.signal?.aborted) {
       return failure('Client disconnected before context compaction started.', 'qwen_ai_client_cancelled', 499)
@@ -2158,6 +2284,10 @@ export class RequestForwarder {
         preferInitial: boolean,
       ): Promise<AccountSelection | null> => {
         while (!pipelineStopped && !context?.signal?.aborted) {
+          if (requestDeadlineExpired()) {
+            stopPipeline(requestTimeoutFailure())
+            return null
+          }
           const status = getGovernorStatus()
           if (
             status.effectiveConfig.healthyAccountCount <= 0
@@ -2180,7 +2310,18 @@ export class RequestForwarder {
             return selectCompactionAccount(failedAccountIds, preferInitial)
           }
 
-          const delayed = await this.delay(schedulerWaitMs(status), context?.signal)
+          const configuredWaitMs = schedulerWaitMs(status)
+          const waitMs = options.requestDeadlineAt === undefined
+            ? configuredWaitMs
+            : Math.min(
+                configuredWaitMs,
+                Math.max(0, options.requestDeadlineAt - Date.now()),
+              )
+          if (waitMs <= 0) {
+            stopPipeline(requestTimeoutFailure())
+            return null
+          }
+          const delayed = await this.delay(waitMs, context?.signal)
           if (!delayed) return null
         }
         return null
@@ -2208,6 +2349,10 @@ export class RequestForwarder {
           // failure, must not consume an account attempt, and must never be
           // interpreted as a terminal wave failure.
           while (true) {
+            if (requestDeadlineExpired()) {
+              result = requestTimeoutFailure()
+              break
+            }
             result = await qwenAiRequestGovernor.run(
               selection.account.id,
               () => this.forwardQwenAi(
@@ -2222,11 +2367,13 @@ export class RequestForwarder {
                   forceContextCompaction: true,
                   skipCompactionPlanning: true,
                   requestTimeoutMs: options.requestTimeoutMs,
+                  requestDeadlineAt: options.requestDeadlineAt,
                   messageTransport: options.messageTransport,
                 },
               ),
               {
                 signal: context?.signal,
+                deadlineAt: options.requestDeadlineAt,
                 allowQueue: false,
                 waitForActiveSettlementOnAbort: true,
                 recoveryBypassGlobalInterval,
@@ -2247,16 +2394,23 @@ export class RequestForwarder {
                 retryAfterMsFromResult(result) ?? schedulerWaitMs(status),
               ),
             )
+            const deadlineBoundWaitMs = options.requestDeadlineAt === undefined
+              ? waitMs
+              : Math.min(waitMs, Math.max(0, options.requestDeadlineAt - Date.now()))
+            if (deadlineBoundWaitMs <= 0) {
+              result = requestTimeoutFailure()
+              break
+            }
             if (admissionDeferrals === 1) {
               console.info('[QwenAI] context-compaction admission deferred', JSON.stringify({
                 requestId,
                 kind,
                 accountId: selection.account.id,
                 attempt,
-                waitMs,
+                waitMs: deadlineBoundWaitMs,
               }))
             }
-            const delayed = await this.delay(waitMs, context?.signal)
+            const delayed = await this.delay(deadlineBoundWaitMs, context?.signal)
             if (!delayed) {
               result = failure(
                 'Client disconnected while waiting for a Qwen AI compaction slot.',
@@ -2480,6 +2634,9 @@ export class RequestForwarder {
       if (pipelineStopped && firstPipelineFailure) {
         return { result: firstPipelineFailure }
       }
+      if (requestDeadlineExpired()) {
+        return { result: requestTimeoutFailure() }
+      }
       if (context?.signal?.aborted) {
         return { result: failure('Client disconnected during context compaction.', 'qwen_ai_client_cancelled', 499) }
       }
@@ -2602,6 +2759,9 @@ export class RequestForwarder {
       let nextDispatchAt = 0
 
       while (nextIndex < chunks.length || running.size > 0) {
+        if (requestDeadlineExpired() && !pipelineStopped) {
+          stopPipeline(requestTimeoutFailure())
+        }
         if (context?.signal?.aborted && !pipelineStopped) {
           stopPipeline(failure(
             'Client disconnected during context compaction.',
@@ -2693,7 +2853,18 @@ export class RequestForwarder {
         if (nextIndex >= chunks.length && running.size === 0) break
 
         const status = getGovernorStatus()
-        const woke = await waitForSchedulerWake(schedulerWaitMs(status, nextDispatchAt))
+        const configuredWaitMs = schedulerWaitMs(status, nextDispatchAt)
+        const waitMs = options.requestDeadlineAt === undefined
+          ? configuredWaitMs
+          : Math.min(
+              configuredWaitMs,
+              Math.max(0, options.requestDeadlineAt - Date.now()),
+            )
+        if (waitMs <= 0) {
+          stopPipeline(requestTimeoutFailure())
+          continue
+        }
+        const woke = await waitForSchedulerWake(waitMs)
         if (!woke && !pipelineStopped) {
           stopPipeline(failure(
             'Client disconnected during context compaction.',
@@ -2767,6 +2938,9 @@ export class RequestForwarder {
     context?: ProxyContext,
     options: QwenAiForwardOptions = {},
   ): Promise<ForwardResult> {
+    if (options.requestDeadlineAt !== undefined && Date.now() >= options.requestDeadlineAt) {
+      return createQwenAiRequestTimeoutResult(startTime)
+    }
     const adapter = new QwenAiAdapter(provider, account)
     const requestIntent = options.forceContextCompaction
       ? 'context_compaction' as const
@@ -2796,6 +2970,7 @@ export class RequestForwarder {
         capability,
         {
           requestTimeoutMs: options.requestTimeoutMs,
+          requestDeadlineAt: options.requestDeadlineAt,
           messageTransport: options.messageTransport,
         },
       )
@@ -2803,6 +2978,10 @@ export class RequestForwarder {
     const providerRequest = options.preparedRequest
       || prepareQwenAiCompactionRequest(request, requestIntent, provider, actualModel)
     const isContextCompaction = requestIntent === 'context_compaction'
+    const workflowRecoveryDeadlineAt = options.requestDeadlineAt
+      ?? (options.requestTimeoutMs === undefined
+        ? undefined
+        : Date.now() + Math.max(0, options.requestTimeoutMs))
     if (isContextCompaction) {
       const intentInfo = classifyChatRequest(request)
       console.info('[QwenAI] context-compaction request normalized', JSON.stringify({
@@ -2851,9 +3030,15 @@ export class RequestForwarder {
         thinking_budget: providerRequest.thinking_budget,
         image_generation: providerRequest.image_generation,
         signal: context?.signal,
-        timeoutMs: options.requestTimeoutMs,
+        deadlineAt: options.requestDeadlineAt,
+        timeoutMs: options.requestDeadlineAt === undefined
+          ? options.requestTimeoutMs
+          : Math.max(1, options.requestDeadlineAt - Date.now()),
         messageTransport: options.messageTransport,
       })
+      if (options.requestDeadlineAt !== undefined && Date.now() >= options.requestDeadlineAt) {
+        return createQwenAiRequestTimeoutResult(startTime)
+      }
       const { response, chatId, parentId } = await adapter.chatCompletion(
         createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
       )
@@ -2891,6 +3076,7 @@ export class RequestForwarder {
       )
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
+        workflowRecoveryDeadlineAt,
         getResponseId: () => handler.getResponseId(),
         getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
         isComplete: () => handler.isComplete(),
@@ -2912,6 +3098,7 @@ export class RequestForwarder {
                 const requireManagedToolCall = transformed.plan.failedToolResultPending
                   || transformed.plan.toolChoiceMode === 'required'
                   || transformed.plan.toolChoiceMode === 'forced'
+                  || recoveryCode === 'qwen_ai_wrapper_leak'
                   || recoveryCode === 'qwen_ai_invalid_tool_arguments'
                   || recoveryCode === 'undeclared_native_tool_call'
                   || recoveryCode === 'malformed_tool_call'
@@ -2924,19 +3111,13 @@ export class RequestForwarder {
                   ? workflowContinuationMessage.content
                   : JSON.stringify(workflowContinuationMessage.content)
                 const restartFromFreshChat = recoveryCode === 'undeclared_native_tool_call'
-                  || (
-                    (recoveryCode === 'qwen_ai_semantic_incomplete'
-                      || recoveryCode === 'qwen_ai_semantic_empty')
-                    && !transformed.plan.failedToolResultPending
-                  )
+                  || recoveryCode === 'qwen_ai_wrapper_leak'
 
-                // A semantically completed Qwen branch can remain busy even
-                // after its response became unusable. Replay the complete,
-                // dynamically transformed history in a fresh temporary chat
-                // and append a recovery turn derived from the current tool
-                // policy. This keeps the active task and declared tool
-                // contract intact without relying on a provider-specific chat
-                // continuation endpoint.
+                // Provider-native tool failures and leaked result wrappers can
+                // poison the rejected assistant branch. Replay the clean input
+                // in a fresh chat instead of parenting recovery to that branch.
+                // Ordinary semantic-empty/incomplete branches keep the compact
+                // same-chat continuation below.
                 if (restartFromFreshChat) {
                   // workflowContinuation is set only when the tool engine
                   // appended its own trailing user turn. The recovery prompt
@@ -2990,6 +3171,7 @@ export class RequestForwarder {
           && qwenAiBufferManagedStreamsFromEnv()
         let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
+          requestDeadlineAt: options.requestDeadlineAt,
           bufferManagedBranch: bufferManagedStream,
           onProgressFrame: context?.onQwenAiProgressFrame,
           onFailure: () => cleanupChat(activeChatId || chatId),
@@ -3060,6 +3242,7 @@ export class RequestForwarder {
 
       const result = await handler.handleNonStream(resumableResponseStream, {
         signal: context?.signal,
+        requestDeadlineAt: options.requestDeadlineAt,
         recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
         recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
         allowReasoningOnlyOutput: isContextCompaction,
@@ -3069,7 +3252,7 @@ export class RequestForwarder {
       this.applyToolCallsToResponse(result, transformed)
 
       if (isContextCompaction || shouldDeleteSession()) {
-        await adapter.deleteChat(activeChatId || chatId)
+        cleanupChat(activeChatId || chatId)
       }
 
       return {
@@ -3387,7 +3570,9 @@ export class RequestForwarder {
             transformedStream.end()
           } catch (error) {
             console.error('[Mimo] Stream error:', error)
-            transformedStream.end()
+            transformedStream.destroy(
+              error instanceof Error ? error : new Error(String(error)),
+            )
           }
         })()
 

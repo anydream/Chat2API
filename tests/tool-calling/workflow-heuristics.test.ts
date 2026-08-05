@@ -94,6 +94,36 @@ test('accepts OpenAI tool calls whose content field is omitted', () => {
   assert.equal(hasTrailingMatchedToolResultBatch(messages), true)
 })
 
+test('accepts bridge-split assistant text between a call and its matching result', () => {
+  const messages = [
+    openAiCall('call-a'),
+    { role: 'assistant', content: 'I will inspect the export directory.' },
+    openAiResult('call-a'),
+  ] as ChatMessage[]
+
+  assert.equal(hasTrailingMatchedToolResultBatch(messages), true)
+})
+
+test('only skips structurally valid assistant text before trailing results', () => {
+  const invalidInterveningMessages = [
+    { role: 'user', content: 'start a different task' },
+    { role: 'assistant', content: 'text', tool_calls: {} },
+    { role: 'assistant', content: [{ type: 'image_url', image_url: { url: 'https://example.test/a.png' } }] },
+    openAiCall('call-b', 'unrelated'),
+  ] as unknown as ChatMessage[]
+
+  for (const interveningMessage of invalidInterveningMessages) {
+    assert.equal(
+      hasTrailingMatchedToolResultBatch([
+        openAiCall('call-a'),
+        interveningMessage,
+        openAiResult('call-a'),
+      ]),
+      false,
+    )
+  }
+})
+
 test('rejects incomplete, duplicate, mismatched, and non-adjacent result batches', () => {
   const callBatch = {
     role: 'assistant',

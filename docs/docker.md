@@ -179,13 +179,14 @@ CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED=true
 CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT=20
 CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
 CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS=30000
-QWEN_AI_REQUEST_TIMEOUT_MS=600000
+QWEN_AI_REQUEST_TIMEOUT_MS=540000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
+CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
 # explicit retry cap (0 disables busy-chat recovery).
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
@@ -198,20 +199,25 @@ CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
 
 The Qwen AI queue timeout applies only while waiting for a governor slot. The
-request and idle limits apply after admission. The idle timeout is refreshed
+cumulative request deadline starts at route entry and is preserved across
+account failover, queue waits, retries, compaction stages, file upload and
+parsing, active response streams, and semantic recovery. Expiry returns
+`504/qwen_ai_request_timeout` without penalizing the account. Response and idle
+limits apply after admission. The idle timeout is refreshed
 only by parsed SSE events that represent generation progress; empty events and
 transport heartbeats keep the connection alive without resetting it. The
-absolute response limit is disabled when `QWEN_AI_RESPONSE_TIMEOUT_MS=0`, so an
-active long generation is not terminated solely because of elapsed wall time.
-Set a positive value only when the deployment requires an absolute cap. A
-stream with no meaningful progress still fails after 180 seconds by default.
-An outer client or reverse proxy can impose a shorter end-to-end deadline, so
-its timeout must be configured separately when the deployment is expected to
-tolerate both queueing and a long generation.
+additional post-admission response limit is disabled when
+`QWEN_AI_RESPONSE_TIMEOUT_MS=0`; the cumulative request deadline remains in
+force. Set a positive value to impose a shorter response-only cap. A stream
+with no meaningful progress still fails after 180 seconds by default.
 When using the bundled LiteLLM Compose service, its generic outer
 `REQUEST_TIMEOUT` defaults to `900` seconds (via `LITELLM_REQUEST_TIMEOUT`).
-Streaming activity refreshes LiteLLM's outer connect/read budget. This value is
-independent from Chat2API's queue and meaningful-idle limits and remains
+The bundled LiteLLM configuration maps
+`general_settings.pass_through_request_timeout` to `REQUEST_TIMEOUT`; this
+keeps pass-through Anthropic Messages and Responses requests from falling back
+to LiteLLM's built-in 600-second timeout. Streaming activity refreshes
+LiteLLM's outer connect/read budget. This value is independent from Chat2API's
+Qwen cumulative request, queue, and meaningful-idle limits and remains
 configurable.
 Chat2API emits legal SSE comment frames after
 `CHAT2API_SSE_KEEPALIVE_INTERVAL_MS` of downstream silence. These comments do
@@ -225,30 +231,46 @@ controls the pause between attempts. Set the attempts value to `0` to disable
 this transport recovery. It never resubmits the original prompt and is not
 selected by a session id, project path, or task content.
 Transport resumes and managed workflow continuations also share the bounded
-`CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `180000` ms). The budget is
-spent only while a replacement stream is being admitted, including retry
-delays and a stalled JSON admission response; it pauses once a replacement
-stream is attached. This prevents several recovery layers from accumulating
-independent waits while preserving long generations that are making progress.
+ `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `180000` ms). The budget is
+ spent only while a replacement stream is being admitted, including retry
+ delays and a stalled JSON admission response; it pauses once a replacement
+ stream is attached. Active generation does not spend this smaller no-progress
+ budget, but it remains inside the configured cumulative request deadline. This
+ prevents several recovery layers from accumulating independent waits while
+ preserving generations that are making progress within the route budget.
 Set it to `0` to disable recovery and surface the original upstream failure.
+Once a managed semantic recovery starts,
+`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` (default `300000` ms) adds an
+absolute wall-clock limit across every replacement branch. Unlike the
+no-progress budget, this timer keeps running while a continuation emits output,
+so repeated incomplete branches cannot outlive the outer LiteLLM timeout. On
+each request it is also clamped to the remaining `QWEN_AI_REQUEST_TIMEOUT_MS`
+ budget. Configure the request budget below any downstream client or proxy
+ deadline so the transport layers have time to carry the terminal response.
+ If the workflow-specific timer expires first, Chat2API returns
+ `504/qwen_ai_workflow_recovery_timeout`. If the cumulative request deadline
+ expires first, it returns `504/qwen_ai_request_timeout`. Neither penalizes the
+ account.
 Qwen receives the OpenAI message history as one provider prompt. Chat2API
 forwards the complete rendered transcript without applying a proxy-side size
 limit or compacting messages, tool arguments, or tool results.
 When a managed-tool response reaches a semantic terminal without a tool call,
 Chat2API starts a new user-turn continuation in the same Qwen chat instead of
-replaying that completed response branch. By default,
+replaying that completed response branch or the original transcript. A fresh
+chat replay is reserved for an undeclared provider-native tool call. By default,
 `CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` is blank: genuine Qwen
-progress remains authoritative, while the shared no-progress recovery budget
-still bounds stalled admission and empty retry loops. Set a positive integer
-only to impose a deployment-specific turn cap, or `0` to disable semantic
-recovery. The new turn is parented to Qwen's latest `response_id` and does not
-resend the original messages or files.
+progress remains authoritative within the absolute workflow recovery deadline;
+the shared no-progress budget separately bounds stalled admission and empty
+retry loops. Set a positive integer only to impose a deployment-specific turn
+cap, or `0` to disable semantic recovery. The new turn is parented to Qwen's
+latest `response_id` and does not resend the original messages or files.
 If Qwen is still finalizing the parent response, its continuation endpoint
 returns HTTP 200 JSON with `code=CHAT_IN_PROGRESS` instead of an SSE stream.
 Chat2API waits with exponential backoff and retries the exact same continuation
 payload until `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS` is spent
 (default `300000` ms). This admission budget is capped by
-`QWEN_AI_REQUEST_TIMEOUT_MS` but does not shorten an accepted generation. Leave
+`QWEN_AI_REQUEST_TIMEOUT_MS`; once a generation is accepted, the same
+cumulative request deadline remains in force. Leave
 `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` unset/blank for deadline mode;
 set a positive value only when the deployment needs an explicit attempt cap, or
 set it to `0` to fail immediately. `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`

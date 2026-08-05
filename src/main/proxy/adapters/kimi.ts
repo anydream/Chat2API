@@ -1222,10 +1222,15 @@ export class KimiStreamHandler {
         return
       }
 
-      finalized = true
-      cleanup()
       const baseChunk = createBaseChunk(this.responseId, this.model, created)
       const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
+      const protocolError = this.toolStreamParser?.getProtocolError()
+      if (protocolError) {
+        fail(protocolError)
+        return
+      }
+      finalized = true
+      cleanup()
       for (const outChunk of flushChunks) {
         transStream.write(`data: ${JSON.stringify(outChunk)}\n\n`)
       }

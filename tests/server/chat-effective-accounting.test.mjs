@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import { createAssistantOutputBoundaryStream } from '../../src/main/proxy/toolCalling/assistantOutputBoundary.ts'
 
 const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
@@ -241,6 +242,7 @@ function loadChatRoute({
         lastUserTextPrefix: 'compact',
       }),
     },
+    '../toolCalling/assistantOutputBoundary': { createAssistantOutputBoundaryStream },
   }
   const testRequire = specifier => {
     if (specifier in localModules) return localModules[specifier]
@@ -492,4 +494,96 @@ test('deferred stream failure applies governor, cooldown, stats, and logs to eff
   assert.equal(harness.calls.requestLogs[0].providerId, 'provider-effective')
   assert.equal(harness.calls.requestLogs[0].accountId, 'account-effective')
   assert.equal(harness.calls.requestLogs[0].actualModel, 'qwen-effective-model')
+})
+
+test('generic protocol stream failure stays structured and is recorded as a failure', async () => {
+  const upstream = new PassThrough()
+  const harness = loadChatRoute({
+    stream: true,
+    qwenAiProvider: false,
+    forwardResult: {
+      success: true,
+      status: 200,
+      stream: upstream,
+      skipTransform: true,
+    },
+  })
+  const { ctx } = await invokeChatRoute(harness)
+  const output = []
+  ctx.body.on('data', chunk => output.push(chunk))
+  const ended = once(ctx.body, 'end')
+  const failure = Object.assign(new Error('internal managed wrapper reached the response boundary'), {
+    status: 502,
+    code: 'managed_tool_result_wrapper_leak',
+    type: 'upstream_protocol_error',
+    param: 'content',
+    retryable: false,
+    accountFault: false,
+  })
+
+  upstream.destroy(failure)
+  await ended
+
+  const body = Buffer.concat(output).toString()
+  assert.match(body, /event: error/)
+  assert.match(body, /"status":502/)
+  assert.match(body, /"code":"managed_tool_result_wrapper_leak"/)
+  assert.match(body, /"type":"upstream_protocol_error"/)
+  assert.match(body, /"param":"content"/)
+  assert.match(body, /"retryable":false/)
+  assert.match(body, /"accountFault":false/)
+  assert.doesNotMatch(body, /finish_reason|\[DONE\]|\[Error:/)
+  assert.deepEqual(harness.calls.usage, [])
+  assert.deepEqual(harness.calls.failed, [])
+  assert.deepEqual(
+    harness.calls.stats.map(({ success, providerId, accountId }) => ({ success, providerId, accountId })),
+    [{ success: false, providerId: 'provider-initial', accountId: 'account-initial' }],
+  )
+  assert.equal(harness.calls.requestLogs[0].status, 'error')
+  assert.equal(harness.calls.requestLogs[0].statusCode, 502)
+  assert.equal(harness.calls.requestLogs[0].errorCode, 'managed_tool_result_wrapper_leak')
+})
+
+test('route boundary blocks a reasoning wrapper emitted as otherwise successful SSE', async () => {
+  const upstream = new PassThrough()
+  const harness = loadChatRoute({
+    stream: true,
+    qwenAiProvider: false,
+    forwardResult: {
+      success: true,
+      status: 200,
+      stream: upstream,
+      skipTransform: true,
+    },
+  })
+  const { ctx } = await invokeChatRoute(harness)
+  const output = []
+  ctx.body.on('data', chunk => output.push(chunk))
+  const ended = once(ctx.body, 'end')
+  const chunk = value => `data: ${JSON.stringify({
+    id: 'chatcmpl-route-boundary',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'fixture-model',
+    choices: [{ index: 0, delta: { reasoning_content: value }, finish_reason: null }],
+  })}\n\n`
+
+  upstream.write(chunk('checking <|CHAT2API|tool_'))
+  upstream.write(chunk('result tool_call_id="call_fake"><![CDATA[value]]></|CHAT2API|tool_result>'))
+  upstream.end('data: [DONE]\n\n')
+  await ended
+
+  const body = Buffer.concat(output).toString()
+  assert.match(body, /event: error/)
+  assert.match(body, /"status":502/)
+  assert.match(body, /"code":"managed_tool_result_wrapper_leak"/)
+  assert.match(body, /"param":"reasoning_content"/)
+  assert.doesNotMatch(body, /CHAT2API\|tool_result|"finish_reason":"(?:stop|tool_calls)"|data: \[DONE\]|\[Error:/)
+  assert.deepEqual(harness.calls.usage, [])
+  assert.deepEqual(
+    harness.calls.stats.map(({ success, providerId, accountId }) => ({ success, providerId, accountId })),
+    [{ success: false, providerId: 'provider-initial', accountId: 'account-initial' }],
+  )
+  assert.equal(harness.calls.requestLogs[0].status, 'error')
+  assert.equal(harness.calls.requestLogs[0].errorCode, 'managed_tool_result_wrapper_leak')
 })

@@ -20,6 +20,9 @@ model_list:
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  # Apply the configured outer timeout to every pass-through request instead
+  # of relying on LiteLLM's separate built-in fallback.
+  pass_through_request_timeout: os.environ/REQUEST_TIMEOUT
   # LiteLLM 1.93 monitors the downstream connection and cancels an in-flight
   # upstream call when the client disconnects.
   cancel_on_disconnect: true

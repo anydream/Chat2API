@@ -31,6 +31,11 @@ import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
 import { getToolProtocol } from '../toolCalling/protocols'
 import {
+  ManagedToolResultGuard,
+  stripManagedToolResultWrappers,
+  type ManagedToolResultGuardOutput,
+} from '../toolCalling/managedToolResultGuard'
+import {
   hasManagedWorkflowCompletionMarker,
   requiresManagedWorkflowCompletionMarker,
   stripManagedWorkflowCompletionMarker,
@@ -74,6 +79,11 @@ const QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS = 1_000
 // so a valid long generation is not cut off by this guard.
 const QWEN_AI_RECOVERY_DEFAULT_BUDGET_MS = 180_000
 const QWEN_AI_RECOVERY_MAX_BUDGET_MS = 30 * 60 * 1_000
+// Once semantic recovery starts, every replacement branch belongs to one
+// logical recovery episode. Bound its total wall time even while Qwen keeps
+// producing progress that would otherwise pause the no-progress budget.
+const QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS = 300_000
+const QWEN_AI_WORKFLOW_RECOVERY_MAX_TIMEOUT_MS = 30 * 60 * 1_000
 
 export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
@@ -118,6 +128,8 @@ type QwenAiMessage = ChatMessage
 
 type StreamHandlingOptions = {
   signal?: AbortSignal
+  /** Absolute deadline for the complete route request, including active SSE. */
+  requestDeadlineAt?: number
   responseTimeoutMs?: number
   idleTimeoutMs?: number
   /** Withhold managed-tool frames until the response branch passes validation. */
@@ -161,6 +173,10 @@ type QwenAiResumableStreamOptions = {
   workflowContinuationAttempts?: number
   /** Shared budget for one or more no-progress recovery episodes. */
   recoveryBudgetMs?: number
+  /** Absolute wall time across all managed workflow continuation branches. */
+  workflowRecoveryTimeoutMs?: number
+  /** Existing request deadline used to leave time for outer proxies to reply. */
+  workflowRecoveryDeadlineAt?: number
 }
 
 export type QwenAiResumableStream = PassThrough & {
@@ -190,6 +206,8 @@ interface ChatCompletionRequest {
   }
   chatId?: string
   signal?: AbortSignal
+  /** Absolute deadline shared by admission, upload, generation, and recovery. */
+  deadlineAt?: number
   /** Remaining budget supplied by the outer same-account busy retry loop. */
   timeoutMs?: number
   /** Selects how the complete converted conversation reaches Qwen. */
@@ -344,6 +362,16 @@ export function qwenAiRecoveryBudgetMsFromEnv(): number {
     nonNegativeNumberFromEnv(
       'CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS',
       QWEN_AI_RECOVERY_DEFAULT_BUDGET_MS,
+    ),
+  )
+}
+
+export function qwenAiWorkflowRecoveryTimeoutMsFromEnv(): number {
+  return Math.min(
+    QWEN_AI_WORKFLOW_RECOVERY_MAX_TIMEOUT_MS,
+    nonNegativeNumberFromEnv(
+      'CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS',
+      QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS,
     ),
   )
 }
@@ -516,6 +544,29 @@ export function createQwenAiResumableStream(
   let recoveryBudgetController: AbortController | undefined
   let recoveryBudgetClientAbort: (() => void) | undefined
   let recoveryBudgetExpired = false
+  let recoveryBudgetEffectiveTimerMs = 0
+  const configuredWorkflowRecoveryTimeoutMs = options.workflowRecoveryTimeoutMs
+    ?? qwenAiWorkflowRecoveryTimeoutMsFromEnv()
+  const workflowRecoveryTimeoutMs = Number.isFinite(configuredWorkflowRecoveryTimeoutMs)
+    ? Math.max(0, configuredWorkflowRecoveryTimeoutMs)
+    : qwenAiWorkflowRecoveryTimeoutMsFromEnv()
+  const workflowRecoveryRequestDeadlineAt = Number.isFinite(options.workflowRecoveryDeadlineAt)
+    ? Math.max(0, options.workflowRecoveryDeadlineAt || 0)
+    : undefined
+  const requestDeadlineExpired = () => workflowRecoveryRequestDeadlineAt !== undefined
+    && Date.now() >= workflowRecoveryRequestDeadlineAt
+  const effectiveRecoveryBudgetError = () => requestDeadlineExpired()
+    ? createQwenAiRequestTimeoutError()
+    : createQwenAiRecoveryBudgetError()
+  const effectiveWorkflowRecoveryTimeoutError = () => requestDeadlineExpired()
+    ? createQwenAiRequestTimeoutError()
+    : createQwenAiWorkflowRecoveryTimeoutError()
+  let workflowRecoveryStartedAt: number | undefined
+  let workflowRecoveryEffectiveTimeoutMs = 0
+  let workflowRecoveryTimer: NodeJS.Timeout | undefined
+  let workflowRecoveryController: AbortController | undefined
+  let workflowRecoveryExpired = false
+  let linkedRecoverySignalCleanup: (() => void) | undefined
 
   type SourceListeners = {
     data: (chunk: Buffer | string) => void
@@ -540,6 +591,7 @@ export function createQwenAiResumableStream(
       )
     }
     recoveryBudgetStartedAt = undefined
+    recoveryBudgetEffectiveTimerMs = 0
     if (recoveryBudgetTimer) {
       clearTimeout(recoveryBudgetTimer)
       recoveryBudgetTimer = undefined
@@ -554,9 +606,41 @@ export function createQwenAiResumableStream(
     }
   }
 
+  const releaseLinkedRecoverySignal = () => {
+    linkedRecoverySignalCleanup?.()
+    linkedRecoverySignalCleanup = undefined
+  }
+
+  const stopWorkflowRecoveryDeadline = (abortInFlight = false) => {
+    const controller = workflowRecoveryController
+    if (workflowRecoveryTimer) {
+      clearTimeout(workflowRecoveryTimer)
+      workflowRecoveryTimer = undefined
+    }
+    workflowRecoveryController = undefined
+    workflowRecoveryStartedAt = undefined
+    workflowRecoveryEffectiveTimeoutMs = 0
+    releaseLinkedRecoverySignal()
+    if (abortInFlight && controller && !controller.signal.aborted) {
+      controller.abort()
+    }
+  }
+
   const startRecoveryBudget = (): AbortSignal | undefined => {
     if (recoveryBudgetStartedAt !== undefined) return recoveryBudgetController?.signal
     if (recoveryBudgetRemainingMs <= 0) return undefined
+
+    const requestRemainingMs = workflowRecoveryRequestDeadlineAt === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, workflowRecoveryRequestDeadlineAt - Date.now())
+    recoveryBudgetEffectiveTimerMs = Math.min(
+      recoveryBudgetRemainingMs,
+      requestRemainingMs,
+    )
+    if (recoveryBudgetEffectiveTimerMs <= 0) {
+      recoveryBudgetExpired = true
+      return undefined
+    }
 
     recoveryBudgetStartedAt = performance.now()
     recoveryBudgetExpired = false
@@ -568,19 +652,19 @@ export function createQwenAiResumableStream(
     recoveryBudgetTimer = setTimeout(() => {
       recoveryBudgetExpired = true
       recoveryBudgetController?.abort()
-    }, Math.max(1, Math.ceil(recoveryBudgetRemainingMs)))
+    }, Math.max(1, Math.ceil(recoveryBudgetEffectiveTimerMs)))
     return recoveryBudgetController.signal
   }
 
   const assertRecoveryBudget = () => {
-    if (recoveryBudgetExpired) throw createQwenAiRecoveryBudgetError()
+    if (recoveryBudgetExpired) throw effectiveRecoveryBudgetError()
     if (
       recoveryBudgetStartedAt !== undefined
-      && performance.now() - recoveryBudgetStartedAt >= recoveryBudgetRemainingMs
+      && performance.now() - recoveryBudgetStartedAt >= recoveryBudgetEffectiveTimerMs
     ) {
       recoveryBudgetExpired = true
       recoveryBudgetController?.abort()
-      throw createQwenAiRecoveryBudgetError()
+      throw effectiveRecoveryBudgetError()
     }
   }
 
@@ -605,6 +689,7 @@ export function createQwenAiResumableStream(
     settled = true
     settledError = error
     pauseRecoveryBudget(true)
+    stopWorkflowRecoveryDeadline(true)
     detachSource(source, true)
     removeAbortListener()
     bridge.destroy(error)
@@ -614,9 +699,77 @@ export function createQwenAiResumableStream(
     if (settled) return
     settled = true
     pauseRecoveryBudget(true)
+    stopWorkflowRecoveryDeadline(true)
     detachSource(source, true)
     removeAbortListener()
     bridge.end()
+  }
+
+  const startWorkflowRecoveryDeadline = (): AbortSignal | undefined => {
+    if (workflowRecoveryStartedAt !== undefined) {
+      return workflowRecoveryController?.signal
+    }
+    const requestRemainingMs = workflowRecoveryRequestDeadlineAt === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, workflowRecoveryRequestDeadlineAt - Date.now())
+    workflowRecoveryEffectiveTimeoutMs = Math.min(
+      workflowRecoveryTimeoutMs,
+      requestRemainingMs,
+    )
+    if (workflowRecoveryEffectiveTimeoutMs <= 0) {
+      workflowRecoveryExpired = true
+      return undefined
+    }
+
+    workflowRecoveryStartedAt = performance.now()
+    workflowRecoveryExpired = false
+    workflowRecoveryController = new AbortController()
+    workflowRecoveryTimer = setTimeout(() => {
+      if (settled) return
+      workflowRecoveryExpired = true
+      workflowRecoveryController?.abort()
+      fail(effectiveWorkflowRecoveryTimeoutError())
+    }, Math.max(1, Math.ceil(workflowRecoveryEffectiveTimeoutMs)))
+    return workflowRecoveryController.signal
+  }
+
+  const assertWorkflowRecoveryDeadline = () => {
+    if (workflowRecoveryExpired) throw effectiveWorkflowRecoveryTimeoutError()
+    if (
+      workflowRecoveryStartedAt !== undefined
+      && performance.now() - workflowRecoveryStartedAt >= workflowRecoveryEffectiveTimeoutMs
+    ) {
+      workflowRecoveryExpired = true
+      workflowRecoveryController?.abort()
+      throw effectiveWorkflowRecoveryTimeoutError()
+    }
+  }
+
+  const linkAbortSignals = (
+    signals: Array<AbortSignal | undefined>,
+  ): { signal: AbortSignal; cleanup: () => void } => {
+    const controller = new AbortController()
+    const listeners: Array<{ signal: AbortSignal; listener: () => void }> = []
+
+    for (const signal of signals) {
+      if (!signal) continue
+      if (signal.aborted) {
+        controller.abort()
+        break
+      }
+      const listener = () => controller.abort()
+      signal.addEventListener('abort', listener, { once: true })
+      listeners.push({ signal, listener })
+    }
+
+    return {
+      signal: controller.signal,
+      cleanup: () => {
+        for (const entry of listeners) {
+          entry.signal.removeEventListener('abort', entry.listener)
+        }
+      },
+    }
   }
 
   const checkComplete = (): boolean => {
@@ -682,6 +835,7 @@ export function createQwenAiResumableStream(
   }
 
   const retireCurrentSource = () => {
+    releaseLinkedRecoverySignal()
     detachSource(source, true)
   }
 
@@ -703,6 +857,9 @@ export function createQwenAiResumableStream(
     // A zero budget is an explicit deployment choice to disable recovery.
     // Preserve the original provider failure instead of waiting indefinitely.
     if (!recoverySignal) {
+      if (recoveryBudgetExpired) {
+        failRecovery(effectiveRecoveryBudgetError())
+      }
       failRecovery(
         recoveryBudgetRemainingMs <= 0
           ? normalizeQwenAiStreamFailure(lastError)
@@ -714,7 +871,7 @@ export function createQwenAiResumableStream(
       try {
         assertRecoveryBudget()
       } catch (error) {
-        failRecovery(error instanceof Error ? error : createQwenAiRecoveryBudgetError())
+        failRecovery(error instanceof Error ? error : effectiveRecoveryBudgetError())
       }
     }
 
@@ -746,7 +903,7 @@ export function createQwenAiResumableStream(
 
       attempts += 1
       if (!(await waitForRetry(recoverySignal))) {
-        if (recoveryBudgetExpired) failRecovery(createQwenAiRecoveryBudgetError())
+        if (recoveryBudgetExpired) failRecovery(effectiveRecoveryBudgetError())
         failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
       }
       ensureRecoveryBudget()
@@ -779,7 +936,13 @@ export function createQwenAiResumableStream(
         // response to the bridge; release it immediately instead.
         if (recoveryBudgetExpired) {
           destroyReadableStream(nextStream)
-          failRecovery(createQwenAiRecoveryBudgetError())
+          failRecovery(effectiveRecoveryBudgetError())
+        }
+        try {
+          assertRecoveryBudget()
+        } catch (error) {
+          destroyReadableStream(nextStream)
+          failRecovery(error instanceof Error ? error : effectiveRecoveryBudgetError())
         }
         if (settled || options.signal?.aborted || sourceComplete || checkComplete()) {
           destroyReadableStream(nextStream)
@@ -813,7 +976,7 @@ export function createQwenAiResumableStream(
         }
         lastError = error instanceof Error ? error : new Error(String(error))
         if (recoveryBudgetExpired) {
-          failRecovery(createQwenAiRecoveryBudgetError())
+          failRecovery(effectiveRecoveryBudgetError())
         }
         if (!isQwenAiSemanticRecoveryError(lastError)) {
           semanticRecoveryEligible = false
@@ -841,13 +1004,36 @@ export function createQwenAiResumableStream(
     ) {
       const parentResponseId = options.getResponseId().trim()
       if (parentResponseId) {
+        const workflowRecoverySignal = startWorkflowRecoveryDeadline()
+        if (!workflowRecoverySignal) {
+          failRecovery(effectiveWorkflowRecoveryTimeoutError())
+        }
+        try {
+          assertWorkflowRecoveryDeadline()
+        } catch (error) {
+          failRecovery(error instanceof Error ? error : effectiveWorkflowRecoveryTimeoutError())
+        }
+        const linkedRecoverySignal = linkAbortSignals([
+          recoverySignal,
+          workflowRecoverySignal,
+        ])
+        releaseLinkedRecoverySignal()
+        linkedRecoverySignalCleanup = linkedRecoverySignal.cleanup
         workflowContinuationAttempts += 1
         ensureRecoveryBudget()
-        if (!(await waitForRetry(recoverySignal))) {
-          if (recoveryBudgetExpired) failRecovery(createQwenAiRecoveryBudgetError())
+        if (!(await waitForRetry(linkedRecoverySignal.signal))) {
+          if (workflowRecoveryExpired) {
+            failRecovery(effectiveWorkflowRecoveryTimeoutError())
+          }
+          if (recoveryBudgetExpired) failRecovery(effectiveRecoveryBudgetError())
           failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
         }
         ensureRecoveryBudget()
+        try {
+          assertWorkflowRecoveryDeadline()
+        } catch (error) {
+          failRecovery(error instanceof Error ? error : effectiveWorkflowRecoveryTimeoutError())
+        }
 
         try {
           console.warn('[QwenAI] Starting managed workflow continuation', JSON.stringify({
@@ -857,12 +1043,32 @@ export function createQwenAiResumableStream(
               ? { limitMode: 'provider_progress' }
               : { maxAttempts: workflowContinuationAttemptLimit }),
           }))
-          const continued = await options.continueWorkflow(parentResponseId, lastError, recoverySignal)
+          const continued = await options.continueWorkflow(
+            parentResponseId,
+            lastError,
+            linkedRecoverySignal.signal,
+          )
           const nextStream = continued?.data ?? continued
 
+          if (workflowRecoveryExpired) {
+            destroyReadableStream(nextStream)
+            failRecovery(effectiveWorkflowRecoveryTimeoutError())
+          }
           if (recoveryBudgetExpired) {
             destroyReadableStream(nextStream)
-            failRecovery(createQwenAiRecoveryBudgetError())
+            failRecovery(effectiveRecoveryBudgetError())
+          }
+          try {
+            assertWorkflowRecoveryDeadline()
+          } catch (error) {
+            destroyReadableStream(nextStream)
+            failRecovery(error instanceof Error ? error : effectiveWorkflowRecoveryTimeoutError())
+          }
+          try {
+            assertRecoveryBudget()
+          } catch (error) {
+            destroyReadableStream(nextStream)
+            failRecovery(error instanceof Error ? error : effectiveRecoveryBudgetError())
           }
           if (settled || options.signal?.aborted || checkComplete()) {
             destroyReadableStream(nextStream)
@@ -884,8 +1090,8 @@ export function createQwenAiResumableStream(
           sourceComplete = false
           terminalMarkerSeen = false
           completionScan = ''
-          // A fresh user turn has a new response branch. Keep the shared
-          // recovery budget paused until that branch needs another recovery.
+          // A fresh user turn has a new response branch. Pause only the
+          // no-progress budget; the workflow wall-clock deadline stays active.
           attempts = 0
           pauseRecoveryBudget()
           recoveryInFlight = false
@@ -894,13 +1100,17 @@ export function createQwenAiResumableStream(
           attachSource(nextStream, sourceGeneration)
           return true
         } catch (error) {
+          releaseLinkedRecoverySignal()
           if (settled) {
             if (settledError) throw settledError
             return false
           }
           lastError = error instanceof Error ? error : new Error(String(error))
+          if (workflowRecoveryExpired) {
+            failRecovery(effectiveWorkflowRecoveryTimeoutError())
+          }
           if (recoveryBudgetExpired) {
-            failRecovery(createQwenAiRecoveryBudgetError())
+            failRecovery(effectiveRecoveryBudgetError())
           }
           if (isClientCancellationError(lastError) || options.signal?.aborted) {
             failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
@@ -931,7 +1141,7 @@ export function createQwenAiResumableStream(
     if (transportError.status === undefined || transportError.status >= 500) {
       transportError.accountFault = false
     }
-    failRecovery(transportError)
+    return failRecovery(transportError)
   }
 
   const startRecovery = (
@@ -1110,6 +1320,7 @@ export function createQwenAiResumableStream(
     if (settled) return
     settled = true
     pauseRecoveryBudget(true)
+    stopWorkflowRecoveryDeadline(true)
     detachSource(source, true)
     removeAbortListener()
   })
@@ -1524,6 +1735,7 @@ function createQwenAiStreamFailure(
     | 'qwen_ai_empty_stream'
     | 'qwen_ai_semantic_empty'
     | 'qwen_ai_semantic_incomplete'
+    | 'qwen_ai_wrapper_leak'
     | 'qwen_ai_invalid_tool_arguments' = 'qwen_ai_stream_incomplete',
 ): QwenAiUpstreamError {
   const error = new Error(message) as QwenAiUpstreamError
@@ -1552,6 +1764,17 @@ function createQwenAiSemanticIncompleteError(): QwenAiUpstreamError {
     'Qwen AI completed with a dangling answer while managed tools were available',
     'qwen_ai_semantic_incomplete',
   )
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiWrapperLeakError(): QwenAiUpstreamError {
+  const error = createQwenAiStreamFailure(
+    'Qwen AI returned an internal managed tool-result wrapper in assistant output',
+    'qwen_ai_wrapper_leak',
+  )
+  error.type = 'upstream_protocol_error'
+  error.param = 'content'
   error.accountFault = false
   return error
 }
@@ -1616,6 +1839,178 @@ function createQwenAiRecoveryBudgetError(): QwenAiUpstreamError {
   return error
 }
 
+function createQwenAiRequestTimeoutError(): QwenAiUpstreamError {
+  const error = new Error(
+    'Qwen AI request exceeded its cumulative request deadline.',
+  ) as QwenAiUpstreamError
+  error.status = 504
+  error.code = 'qwen_ai_request_timeout'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiClientCancellationError(): QwenAiUpstreamError {
+  const error = new Error(
+    'Qwen AI request was cancelled because the client disconnected.',
+  ) as QwenAiUpstreamError
+  error.name = 'AbortError'
+  error.status = 499
+  error.code = 'qwen_ai_client_cancelled'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+type QwenAiRequestDeadlineScope = {
+  signal?: AbortSignal
+  wait<T>(operation: Promise<T>, disposeLateValue?: (value: T) => void): Promise<T>
+  throwIfStopped(): void
+  remainingTimeoutMs(configuredTimeoutMs: number): number
+  dispose(): void
+}
+
+function createQwenAiRequestDeadlineScope(
+  clientSignal?: AbortSignal,
+  rawDeadlineAt?: number,
+): QwenAiRequestDeadlineScope {
+  const deadlineAt = typeof rawDeadlineAt === 'number' && Number.isFinite(rawDeadlineAt)
+    ? rawDeadlineAt
+    : undefined
+  const needsLinkedSignal = Boolean(clientSignal) || deadlineAt !== undefined
+  const controller = needsLinkedSignal ? new AbortController() : undefined
+  let stopCause: 'client' | 'deadline' | undefined
+  let deadlineTimer: NodeJS.Timeout | undefined
+  let rejectStopped: ((error: QwenAiUpstreamError) => void) | undefined
+
+  const stopped = needsLinkedSignal
+    ? new Promise<never>((_resolve, reject) => {
+        rejectStopped = reject
+      })
+    : undefined
+  // A synchronously-aborted input can settle this promise before the first
+  // operation is raced. Keep that rejection observed without changing it.
+  void stopped?.catch(() => {})
+
+  const errorForCause = (cause: 'client' | 'deadline'): QwenAiUpstreamError => cause === 'deadline'
+    ? createQwenAiRequestTimeoutError()
+    : createQwenAiClientCancellationError()
+
+  const stop = (cause: 'client' | 'deadline') => {
+    if (stopCause) return
+    stopCause = cause
+    const error = errorForCause(cause)
+    if (controller && !controller.signal.aborted) controller.abort(error)
+    rejectStopped?.(error)
+  }
+
+  const onClientAbort = () => stop('client')
+  clientSignal?.addEventListener('abort', onClientAbort, { once: true })
+
+  if (clientSignal?.aborted) {
+    stop('client')
+  } else if (deadlineAt !== undefined) {
+    const remainingMs = deadlineAt - Date.now()
+    if (remainingMs <= 0) {
+      stop('deadline')
+    } else {
+      deadlineTimer = setTimeout(
+        () => stop('deadline'),
+        Math.min(2_147_483_647, remainingMs),
+      )
+    }
+  }
+
+  const throwIfStopped = () => {
+    if (!stopCause && clientSignal?.aborted) stop('client')
+    // Recheck wall time synchronously. This prevents a late success from
+    // winning when CPU work delayed the deadline timer callback.
+    if (!stopCause && deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      stop('deadline')
+    }
+    if (stopCause) throw errorForCause(stopCause)
+  }
+
+  return {
+    signal: controller?.signal,
+    async wait<T>(operation: Promise<T>, disposeLateValue?: (value: T) => void): Promise<T> {
+      let waitFinished = false
+      let accepted = false
+      let pendingValue: T | undefined
+      let hasPendingValue = false
+      let lateValueDisposed = false
+      const disposeOnce = (value: T) => {
+        if (lateValueDisposed) return
+        lateValueDisposed = true
+        try {
+          disposeLateValue?.(value)
+        } catch {
+          // The structured timeout/cancellation remains authoritative.
+        }
+      }
+      operation.then(
+        value => {
+          if (accepted) return
+          if (waitFinished) {
+            disposeOnce(value)
+          } else {
+            pendingValue = value
+            hasPendingValue = true
+          }
+        },
+        () => {},
+      )
+
+      try {
+        const value = stopped
+          ? await Promise.race([operation, stopped])
+          : await operation
+        try {
+          throwIfStopped()
+        } catch (error) {
+          disposeOnce(value)
+          throw error
+        }
+        accepted = true
+        return value
+      } catch (error) {
+        throwIfStopped()
+        throw error
+      } finally {
+        waitFinished = true
+        if (!accepted && hasPendingValue) disposeOnce(pendingValue as T)
+      }
+    },
+    throwIfStopped,
+    remainingTimeoutMs(configuredTimeoutMs: number): number {
+      throwIfStopped()
+      const safeConfigured = Math.max(1, Math.floor(configuredTimeoutMs))
+      return deadlineAt === undefined
+        ? safeConfigured
+        : Math.max(1, Math.min(safeConfigured, deadlineAt - Date.now()))
+    },
+    dispose() {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer)
+        deadlineTimer = undefined
+      }
+      clientSignal?.removeEventListener('abort', onClientAbort)
+      rejectStopped = undefined
+    },
+  }
+}
+
+function createQwenAiWorkflowRecoveryTimeoutError(): QwenAiUpstreamError {
+  const error = new Error(
+    'Qwen AI managed workflow recovery exceeded its configured wall-clock timeout.',
+  ) as QwenAiUpstreamError
+  error.status = 504
+  error.code = 'qwen_ai_workflow_recovery_timeout'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
 function isDanglingManagedToolAnswer(
   content: string,
   plan?: ToolCallingPlan,
@@ -1673,6 +2068,7 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
     : ''
   return code === 'qwen_ai_semantic_empty'
     || code === 'qwen_ai_semantic_incomplete'
+    || code === 'qwen_ai_wrapper_leak'
     || code === 'qwen_ai_invalid_tool_arguments'
     || code === 'undeclared_native_tool_call'
     || code === 'malformed_tool_call'
@@ -2710,6 +3106,12 @@ export class QwenAiAdapter {
 
     const request = this.performDeleteChat(chatId)
     this.deleteChatRequests.set(chatId, request)
+    const clearRequest = () => {
+      if (this.deleteChatRequests.get(chatId) === request) {
+        this.deleteChatRequests.delete(chatId)
+      }
+    }
+    void request.then(clearRequest, clearRequest)
     return request
   }
 
@@ -2766,45 +3168,60 @@ export class QwenAiAdapter {
     chatId: string
     parentId: string | null
   }> {
-    await this.refreshTokenIfNeeded(request.signal)
-
-    const token = this.getToken()
-    if (!token) {
-      const error = new Error('Qwen AI token not configured, please add token in account settings') as QwenAiUpstreamError
-      error.status = 401
-      error.retryable = false
-      throw error
+    const scope = createQwenAiRequestDeadlineScope(request.signal, request.deadlineAt)
+    let chatId: string | undefined
+    let response: AxiosResponse | undefined
+    const cleanupChat = (id: string) => {
+      void this.deleteChat(id).catch(error => {
+        console.error('[QwenAI] Failed to delete chat:', describeErrorForLog(error))
+      })
     }
-
-    const modelId = this.mapModel(request.model)
-    const imageGeneration = resolveQwenAiImageGenerationOptions(request.image_generation)
-    const chatType = imageGeneration?.chatType ?? 't2t'
-
-    // Get forced thinking mode setting from originalModel (preserves user's intent before mapping)
-    // If originalModel exists, use it for thinking detection; otherwise fall back to request.model
-    const modelForThinking = request.originalModel || request.model
-    const modelLower = modelForThinking.toLowerCase()
-    let forceThinking: boolean | undefined
-    if (modelForThinking.endsWith('-thinking')) {
-      forceThinking = true
-    } else if (modelForThinking.endsWith('-fast')) {
-      forceThinking = false
-    } else if (modelLower.includes('think') || modelLower.includes('r1')) {
-      // Auto-enable thinking based on model name keywords (e.g. "Qwen3.6-Plus-AI-Think-Search")
-      forceThinking = true
-      console.log('[QwenAI] Thinking mode enabled (from model name keyword)')
-    } else {
-      // Use the forceThinking from mapModel if no originalModel-specific detection
-      forceThinking = (this as any)._forceThinking
-    }
-
-    // Always create a new chat (single-turn mode only)
-    const chatId = await this.createChat(modelId, 'OpenAI_API_Chat', request.signal, chatType)
-    if (QWEN_AI_DEBUG_REQUEST_LOGS) {
-      console.log('[QwenAI] Created new chat:', chatId)
+    const disposeResponse = (value: AxiosResponse) => {
+      destroyReadableStream(value?.data)
     }
 
     try {
+      await scope.wait(this.refreshTokenIfNeeded(scope.signal))
+
+      const token = this.getToken()
+      if (!token) {
+        const error = new Error('Qwen AI token not configured, please add token in account settings') as QwenAiUpstreamError
+        error.status = 401
+        error.retryable = false
+        throw error
+      }
+
+      const modelId = this.mapModel(request.model)
+      const imageGeneration = resolveQwenAiImageGenerationOptions(request.image_generation)
+      const chatType = imageGeneration?.chatType ?? 't2t'
+
+      // Get forced thinking mode setting from originalModel (preserves user's intent before mapping)
+      // If originalModel exists, use it for thinking detection; otherwise fall back to request.model
+      const modelForThinking = request.originalModel || request.model
+      const modelLower = modelForThinking.toLowerCase()
+      let forceThinking: boolean | undefined
+      if (modelForThinking.endsWith('-thinking')) {
+        forceThinking = true
+      } else if (modelForThinking.endsWith('-fast')) {
+        forceThinking = false
+      } else if (modelLower.includes('think') || modelLower.includes('r1')) {
+        // Auto-enable thinking based on model name keywords (e.g. "Qwen3.6-Plus-AI-Think-Search")
+        forceThinking = true
+        console.log('[QwenAI] Thinking mode enabled (from model name keyword)')
+      } else {
+        // Use the forceThinking from mapModel if no originalModel-specific detection
+        forceThinking = (this as any)._forceThinking
+      }
+
+      scope.throwIfStopped()
+      chatId = await scope.wait(
+        this.createChat(modelId, 'OpenAI_API_Chat', scope.signal, chatType),
+        lateChatId => cleanupChat(lateChatId),
+      )
+      if (QWEN_AI_DEBUG_REQUEST_LOGS) {
+        console.log('[QwenAI] Created new chat:', chatId)
+      }
+
       const messages = request.messages
       const uploader = new QwenAiFileUploader(
         this.axiosInstance,
@@ -2812,126 +3229,133 @@ export class QwenAiAdapter {
         this.postWithRefreshRetry.bind(this),
         { providerId: this.provider.id, accountId: this.account.id },
       )
-      const preparedUserMessage = await prepareQwenAiMultimodalMessage(messages, uploader, {
-        transport: request.messageTransport,
-      })
+      const preparedUserMessage = await scope.wait(
+        prepareQwenAiMultimodalMessage(messages, uploader, {
+          transport: request.messageTransport,
+          signal: scope.signal,
+          deadlineAt: request.deadlineAt,
+        }),
+      )
       const qwenFiles = preparedUserMessage.files
 
-    const fid = uuid()
-    const childId = uuid()
-    const ts = Math.floor(Date.now() / 1000)
+      const fid = uuid()
+      const childId = uuid()
+      const ts = Math.floor(Date.now() / 1000)
 
-    // The live model capability is authoritative when the upstream model does
-    // not support skipping its reasoning phase.
-    const modelCapability = findModelCapability(this.provider, modelForThinking, modelId)
-    const shouldEnableThinking = resolveQwenThinkingEnabled(
-      request.enable_thinking,
-      forceThinking,
-      modelCapability,
-    )
+      // The live model capability is authoritative when the upstream model does
+      // not support skipping its reasoning phase.
+      const modelCapability = findModelCapability(this.provider, modelForThinking, modelId)
+      const shouldEnableThinking = resolveQwenThinkingEnabled(
+        request.enable_thinking,
+        forceThinking,
+        modelCapability,
+      )
 
-    console.info('[QwenAI] upstream request shape', JSON.stringify({
-      requestId: request.requestId,
-      accountId: this.account.id,
-      model: modelId,
-      sourceMessageCount: messages.length,
-      transcriptChars: preparedUserMessage.content.length,
-      transcriptUtf8Bytes: Buffer.byteLength(preparedUserMessage.content, 'utf8'),
-      conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
-      fileCount: qwenFiles.length,
-      messageTransport: request.messageTransport ?? 'inline',
-      thinkingEnabled: shouldEnableThinking,
-      modelMaxContextTokens: modelCapability?.maxContextLength,
-      modelMaxSummaryTokens: modelCapability?.maxSummaryGenerationLength,
-    }))
+      console.info('[QwenAI] upstream request shape', JSON.stringify({
+        requestId: request.requestId,
+        accountId: this.account.id,
+        model: modelId,
+        sourceMessageCount: messages.length,
+        transcriptChars: preparedUserMessage.content.length,
+        transcriptUtf8Bytes: Buffer.byteLength(preparedUserMessage.content, 'utf8'),
+        conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
+        fileCount: qwenFiles.length,
+        messageTransport: request.messageTransport ?? 'inline',
+        thinkingEnabled: shouldEnableThinking,
+        modelMaxContextTokens: modelCapability?.maxContextLength,
+        modelMaxSummaryTokens: modelCapability?.maxSummaryGenerationLength,
+      }))
     
-    const featureConfig: Record<string, any> = {
-      thinking_enabled: shouldEnableThinking,
-      output_schema: 'phase',
-      research_mode: 'normal',
-      auto_thinking: shouldEnableThinking,
-      thinking_format: 'summary',
-      auto_search: false, // Default to disable auto search
-    }
-
-    if (request.thinking_budget) {
-      featureConfig.thinking_budget = request.thinking_budget
-    }
-
-    const payload = {
-      stream: true,
-      version: '2.1',
-      incremental_output: true,
-      chat_id: chatId,
-      chat_mode: 'normal',
-      model: modelId,
-      parent_id: null,
-      messages: [
-        {
-          fid,
-          parentId: null,
-          childrenIds: [childId],
-          role: 'user',
-          content: preparedUserMessage.content,
-          user_action: 'chat',
-          files: qwenFiles,
-          timestamp: ts,
-          models: [modelId],
-          chat_type: chatType,
-          feature_config: featureConfig,
-          extra: {
-            meta: {
-              subChatType: chatType,
-              ...(imageGeneration
-                ? { size: imageGeneration.size, model: imageGeneration.model }
-                : {}),
-            },
-          },
-          sub_chat_type: chatType,
-          parent_id: null,
-        },
-      ],
-      timestamp: ts + 1,
-      ...(imageGeneration ? { size: imageGeneration.size } : {}),
-    }
-
-    const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${chatId}`
-
-    if (QWEN_AI_DEBUG_REQUEST_LOGS || QWEN_AI_DEBUG_PAYLOAD_LOGS) {
-      console.log('[QwenAI] Sending request to /api/v2/chat/completions...')
-      console.log('[QwenAI] Request URL:', url)
-      if (QWEN_AI_DEBUG_PAYLOAD_LOGS) {
-        console.log('[QwenAI] Request payload:', JSON.stringify(this.sanitizePayloadForLog(payload), null, 2))
-      } else {
-        console.log('[QwenAI] Request payload summary:', JSON.stringify(this.summarizePayloadForLog(payload), null, 2))
+      const featureConfig: Record<string, any> = {
+        thinking_enabled: shouldEnableThinking,
+        output_schema: 'phase',
+        research_mode: 'normal',
+        auto_thinking: shouldEnableThinking,
+        thinking_format: 'summary',
+        auto_search: false, // Default to disable auto search
       }
-      console.log('[QwenAI] Request headers:', JSON.stringify(this.sanitizeHeadersForLog(this.getHeaders(chatId)), null, 2))
-    }
 
-    const requestTimeoutMs = Math.max(
-      1,
-      Math.min(QWEN_AI_REQUEST_TIMEOUT_MS, request.timeoutMs ?? QWEN_AI_REQUEST_TIMEOUT_MS),
-    )
-    const response = await this.postWithRefreshRetry(url, payload, () => ({
-      headers: {
-        ...this.getHeaders(chatId),
-        'x-accel-buffering': 'no',
-      },
-      responseType: 'stream',
-      timeout: requestTimeoutMs,
-      signal: request.signal,
-      validateStatus: () => true,
-    }))
+      if (request.thinking_budget) {
+        featureConfig.thinking_budget = request.thinking_budget
+      }
 
-    if (QWEN_AI_DEBUG_REQUEST_LOGS) {
-      console.log('[QwenAI] Response status:', response.status)
-      console.log('[QwenAI] Response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers), null, 2))
-    }
+      const payload = {
+        stream: true,
+        version: '2.1',
+        incremental_output: true,
+        chat_id: chatId,
+        chat_mode: 'normal',
+        model: modelId,
+        parent_id: null,
+        messages: [
+          {
+            fid,
+            parentId: null,
+            childrenIds: [childId],
+            role: 'user',
+            content: preparedUserMessage.content,
+            user_action: 'chat',
+            files: qwenFiles,
+            timestamp: ts,
+            models: [modelId],
+            chat_type: chatType,
+            feature_config: featureConfig,
+            extra: {
+              meta: {
+                subChatType: chatType,
+                ...(imageGeneration
+                  ? { size: imageGeneration.size, model: imageGeneration.model }
+                  : {}),
+              },
+            },
+            sub_chat_type: chatType,
+            parent_id: null,
+          },
+        ],
+        timestamp: ts + 1,
+        ...(imageGeneration ? { size: imageGeneration.size } : {}),
+      }
 
-    await this.assertChatCompletionStreamResponse(response, {
-      signal: request.signal,
-      previewTimeoutMs: requestTimeoutMs,
-    })
+      const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${chatId}`
+
+      if (QWEN_AI_DEBUG_REQUEST_LOGS || QWEN_AI_DEBUG_PAYLOAD_LOGS) {
+        console.log('[QwenAI] Sending request to /api/v2/chat/completions...')
+        console.log('[QwenAI] Request URL:', url)
+        if (QWEN_AI_DEBUG_PAYLOAD_LOGS) {
+          console.log('[QwenAI] Request payload:', JSON.stringify(this.sanitizePayloadForLog(payload), null, 2))
+        } else {
+          console.log('[QwenAI] Request payload summary:', JSON.stringify(this.summarizePayloadForLog(payload), null, 2))
+        }
+        console.log('[QwenAI] Request headers:', JSON.stringify(this.sanitizeHeadersForLog(this.getHeaders(chatId)), null, 2))
+      }
+
+      const requestTimeoutMs = scope.remainingTimeoutMs(Math.min(
+        QWEN_AI_REQUEST_TIMEOUT_MS,
+        request.timeoutMs ?? QWEN_AI_REQUEST_TIMEOUT_MS,
+      ))
+      response = await scope.wait(
+        this.postWithRefreshRetry(url, payload, () => ({
+          headers: {
+            ...this.getHeaders(chatId),
+            'x-accel-buffering': 'no',
+          },
+          responseType: 'stream',
+          timeout: scope.remainingTimeoutMs(requestTimeoutMs),
+          signal: scope.signal,
+          validateStatus: () => true,
+        })),
+        disposeResponse,
+      )
+
+      if (QWEN_AI_DEBUG_REQUEST_LOGS) {
+        console.log('[QwenAI] Response status:', response.status)
+        console.log('[QwenAI] Response headers:', JSON.stringify(this.sanitizeHeadersForLog(response.headers), null, 2))
+      }
+
+      await scope.wait(this.assertChatCompletionStreamResponse(response, {
+        signal: scope.signal,
+        previewTimeoutMs: scope.remainingTimeoutMs(requestTimeoutMs),
+      }))
 
       return {
         response,
@@ -2941,8 +3365,12 @@ export class QwenAiAdapter {
         parentId: childId,
       }
     } catch (error) {
-      await this.deleteChat(chatId)
+      if (response) destroyReadableStream(response.data)
+      if (chatId) cleanupChat(chatId)
+      scope.throwIfStopped()
       throw error
+    } finally {
+      scope.dispose()
     }
   }
 
@@ -3259,6 +3687,11 @@ export class QwenAiStreamHandler {
   private streamCompleted = false
   private continuationResetter?: () => void
   private readonly toolCallIdPrefix: string
+  private answerToolResultGuard: ManagedToolResultGuard
+  private reasoningToolResultGuard: ManagedToolResultGuard
+  private summaryToolResultGuard: ManagedToolResultGuard
+  private wrapperLeakDetected = false
+  private wrapperLeakLogged = false
 
   constructor(model: string, onEnd?: (chatId: string) => void, toolCallingPlan?: ToolCallingPlan) {
     this.model = model
@@ -3266,13 +3699,125 @@ export class QwenAiStreamHandler {
     this.onEnd = onEnd
     this.toolCallingPlan = toolCallingPlan
     this.toolCallIdPrefix = `call_${uuid().replace(/-/g, '')}`
+    this.answerToolResultGuard = this.createAnswerToolResultGuard()
+    this.reasoningToolResultGuard = new ManagedToolResultGuard(null)
+    this.summaryToolResultGuard = new ManagedToolResultGuard(null)
     this.resetToolStreamParser()
   }
 
   private resetToolStreamParser(): void {
     this.toolStreamParser = this.toolCallingPlan?.shouldParseResponse
-      ? new ToolStreamParser(this.toolCallingPlan, this.toolCallIdPrefix)
+      ? new ToolStreamParser(
+          this.toolCallingPlan,
+          this.toolCallIdPrefix,
+          { inputAlreadyGuarded: true },
+        )
       : undefined
+  }
+
+  private createAnswerToolResultGuard(): ManagedToolResultGuard {
+    return new ManagedToolResultGuard(
+      this.toolCallingPlan?.shouldParseResponse
+        ? this.toolCallingPlan.protocol
+        : null,
+    )
+  }
+
+  private resetToolResultGuards(): void {
+    this.answerToolResultGuard = this.createAnswerToolResultGuard()
+    this.reasoningToolResultGuard = new ManagedToolResultGuard(null)
+    this.summaryToolResultGuard = new ManagedToolResultGuard(null)
+    this.wrapperLeakDetected = false
+    this.wrapperLeakLogged = false
+  }
+
+  private guardAssistantOutput(
+    content: string,
+    channel: 'answer' | 'reasoning' | 'summary',
+  ): ManagedToolResultGuardOutput {
+    const guard = this.toolResultGuardForChannel(channel)
+    const output = guard.push(content)
+    if (guard.hasDetectedWrapperLeak()) this.markWrapperLeakDetected(channel)
+    return output
+  }
+
+  private flushAssistantOutputGuard(
+    channel: 'answer' | 'reasoning' | 'summary',
+  ): ManagedToolResultGuardOutput {
+    const guard = this.toolResultGuardForChannel(channel)
+    const output = guard.flush()
+    if (guard.hasDetectedWrapperLeak()) this.markWrapperLeakDetected(channel)
+    return output
+  }
+
+  private guardCumulativeSummarySnapshot(
+    snapshot: string,
+    previousSnapshot: string,
+  ): { sourceText: string, content: string, replacement?: string } {
+    if (snapshot.startsWith(previousSnapshot)) {
+      return {
+        sourceText: snapshot,
+        content: this.guardAssistantOutput(
+          snapshot.slice(previousSnapshot.length),
+          'summary',
+        ).content,
+      }
+    }
+
+    // A cumulative snapshot may be rewritten rather than appended. Inspect
+    // the complete replacement before changing the incremental baseline so a
+    // rewritten prefix cannot hide the beginning of a reserved wrapper.
+    const inspected = stripManagedToolResultWrappers(snapshot, null)
+    if (inspected.wrapperLeakDetected) {
+      this.markWrapperLeakDetected('summary')
+      return { sourceText: snapshot, content: '' }
+    }
+
+    this.summaryToolResultGuard = new ManagedToolResultGuard(null)
+    return {
+      sourceText: snapshot,
+      content: '',
+      replacement: inspected.content,
+    }
+  }
+
+  private toolResultGuardForChannel(
+    channel: 'answer' | 'reasoning' | 'summary',
+  ): ManagedToolResultGuard {
+    if (channel === 'reasoning') return this.reasoningToolResultGuard
+    if (channel === 'summary') return this.summaryToolResultGuard
+    return this.answerToolResultGuard
+  }
+
+  private currentBranchHasWrapperLeak(): boolean {
+    return this.wrapperLeakDetected
+      || this.answerToolResultGuard.hasDetectedWrapperLeak()
+      || this.reasoningToolResultGuard.hasDetectedWrapperLeak()
+      || this.summaryToolResultGuard.hasDetectedWrapperLeak()
+  }
+
+  private markWrapperLeakDetected(channel: 'answer' | 'reasoning' | 'summary'): void {
+    this.wrapperLeakDetected = true
+    if (this.toolCallingPlan) {
+      this.toolCallingPlan = {
+        ...this.toolCallingPlan,
+        diagnostics: {
+          ...this.toolCallingPlan.diagnostics,
+          wrapperLeakDetected: true,
+        },
+      }
+    }
+    if (this.wrapperLeakLogged) return
+    this.wrapperLeakLogged = true
+    console.warn('[ToolCalling] Blocked leaked managed tool-result wrapper', JSON.stringify({
+      wrapperLeakDetected: true,
+      providerId: this.toolCallingPlan?.diagnostics.providerId || 'qwen-ai',
+      model: this.toolCallingPlan?.diagnostics.actualModel
+        || this.toolCallingPlan?.diagnostics.model
+        || this.model,
+      protocol: this.toolCallingPlan?.protocol,
+      channel,
+    }))
   }
 
   private resetManagedResponseArtifacts(): void {
@@ -3284,6 +3829,7 @@ export class QwenAiStreamHandler {
     this.nativeToolCallStates = new Map<string, NativeToolCallState>()
     this.nativeToolCallIndex = 0
     this.warnedUndeclaredNativeToolNames = new Set<string>()
+    this.resetToolResultGuards()
     this.resetToolStreamParser()
   }
 
@@ -3704,11 +4250,14 @@ export class QwenAiStreamHandler {
     let reasoningText = ''
     let hasSentReasoning = false
     let summaryText = ''
+    let summarySourceText = ''
     let initialChunkSent = false
     let finalChunkSent = false
     let sawUpstreamCompletion = false
+    let requestDeadlineTimer: NodeJS.Timeout | undefined
     let responseTimer: NodeJS.Timeout | undefined
     let idleTimer: NodeJS.Timeout | undefined
+    let abortListenerAttached = false
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
     let upstreamEventCount = 0
@@ -3731,6 +4280,12 @@ export class QwenAiStreamHandler {
     let lastDownstreamFrameAt = 0
     let parser: ReturnType<typeof createParser>
     const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
+    const requestDeadlineAt = typeof options.requestDeadlineAt === 'number'
+      && Number.isFinite(options.requestDeadlineAt)
+      ? options.requestDeadlineAt
+      : undefined
+    const requestDeadlineExpired = () => requestDeadlineAt !== undefined
+      && Date.now() >= requestDeadlineAt
 
     const writeDownstreamFrame = (frame: string): boolean => {
       downstreamFrameCount += 1
@@ -3760,6 +4315,7 @@ export class QwenAiStreamHandler {
       // is not emitted after visible prefix bytes have reached the client.
       reasoningText = ''
       summaryText = ''
+      summarySourceText = ''
       sawUpstreamCompletion = false
       idleRecoveryInFlight = false
       semanticRecoveryInFlight = false
@@ -3772,6 +4328,10 @@ export class QwenAiStreamHandler {
     }
 
     const cleanupTimers = () => {
+      if (requestDeadlineTimer) {
+        clearTimeout(requestDeadlineTimer)
+        requestDeadlineTimer = undefined
+      }
       if (responseTimer) {
         clearTimeout(responseTimer)
         responseTimer = undefined
@@ -3779,6 +4339,14 @@ export class QwenAiStreamHandler {
       if (idleTimer) {
         clearTimeout(idleTimer)
         idleTimer = undefined
+      }
+    }
+
+    const cleanup = () => {
+      cleanupTimers()
+      if (abortListenerAttached) {
+        options.signal?.removeEventListener('abort', onAbort)
+        abortListenerAttached = false
       }
     }
 
@@ -3791,7 +4359,7 @@ export class QwenAiStreamHandler {
         console.error('[QwenAI] Stream failed:', description)
       }
       finalChunkSent = true
-      cleanupTimers()
+      cleanup()
       transStream.qwenAiFailure = error
       transStream.emit(QWEN_AI_STREAM_FAILURE_EVENT, error)
       options.onFailure?.(error)
@@ -3866,6 +4434,12 @@ export class QwenAiStreamHandler {
       destroyReadableStream(stream, upstreamError)
     }
 
+    const failIfRequestDeadlineExpired = (): boolean => {
+      if (!requestDeadlineExpired()) return false
+      failStream(createQwenAiRequestTimeoutError())
+      return true
+    }
+
     const handleIdle = async () => {
       if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight) return
       idleTimer = undefined
@@ -3910,6 +4484,7 @@ export class QwenAiStreamHandler {
       progressVisible = answerVisible,
     ): boolean => {
       if (finalChunkSent) return false
+      if (failIfRequestDeadlineExpired()) return false
       if (
         bufferManagedBranch
         && progressVisible
@@ -3922,6 +4497,7 @@ export class QwenAiStreamHandler {
           lastPublishedProgressAt = Date.now()
           downstreamFrameCount += 1
           lastDownstreamFrameAt = lastPublishedProgressAt
+          visibleFrameCommitted = true
           if (publishedProgressFrameCount === 1) {
             console.info('[QwenAI] Publishing live reasoning while managed answer validation remains deferred')
           }
@@ -3957,6 +4533,11 @@ export class QwenAiStreamHandler {
     const recoverFromSemanticEmpty = (error: QwenAiUpstreamError): void => {
       if (finalChunkSent || semanticRecoveryInFlight) return
 
+      if (error.code === 'qwen_ai_wrapper_leak' && visibleFrameCommitted) {
+        failStream(error)
+        return
+      }
+
       // A fresh provider branch may replace an invalid branch only while the
       // response is still private to this handler. Once a live frame reaches
       // the client, replay would splice two different generations into one
@@ -3979,9 +4560,14 @@ export class QwenAiStreamHandler {
       semanticRecoveryInFlight = true
       if (buffersManagedCandidate) {
         discardManagedBranchFrames()
+      }
+      if (buffersManagedCandidate || error.code === 'qwen_ai_wrapper_leak') {
         this.resetManagedResponseArtifacts()
         reasoningText = ''
         summaryText = ''
+        summarySourceText = ''
+      } else {
+        this.resetToolResultGuards()
       }
       if (bufferManagedBranch) {
         initialChunkSent = false
@@ -4014,15 +4600,42 @@ export class QwenAiStreamHandler {
       })
     }
 
-    const onAbort = () => {
+    function onAbort() {
       failStream(new Error('Qwen AI response stream aborted because the client disconnected.'))
     }
+
+    const onUpstreamError = (err: Error) => {
+      if (finalChunkSent || semanticRecoveryInFlight) {
+        return
+      }
+      const description = describeErrorForLog(err)
+      if (isClientCancellationError(err)) {
+        console.log('[QwenAI] Stream cancelled:', description)
+      } else {
+        console.error('[QwenAI] Stream error:', description)
+      }
+      failStream(err)
+    }
+
+    // Install the source error handler before an already-aborted signal or
+    // expired deadline can destroy the stream with an error.
+    stream.once('error', onUpstreamError)
 
     if (options.signal?.aborted) {
       failStream(new Error('Qwen AI response stream aborted before reading started.'))
       return transStream
     }
 
+    if (requestDeadlineAt !== undefined) {
+      const remainingMs = requestDeadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        failStream(createQwenAiRequestTimeoutError())
+        return transStream
+      }
+      requestDeadlineTimer = setTimeout(() => {
+        failStream(createQwenAiRequestTimeoutError())
+      }, remainingMs)
+    }
     if (responseTimeoutMs > 0) {
       responseTimer = setTimeout(() => {
         failStream(new Error(`Qwen AI response stream timed out after ${Math.ceil(responseTimeoutMs / 1000)}s.`))
@@ -4030,21 +4643,22 @@ export class QwenAiStreamHandler {
     }
     refreshIdleTimer()
 
-    options.signal?.addEventListener('abort', onAbort, { once: true })
-
-    const cleanup = () => {
-      cleanupTimers()
-      options.signal?.removeEventListener('abort', onAbort)
+    if (options.signal) {
+      options.signal.addEventListener('abort', onAbort, { once: true })
+      abortListenerAttached = true
     }
 
-    const completeStream = () => {
+    const completeStream = (commitTerminalOutput: () => boolean): boolean => {
+      if (failIfRequestDeadlineExpired()) return false
+      if (!commitTerminalOutput()) return false
       this.streamCompleted = true
       finalChunkSent = true
       cleanup()
       destroyReadableStream(stream)
+      return true
     }
 
-    const writeContent = (content: string) => {
+    const writeGuardedContent = (content: string, finishOnToolCall = true) => {
       if (!content || finalChunkSent) return
 
       this.content += content
@@ -4080,9 +4694,87 @@ export class QwenAiStreamHandler {
       // a complete tool call. Some upstream responses never send a follow-up
       // `finished`/`[DONE]` event, so waiting for it leaves the downstream
       // client hanging after it already received an actionable tool call.
-      if (emittedManagedToolCall && !finalChunkSent) {
+      if (finishOnToolCall && emittedManagedToolCall && !finalChunkSent) {
         finishAnswer('tool_calls')
       }
+    }
+
+    const writeGuardedReasoning = (content: string) => {
+      if (!content || finalChunkSent) return
+      reasoningText += content
+      if (options.reasoningOnlyAsContent) return
+
+      if (!hasSentReasoning) {
+        writeVisibleSse(
+          `data: ${JSON.stringify({
+            id: this.responseId || this.chatId,
+            model: this.model,
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
+            created: this.created,
+          })}\n\n`,
+          false,
+          true,
+        )
+        hasSentReasoning = true
+        console.log('[QwenAI] Sent reasoning role chunk')
+      }
+      writeVisibleSse(
+        `data: ${JSON.stringify({
+          id: this.responseId || this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
+          created: this.created,
+        })}\n\n`,
+        false,
+        true,
+      )
+    }
+
+    const writeGuardedSummary = (content: string) => {
+      if (!content || finalChunkSent) return
+      summaryText += content
+      if (options.reasoningOnlyAsContent) return
+
+      if (!hasSentReasoning) {
+        writeVisibleSse(
+          `data: ${JSON.stringify({
+            id: this.responseId || this.chatId,
+            model: this.model,
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
+            created: this.created,
+          })}\n\n`,
+          false,
+        )
+        hasSentReasoning = true
+      }
+      writeVisibleSse(
+        `data: ${JSON.stringify({
+          id: this.responseId || this.chatId,
+          model: this.model,
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
+          created: this.created,
+        })}\n\n`,
+        false,
+        true,
+      )
+    }
+
+    const flushAssistantOutputGuards = (): boolean => {
+      const answer = this.flushAssistantOutputGuard('answer')
+      const reasoning = this.flushAssistantOutputGuard('reasoning')
+      const summary = this.flushAssistantOutputGuard('summary')
+      if (this.currentBranchHasWrapperLeak()) {
+        recoverFromSemanticEmpty(createQwenAiWrapperLeakError())
+        return false
+      }
+      writeGuardedContent(answer.content, false)
+      writeGuardedReasoning(reasoning.content)
+      writeGuardedSummary(summary.content)
+      return !finalChunkSent && !semanticRecoveryInFlight
     }
 
     const writeGeneratedImages = (
@@ -4113,6 +4805,9 @@ export class QwenAiStreamHandler {
 
     const finishAnswer = (finishReason: string = 'stop') => {
       if (finalChunkSent || semanticRecoveryInFlight) return
+      if (failIfRequestDeadlineExpired()) return
+
+      if (!flushAssistantOutputGuards()) return
 
       const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
       if (completeUndeclaredNativeToolNames.length > 0) {
@@ -4134,9 +4829,10 @@ export class QwenAiStreamHandler {
 
       const completeNativeToolCalls = this.getCompleteNativeToolCalls()
       if (completeNativeToolCalls.length > 0) {
-        flushManagedBranchFrames()
-        if (this.emitNativeToolCalls(transStream, completeNativeToolCalls, !initialChunkSent)) {
-          completeStream()
+        if (completeStream(() => {
+          flushManagedBranchFrames()
+          return this.emitNativeToolCalls(transStream, completeNativeToolCalls, !initialChunkSent)
+        })) {
           return
         }
       }
@@ -4160,9 +4856,10 @@ export class QwenAiStreamHandler {
 
       if (hasToolUse(this.content)) {
         console.log('[QwenAI] Found legacy tool_use in stream, sending tool_calls')
-        flushManagedBranchFrames()
-        if (this.sendToolCalls(transStream)) {
-          completeStream()
+        if (completeStream(() => {
+          flushManagedBranchFrames()
+          return this.sendToolCalls(transStream)
+        })) {
           return
         }
       }
@@ -4206,7 +4903,7 @@ export class QwenAiStreamHandler {
       ) {
         const fallbackContent = summaryText.trim() || reasoningText.trim()
         if (!initialChunkSent) sendInitialChunk()
-        writeContent(fallbackContent)
+        writeGuardedContent(fallbackContent)
         hasAnswerOrTool = Boolean(this.content.trim())
         console.info('[QwenAI] Accepted reasoning-only output for context compaction', JSON.stringify({
           chars: fallbackContent.length,
@@ -4241,10 +4938,12 @@ export class QwenAiStreamHandler {
         choices: [{ index: 0, delta: {}, finish_reason: resolvedFinishReason }],
         created: this.created,
       }
-      flushManagedBranchFrames()
-      writeDownstreamFrame(`data: ${JSON.stringify(finalChunk)}\n\n`)
-      transStream.end('data: [DONE]\n\n')
-      completeStream()
+      if (!completeStream(() => {
+        flushManagedBranchFrames()
+        writeDownstreamFrame(`data: ${JSON.stringify(finalChunk)}\n\n`)
+        transStream.end('data: [DONE]\n\n')
+        return true
+      })) return
 
       if (this.onEnd && this.chatId) {
         this.onEnd(this.chatId)
@@ -4275,6 +4974,7 @@ export class QwenAiStreamHandler {
           if (finalChunkSent || semanticRecoveryInFlight) {
             return
           }
+          if (failIfRequestDeadlineExpired()) return
 
           if (typeof event.data !== 'string' || event.data.trim() === '') {
             return
@@ -4337,7 +5037,7 @@ export class QwenAiStreamHandler {
             // the terminal summary is available. Growing upstream reasoning
             // still proves generation progress and must refresh the semantic
             // idle watchdog even though no model bytes are exposed yet.
-            if (isMeaningfulQwenAiEvent(event, summaryText.length)) {
+            if (isMeaningfulQwenAiEvent(event, summarySourceText.length)) {
               refreshIdleTimer()
             }
 
@@ -4345,13 +5045,34 @@ export class QwenAiStreamHandler {
             const delta = choice.delta || {}
             const phase = delta.phase
             const status = delta.status
-            const content = delta.content || ''
+            let content = delta.content || ''
+            let summaryDiff = ''
             const generatedImageBatch = isQwenAiImageGenerationPhase(phase)
               ? this.ingestGeneratedImages(delta.extra)
               : { images: [], startingIndex: this.generatedImages.length }
 
             if (QWEN_AI_DEBUG_STREAM_LOGS) {
               console.log('[QwenAI] Phase:', phase, 'Status:', status, 'Content:', content.substring(0, 50))
+            }
+
+            if (phase === 'think' && status !== 'finished' && content) {
+              content = this.guardAssistantOutput(content, 'reasoning').content
+            } else if (phase === 'thinking_summary') {
+              const parts = delta.extra?.summary_thought?.content
+              const newSummary = Array.isArray(parts) ? parts.join('\n') : ''
+              if (newSummary) {
+                const update = this.guardCumulativeSummarySnapshot(newSummary, summarySourceText)
+                summarySourceText = update.sourceText
+                summaryDiff = update.content
+                if (update.replacement !== undefined) summaryText = update.replacement
+              }
+            } else if ((phase === 'answer' || phase === null) && content) {
+              content = this.guardAssistantOutput(content, 'answer').content
+            }
+
+            if (this.currentBranchHasWrapperLeak()) {
+              recoverFromSemanticEmpty(createQwenAiWrapperLeakError())
+              return
             }
 
             const nativeToolProgress = this.ingestNativeToolCallFragments(delta)
@@ -4378,9 +5099,8 @@ export class QwenAiStreamHandler {
                 && incompleteDeclaredNativeToolNames.length === 0
                 && completeNativeToolCalls.length > 0
               ) {
-                flushManagedBranchFrames()
-                if (this.emitNativeToolCalls(transStream, completeNativeToolCalls, !initialChunkSent)) {
-                  completeStream()
+                finishAnswer('tool_calls')
+                if (finalChunkSent || semanticRecoveryInFlight) {
                   return
                 }
               }
@@ -4394,35 +5114,7 @@ export class QwenAiStreamHandler {
               if (status !== 'finished' && content) {
                 // Summary turns buffer thinking text and emit it as content at
                 // the terminal marker; regular requests keep live reasoning.
-                reasoningText += content
-                if (!options.reasoningOnlyAsContent && !hasSentReasoning) {
-                  writeVisibleSse(
-                    `data: ${JSON.stringify({
-                      id: this.responseId || this.chatId,
-                      model: this.model,
-                      object: 'chat.completion.chunk',
-                      choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
-                      created: this.created,
-                    })}\n\n`,
-                    false,
-                    true,
-                  )
-                  hasSentReasoning = true
-                  console.log('[QwenAI] Sent reasoning role chunk')
-                }
-                if (!options.reasoningOnlyAsContent) {
-                  writeVisibleSse(
-                    `data: ${JSON.stringify({
-                      id: this.responseId || this.chatId,
-                      model: this.model,
-                      object: 'chat.completion.chunk',
-                      choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
-                      created: this.created,
-                    })}\n\n`,
-                    false,
-                    true,
-                  )
-                }
+                writeGuardedReasoning(content)
               }
               // When status === 'finished', the think phase is done
             } else if (phase === 'thinking_summary') {
@@ -4430,52 +5122,21 @@ export class QwenAiStreamHandler {
               if (QWEN_AI_DEBUG_STREAM_LOGS) {
                 console.log('[QwenAI] thinking_summary extra:', JSON.stringify(extra).substring(0, 300))
               }
-              if (extra.summary_thought?.content) {
-                const newSummary = extra.summary_thought.content.join('\n')
-                if (newSummary && newSummary.length > summaryText.length) {
-                  // Send only the incremental diff as reasoning_content
-                  const diff = newSummary.substring(summaryText.length)
-                  if (diff && !options.reasoningOnlyAsContent) {
-                    if (!hasSentReasoning) {
-                      writeVisibleSse(
-                        `data: ${JSON.stringify({
-                          id: this.responseId || this.chatId,
-                          model: this.model,
-                          object: 'chat.completion.chunk',
-                          choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: '' }, finish_reason: null }],
-                          created: this.created,
-                        })}\n\n`,
-                        false,
-                      )
-                      hasSentReasoning = true
-                    }
-                    writeVisibleSse(
-                      `data: ${JSON.stringify({
-                        id: this.responseId || this.chatId,
-                        model: this.model,
-                        object: 'chat.completion.chunk',
-                        choices: [{ index: 0, delta: { reasoning_content: diff }, finish_reason: null }],
-                        created: this.created,
-                      })}\n\n`,
-                      false,
-                      true,
-                    )
-                  }
-                  summaryText = newSummary
-                  console.log('[QwenAI] Updated summaryText, length:', summaryText.length)
-                }
+              if (summaryDiff) {
+                writeGuardedSummary(summaryDiff)
+                console.log('[QwenAI] Updated summaryText, length:', summaryText.length)
               }
             } else if (phase === 'answer') {
               if (content && !initialChunkSent) sendInitialChunk()
               if (QWEN_AI_DEBUG_STREAM_LOGS) {
                 console.log('[QwenAI] Entering answer branch, content:', content)
               }
-              writeContent(content)
+              writeGuardedContent(content)
             } else if (phase === null && content) {
               if (!initialChunkSent) {
                 sendInitialChunk()
               }
-              writeContent(content)
+              writeGuardedContent(content)
             }
 
             writeGeneratedImages(
@@ -4504,23 +5165,12 @@ export class QwenAiStreamHandler {
     })
 
     stream.on('data', (buffer: Buffer) => {
+      if (finalChunkSent || failIfRequestDeadlineExpired()) return
       const text = buffer.toString()
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
         console.log('[QwenAI] Raw stream data:', text.substring(0, 500))
       }
       parser.feed(text)
-    })
-    stream.once('error', (err: Error) => {
-      if (finalChunkSent || semanticRecoveryInFlight) {
-        return
-      }
-      const description = describeErrorForLog(err)
-      if (isClientCancellationError(err)) {
-        console.log('[QwenAI] Stream cancelled:', description)
-      } else {
-        console.error('[QwenAI] Stream error:', description)
-      }
-      failStream(err)
     })
     stream.once('end', () => {
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
@@ -4578,21 +5228,31 @@ export class QwenAiStreamHandler {
 
       let reasoningText = ''
       let summaryText = ''
+      let summarySourceText = ''
       let resolved = false
       let sawAnswerFinish = false
       let sawUpstreamCompletion = false
+      let requestDeadlineTimer: NodeJS.Timeout | undefined
       let responseTimer: NodeJS.Timeout | undefined
       let idleTimer: NodeJS.Timeout | undefined
+      let abortListenerAttached = false
       let idleRecoveryInFlight = false
       let semanticRecoveryInFlight = false
       let parser: ReturnType<typeof createParser>
       const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
+      const requestDeadlineAt = typeof options.requestDeadlineAt === 'number'
+        && Number.isFinite(options.requestDeadlineAt)
+        ? options.requestDeadlineAt
+        : undefined
+      const requestDeadlineExpired = () => requestDeadlineAt !== undefined
+        && Date.now() >= requestDeadlineAt
 
       this.continuationResetter = () => {
         // Keep the same downstream promise alive, but start parsing the fresh
         // provider response as a new assistant branch.
         reasoningText = ''
         summaryText = ''
+        summarySourceText = ''
         data.id = ''
         data.choices[0].message = {
           role: 'assistant',
@@ -4608,6 +5268,10 @@ export class QwenAiStreamHandler {
       }
 
       const cleanupTimers = () => {
+        if (requestDeadlineTimer) {
+          clearTimeout(requestDeadlineTimer)
+          requestDeadlineTimer = undefined
+        }
         if (responseTimer) {
           clearTimeout(responseTimer)
           responseTimer = undefined
@@ -4620,22 +5284,60 @@ export class QwenAiStreamHandler {
 
       const cleanup = () => {
         cleanupTimers()
-        options.signal?.removeEventListener('abort', onAbort)
-      }
-
-      const resolveOnce = (value: any) => {
-        if (!resolved) {
-          resolved = true
-          this.streamCompleted = true
-          cleanup()
-          destroyReadableStream(stream)
-          resolve(value)
+        if (abortListenerAttached) {
+          options.signal?.removeEventListener('abort', onAbort)
+          abortListenerAttached = false
         }
       }
 
+      function rejectOnce(reason: any) {
+        if (resolved) return
+        resolved = true
+        cleanup()
+        const error = enforceQwenAiFailoverBoundary(
+          normalizeQwenAiStreamFailure(reason),
+          () => true,
+        )
+        destroyReadableStream(stream, error)
+        reject(error)
+      }
+
+      const resolveOnce = (value: any): boolean => {
+        if (resolved) return false
+        if (requestDeadlineExpired()) {
+          rejectOnce(createQwenAiRequestTimeoutError())
+          return false
+        }
+        resolved = true
+        this.streamCompleted = true
+        cleanup()
+        destroyReadableStream(stream)
+        resolve(value)
+        return true
+      }
+
+      const flushNonStreamOutputGuards = (): boolean => {
+        const answer = this.flushAssistantOutputGuard('answer')
+        const reasoning = this.flushAssistantOutputGuard('reasoning')
+        const summary = this.flushAssistantOutputGuard('summary')
+        if (this.currentBranchHasWrapperLeak()) {
+          recoverFromSemanticEmpty(createQwenAiWrapperLeakError())
+          return false
+        }
+        data.choices[0].message.content += answer.content
+        reasoningText += reasoning.content
+        summaryText += summary.content
+        return !resolved && !semanticRecoveryInFlight
+      }
+
       const finishNativeToolCalls = (): boolean => {
+        if (requestDeadlineExpired()) {
+          rejectOnce(createQwenAiRequestTimeoutError())
+          return true
+        }
         const toolCalls = this.getCompleteNativeToolCalls()
         if (toolCalls.length === 0) return false
+        if (!flushNonStreamOutputGuards()) return true
 
         const choice = data.choices[0]
         const response = {
@@ -4652,28 +5354,19 @@ export class QwenAiStreamHandler {
         }
         sawAnswerFinish = true
         sawUpstreamCompletion = true
-        if (this.onEnd && this.chatId) {
+        if (resolveOnce(response) && this.onEnd && this.chatId) {
           this.onEnd(this.chatId)
         }
-        resolveOnce(response)
         return true
-      }
-
-      const rejectOnce = (reason: any) => {
-        if (!resolved) {
-          resolved = true
-          cleanup()
-          const error = enforceQwenAiFailoverBoundary(
-            normalizeQwenAiStreamFailure(reason),
-            () => true,
-          )
-          destroyReadableStream(stream, error)
-          reject(error)
-        }
       }
 
       const finishNonStream = () => {
         if (resolved || semanticRecoveryInFlight) return
+        if (requestDeadlineExpired()) {
+          rejectOnce(createQwenAiRequestTimeoutError())
+          return
+        }
+        if (!flushNonStreamOutputGuards()) return
 
         const choice = data.choices[0]
         const answerText = choice.message.content || ''
@@ -4744,10 +5437,9 @@ export class QwenAiStreamHandler {
         if (!sawAnswerFinish) {
           console.log('[QwenAI] Non-stream completed with an upstream DONE signal.')
         }
-        if (this.onEnd && this.chatId) {
+        if (resolveOnce(response) && this.onEnd && this.chatId) {
           this.onEnd(this.chatId)
         }
-        resolveOnce(response)
       }
 
       const handleIdle = async () => {
@@ -4796,10 +5488,14 @@ export class QwenAiStreamHandler {
         }
 
         semanticRecoveryInFlight = true
-        if (this.toolCallingPlan?.shouldParseResponse) {
+        if (
+          this.toolCallingPlan?.shouldParseResponse
+          || error.code === 'qwen_ai_wrapper_leak'
+        ) {
           this.resetManagedResponseArtifacts()
           reasoningText = ''
           summaryText = ''
+          summarySourceText = ''
           data.choices[0].message = {
             role: 'assistant',
             content: '',
@@ -4807,6 +5503,8 @@ export class QwenAiStreamHandler {
           }
           data.choices[0].finish_reason = 'stop'
           sawAnswerFinish = false
+        } else {
+          this.resetToolResultGuards()
         }
         sawUpstreamCompletion = false
         console.warn('[QwenAI] Recovering semantically incomplete non-stream response:', error.code)
@@ -4836,11 +5534,38 @@ export class QwenAiStreamHandler {
         rejectOnce(new Error('Qwen AI response stream aborted because the client disconnected.'))
       }
 
+      const onUpstreamError = (err: Error) => {
+        if (resolved || semanticRecoveryInFlight) {
+          return
+        }
+        const description = describeErrorForLog(err)
+        if (isClientCancellationError(err)) {
+          console.log('[QwenAI] Non-stream cancelled:', description)
+        } else {
+          console.error('[QwenAI] Non-stream error:', description)
+        }
+        rejectOnce(err)
+      }
+
+      // rejectOnce destroys the source with its normalized error, including
+      // when the request has already expired before parsing begins.
+      stream.once('error', onUpstreamError)
+
       if (options.signal?.aborted) {
         rejectOnce(new Error('Qwen AI response stream aborted before reading started.'))
         return
       }
 
+      if (requestDeadlineAt !== undefined) {
+        const remainingMs = requestDeadlineAt - Date.now()
+        if (remainingMs <= 0) {
+          rejectOnce(createQwenAiRequestTimeoutError())
+          return
+        }
+        requestDeadlineTimer = setTimeout(() => {
+          rejectOnce(createQwenAiRequestTimeoutError())
+        }, remainingMs)
+      }
       if (responseTimeoutMs > 0) {
         responseTimer = setTimeout(() => {
           rejectOnce(new Error(`Qwen AI response stream timed out after ${Math.ceil(responseTimeoutMs / 1000)}s.`))
@@ -4848,12 +5573,19 @@ export class QwenAiStreamHandler {
       }
       refreshIdleTimer()
 
-      options.signal?.addEventListener('abort', onAbort, { once: true })
+      if (options.signal) {
+        options.signal.addEventListener('abort', onAbort, { once: true })
+        abortListenerAttached = true
+      }
 
       parser = createParser({
         onEvent: (event: any) => {
           try {
             if (resolved || semanticRecoveryInFlight) {
+              return
+            }
+            if (requestDeadlineExpired()) {
+              rejectOnce(createQwenAiRequestTimeoutError())
               return
             }
 
@@ -4908,11 +5640,33 @@ export class QwenAiStreamHandler {
               const delta = parsed.choices[0].delta || {}
               const phase = delta.phase
               const status = delta.status
-              const content = delta.content || ''
+              let content = delta.content || ''
+              let summaryDiff = ''
+              const previousSummarySourceLength = summarySourceText.length
               const generatedImageBatch = isQwenAiImageGenerationPhase(phase)
                 ? this.ingestGeneratedImages(delta.extra)
                 : { images: [], startingIndex: this.generatedImages.length }
               let shouldFinishAnswer = false
+
+              if (phase === 'think' && status !== 'finished' && content) {
+                content = this.guardAssistantOutput(content, 'reasoning').content
+              } else if (phase === 'thinking_summary') {
+                const parts = delta.extra?.summary_thought?.content
+                const newSummary = Array.isArray(parts) ? parts.join('\n') : ''
+                if (newSummary) {
+                  const update = this.guardCumulativeSummarySnapshot(newSummary, summarySourceText)
+                  summarySourceText = update.sourceText
+                  summaryDiff = update.content
+                  if (update.replacement !== undefined) summaryText = update.replacement
+                }
+              } else if ((phase === 'answer' || phase === null) && content) {
+                content = this.guardAssistantOutput(content, 'answer').content
+              }
+
+              if (this.currentBranchHasWrapperLeak()) {
+                recoverFromSemanticEmpty(createQwenAiWrapperLeakError())
+                return
+              }
 
               this.ingestNativeToolCallFragments(delta)
               const completeUndeclaredNativeToolNames = this.getCompleteUndeclaredNativeToolNames()
@@ -4940,21 +5694,14 @@ export class QwenAiStreamHandler {
                 return
               }
 
-              if (isMeaningfulQwenAiEvent(event, summaryText.length)) {
+              if (isMeaningfulQwenAiEvent(event, previousSummarySourceLength)) {
                 refreshIdleTimer()
               }
 
               if (phase === 'think' && status !== 'finished') {
                 reasoningText += content
               } else if (phase === 'thinking_summary') {
-                // Handle thinking_summary phase - extract summary content
-                const extra = delta.extra || {}
-                if (extra.summary_thought?.content) {
-                  const newSummary = extra.summary_thought.content.join('\n')
-                  if (newSummary && newSummary.length > summaryText.length) {
-                    summaryText = newSummary
-                  }
-                }
+                summaryText += summaryDiff
               } else if (phase === 'answer') {
                 if (content) {
                   data.choices[0].message.content += content
@@ -5003,19 +5750,12 @@ export class QwenAiStreamHandler {
       })
 
       stream.on('data', (buffer: Buffer) => {
-        parser.feed(buffer.toString())
-      })
-      stream.once('error', (err: Error) => {
-        if (resolved || semanticRecoveryInFlight) {
+        if (resolved) return
+        if (requestDeadlineExpired()) {
+          rejectOnce(createQwenAiRequestTimeoutError())
           return
         }
-        const description = describeErrorForLog(err)
-        if (isClientCancellationError(err)) {
-          console.log('[QwenAI] Non-stream cancelled:', description)
-        } else {
-          console.error('[QwenAI] Non-stream error:', description)
-        }
-        rejectOnce(err)
+        parser.feed(buffer.toString())
       })
       const finishFromClose = () => {
         if (resolved || semanticRecoveryInFlight) return

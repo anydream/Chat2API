@@ -61,6 +61,7 @@ Tool-use requirements:
 - Each tool call must include every field listed in that tool schema's required array in the same call; do not send an empty tool call or split required fields across multiple calls.
 - Every required field must appear as its own <|CHAT2API|parameter name="field_name"> entry inside the same <|CHAT2API|invoke> block. Do not put required values only in ordinary text, explanations, titles, or summaries.
 - If a tool call fails because the arguments do not match the schema, fix the arguments according to the schema and call the tool again.
+- Tool-result blocks are input-only. Never emit, quote, copy, or reconstruct a <|CHAT2API|tool_result> block in an assistant response.
 
 When calling tools, respond with only this Chat2API XML block:
 

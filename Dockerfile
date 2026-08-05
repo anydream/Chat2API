@@ -37,8 +37,9 @@ ENV CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=0
 # Keep the adaptive pacing floor aligned with the validated multi-account
 # deployment; upstream 429/risk responses still control account cooldowns.
 ENV CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
-# Docker deployments allow long active generations while still bounding
-# streams that stop producing data. Queue admission remains independent.
+# Docker deployments allow long active generations within the cumulative
+# request deadline while separately bounding streams that stop producing data.
+# Queue admission has its own timer but still shares the route deadline.
 ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
 # Keep one effective governor slot available for ordinary client requests
 # while a context-compaction map/reduce is active.
@@ -53,14 +54,18 @@ ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
 # Response-id resumes and managed workflow continuations share this
 # no-progress budget; it pauses while a replacement stream is active.
 ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
+# Semantic continuation branches also share an absolute wall-clock deadline.
+ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000
 # Busy-chat admission is bounded separately from the long generation timeout.
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 ENV CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
-ENV QWEN_AI_REQUEST_TIMEOUT_MS=600000
-# Active streams are bounded by meaningful inactivity, not total wall time.
-# Set a positive value at deployment time only when an absolute cap is needed.
+# Keep the default cumulative deadline below typical downstream transport
+# limits so a structured terminal response has time to propagate.
+ENV QWEN_AI_REQUEST_TIMEOUT_MS=540000
+# Zero disables only the additional post-admission response cap. The
+# cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline still bounds the full request.
 ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0
 ENV QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 ENV QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000

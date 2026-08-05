@@ -743,6 +743,8 @@ export class MimoStreamHandler {
     }
 
     const flushChunks = this.toolStreamParser?.flush(this.createBaseChunk(id, created)) ?? []
+    const protocolError = this.toolStreamParser?.getProtocolError()
+    if (protocolError) throw protocolError
     for (const chunk of flushChunks) {
       yield `data: ${JSON.stringify(chunk)}\n\n`
     }

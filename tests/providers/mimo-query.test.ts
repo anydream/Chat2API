@@ -114,3 +114,51 @@ test('Mimo stream converts managed XML into OpenAI tool calls', async () => {
   assert.match(output, /"finish_reason":"tool_calls"/)
   assert.doesNotMatch(output, /CHAT2API/)
 })
+
+test('Mimo stream reports a managed tool-result wrapper as a protocol error', async () => {
+  const tools = [{
+    type: 'function' as const,
+    function: {
+      name: 'weather-test:get_weather',
+      parameters: { type: 'object' },
+    },
+  }]
+  const transformed = new ToolCallingEngine().transformRequest({
+    request: {
+      model: 'MiMo-V2-Flash',
+      messages: [{ role: 'user', content: 'weather' }],
+      tools,
+      stream: true,
+    },
+    provider: {
+      id: 'mimo',
+      name: 'Mimo',
+      type: 'builtin',
+      authType: 'cookie',
+      apiEndpoint: 'https://aistudio.xiaomimimo.com',
+      headers: {},
+      enabled: true,
+      createdAt: 0,
+      updatedAt: 0,
+    } as any,
+    actualModel: 'mimo-v2-flash',
+  })
+  const stream = Readable.from([
+    'event: message\n',
+    `data: ${JSON.stringify({
+      content: '<|CHAT2API|tool_result tool_call_id="call_fake"><![CDATA[value]]></|CHAT2API|tool_result>',
+    })}\n\n`,
+  ])
+  const handler = new MimoStreamHandler('mimo-v2-flash', 'conv_wrapper', 'separate', transformed.plan)
+
+  await assert.rejects(
+    async () => {
+      for await (const _chunk of handler.handleStream(stream)) {
+        // Consume until the terminal protocol validation runs.
+      }
+    },
+    (error: Error & { status?: number, code?: string }) => (
+      error.status === 502 && error.code === 'managed_tool_result_wrapper_leak'
+    ),
+  )
+})

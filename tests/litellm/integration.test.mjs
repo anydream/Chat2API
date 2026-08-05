@@ -41,6 +41,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
 
   assert.match(config, /router_settings:\s*\r?\n\s+num_retries:\s*0\b/)
   assert.match(config, /litellm_params:[\s\S]*?num_retries:\s*0\b/)
+  assert.match(config, /general_settings:[\s\S]*?pass_through_request_timeout:\s*os\.environ\/REQUEST_TIMEOUT/)
   assert.match(config, /cancel_on_disconnect:\s*true\b/)
   assert.match(config, /use_chat_completions_url_for_anthropic_messages:\s*os\.environ\/LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES/)
   assert.match(config, /model_name:\s*["']\*["']/)
@@ -67,6 +68,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS:-3\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-300000\}/)
   const transcriptEnvironmentNames = [
     'MAX_BYTES',
     'REQUEST_RESERVE_BYTES',
@@ -84,6 +86,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=300000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000/)
   assert.doesNotMatch(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=/)
@@ -104,6 +107,8 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /\["is_error"\] = tool_result_error_by_id/)
   assert.match(patcher, /ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH/)
   assert.match(patcher, /tool_result_item\["is_error"\] = is_error/)
+  assert.match(patcher, /ANTHROPIC_RESPONSES_ASSISTANT_ORDER_MARKER/)
+  assert.match(patcher, /Flush buffered assistant text before the top-level tool call/)
   assert.match(patcher, /TOKEN_COUNTER_MODULE_PATH/)
   assert.match(patcher, /PROXY_SERVER_MODULE_PATH/)
   assert.match(patcher, /ANTHROPIC_ENDPOINTS_MODULE_PATH/)
@@ -1458,7 +1463,7 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     })
   })
 
-  await t.test('maps Anthropic tool_result continuation messages to OpenAI tool messages', async () => {
+  await t.test('preserves assistant text, tool_use, and tool_result order through Responses', async () => {
     const toolUseId = 'call_offline_weather_previous'
     const ingressCallsBefore = chat2ApiIngress.calls.length
     const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
@@ -1469,12 +1474,15 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
           { role: 'user', content: 'Check the weather with the available tool.' },
           {
             role: 'assistant',
-            content: [{
-              type: 'tool_use',
-              id: toolUseId,
-              name: 'get_weather',
-              input: { city: 'Shanghai' },
-            }],
+            content: [
+              { type: 'text', text: 'I will check the weather now.' },
+              {
+                type: 'tool_use',
+                id: toolUseId,
+                name: 'get_weather',
+                input: { city: 'Shanghai' },
+              },
+            ],
           },
           {
             role: 'user',
@@ -1506,12 +1514,24 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       .filter((candidate) => candidate.url === '/v1/responses')
     assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
     const ingressInput = ingressCalls[0].body.input
-    const functionCall = ingressInput.find((item) => item.type === 'function_call')
+    const assistantTextIndex = ingressInput.findIndex((item) => (
+      item.type === 'message'
+      && item.role === 'assistant'
+      && item.content?.some((part) => (
+        part.type === 'output_text' && part.text === 'I will check the weather now.'
+      ))
+    ))
+    const functionCallIndex = ingressInput.findIndex((item) => item.type === 'function_call')
+    const functionOutputIndex = ingressInput.findIndex((item) => item.type === 'function_call_output')
+    assert.ok(assistantTextIndex >= 0, JSON.stringify(ingressInput))
+    assert.ok(assistantTextIndex < functionCallIndex, JSON.stringify(ingressInput))
+    assert.ok(functionCallIndex < functionOutputIndex, JSON.stringify(ingressInput))
+    const functionCall = ingressInput[functionCallIndex]
     assert.ok(functionCall, JSON.stringify(ingressInput))
     assert.equal(functionCall.call_id, toolUseId)
     assert.equal(functionCall.name, 'get_weather')
     assert.deepEqual(JSON.parse(functionCall.arguments || '{}'), { city: 'Shanghai' })
-    const functionOutput = ingressInput.find((item) => item.type === 'function_call_output')
+    const functionOutput = ingressInput[functionOutputIndex]
     assert.ok(functionOutput, JSON.stringify(ingressInput))
     assert.equal(functionOutput.call_id, toolUseId)
     assert.equal(functionOutput.output, 'Sunny, 25 C')

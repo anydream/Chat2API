@@ -28,6 +28,7 @@ type QueueItem = {
   reject: (reason: unknown) => void
   enqueuedAt: number
   queueDepthAtEnqueue: number
+  deadlineAt?: number
   timeout?: NodeJS.Timeout
   signal?: AbortSignal
   queueAbortListener?: () => void
@@ -43,6 +44,8 @@ type QueueItem = {
 
 export type QwenAiGovernorRunOptions = {
   signal?: AbortSignal
+  /** Absolute outer request deadline, including time spent in this queue. */
+  deadlineAt?: number
   /**
    * When false, return an internal admission-deferred result instead of
    * placing the request in the shared governor queue. Context compaction uses
@@ -302,6 +305,15 @@ export class QwenAiRequestGovernor {
         return
       }
 
+      const deadlineAt = typeof options.deadlineAt === 'number'
+        && Number.isFinite(options.deadlineAt)
+        ? options.deadlineAt
+        : undefined
+      if (deadlineAt !== undefined && now >= deadlineAt) {
+        resolve(this.createRequestDeadlineResult())
+        return
+      }
+
       const requestClass = options.requestClass || 'normal'
       const globalCooldownInMs = this.getGlobalCooldownInMs(now)
       const globalRecoveryProbe = globalCooldownInMs > 0
@@ -335,6 +347,7 @@ export class QwenAiRequestGovernor {
         reject,
         enqueuedAt: now,
         queueDepthAtEnqueue: this.queue.length + 1,
+        deadlineAt,
         signal: options.signal,
         recoveryBypassAccountInterval: options.recoveryBypassAccountInterval === true,
         recoveryBypassGlobalInterval: options.recoveryBypassGlobalInterval === true,
@@ -363,6 +376,10 @@ export class QwenAiRequestGovernor {
         resolve(result)
       }
 
+      const queueTimeoutAt = now + QWEN_AI_QUEUE_TIMEOUT_MS
+      const timeoutAt = deadlineAt === undefined
+        ? queueTimeoutAt
+        : Math.min(queueTimeoutAt, deadlineAt)
       item.timeout = setTimeout(() => {
         this.pump()
         const stillQueued = this.queue.some(candidate => candidate === item || candidate.id === item.id)
@@ -377,7 +394,7 @@ export class QwenAiRequestGovernor {
         cancelQueued(options.signal?.aborted
           ? this.createCancelledResult('Client disconnected while Qwen AI request was queued.')
           : this.createQueueTimeoutResult(item.requestClass))
-      }, QWEN_AI_QUEUE_TIMEOUT_MS)
+      }, Math.max(0, timeoutAt - now))
 
       item.queueAbortListener = () => {
         cancelQueued(this.createCancelledResult('Client disconnected while Qwen AI request was queued.'))
@@ -408,6 +425,17 @@ export class QwenAiRequestGovernor {
       status: 499,
       error: message,
       errorCode: 'qwen_ai_client_cancelled',
+      retryable: false,
+      accountFault: false,
+    }
+  }
+
+  private createRequestDeadlineResult(): ForwardResult {
+    return {
+      success: false,
+      status: 504,
+      error: 'Qwen AI request exceeded its cumulative request deadline.',
+      errorCode: 'qwen_ai_request_timeout',
       retryable: false,
       accountFault: false,
     }
@@ -511,6 +539,28 @@ export class QwenAiRequestGovernor {
     this.clearQueueItemWaiters(item)
   }
 
+  private expireQueuedRequestDeadlines(now: number): void {
+    const expired: QueueItem[] = []
+    this.queue = this.queue.filter((item) => {
+      if (item.deadlineAt === undefined || now < item.deadlineAt) return true
+      expired.push(item)
+      return false
+    })
+
+    for (const item of expired) {
+      item.cancelled = true
+      this.clearQueueItemWaiters(item)
+      this.completeGlobalRecoveryProbe(item, false)
+      this.logLifecycle(item, 'request_deadline', {
+        queueWaitMs: Math.max(0, now - item.enqueuedAt),
+        activeRequests: this.active,
+      })
+      item.resolve(item.signal?.aborted
+        ? this.createCancelledResult('Client disconnected while Qwen AI request was queued.')
+        : this.createRequestDeadlineResult())
+    }
+  }
+
   private pump(): void {
     if (this.timer) {
       clearTimeout(this.timer)
@@ -519,6 +569,7 @@ export class QwenAiRequestGovernor {
 
     const config = this.getEffectiveConfig()
     const nowForGlobal = Date.now()
+    this.expireQueuedRequestDeadlines(nowForGlobal)
     this.expireGlobalCooldown(nowForGlobal)
     const globalCooldownInMs = this.getGlobalCooldownInMs(nowForGlobal)
     if (globalCooldownInMs > 0) {
@@ -702,7 +753,7 @@ export class QwenAiRequestGovernor {
 
   private logLifecycle(
     item: QueueItem,
-    event: 'queue_timeout' | 'admitted' | 'released',
+    event: 'queue_timeout' | 'request_deadline' | 'admitted' | 'released',
     metrics: Record<string, number>,
   ): void {
     if (!item.requestId) return

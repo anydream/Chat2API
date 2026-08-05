@@ -123,6 +123,8 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
   assert.match(forwarderSource, /qwenAiRequestGovernor\.run\(account\.id/)
   assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context, \{[\s\S]*requestTimeoutMs: options\.qwenAiRequestTimeoutMs/)
   assert.match(forwarderSource, /signal: context\.signal/)
+  assert.match(forwarderSource, /deadlineAt: options\.qwenAiRequestDeadlineAt/)
+  assert.match(forwarderSource, /deadlineAt: options\.requestDeadlineAt/)
   assert.match(forwarderSource, /CHAT2API_QWEN_AI_RETRY_COUNT/)
   assert.match(forwarderSource, /QwenAiAdapter\.isQwenAiProvider\(provider\)[\s\S]*qwenAiRetryCountFromEnv\(recoverManagedToolStream\)/)
   assert.match(forwarderSource, /previousRecoveryHint === 'managed_tool_stream_validation'/)
@@ -353,6 +355,46 @@ test('Qwen AI governor returns a runtime 429 after the queue deadline', { timeou
   assert.match(result.error, /waited in queue for more than 1s/)
   assert.ok(waitedMs >= 900, `queue deadline fired too early: ${waitedMs}ms`)
   assert.ok(waitedMs < 3_000, `queue deadline fired too late: ${waitedMs}ms`)
+  assert.equal(getEventListeners(queuedController.signal, 'abort').length, 0)
+
+  activeResult.resolve({ success: true, status: 200, body: {} })
+  await activePromise
+})
+
+test('Qwen AI governor returns 504 when an absolute request deadline expires while pending', { timeout: 5_000 }, async (t) => {
+  const Governor = loadGovernorForRuntimeTest(1_000)
+  const governor = new Governor()
+  const activeStarted = deferred()
+  const activeResult = deferred()
+  const activePromise = governor.run('account-1', () => {
+    activeStarted.resolve()
+    return activeResult.promise
+  })
+  t.after(() => activeResult.resolve({ success: true, status: 200, body: {} }))
+  await activeStarted.promise
+
+  const queuedController = new AbortController()
+  let queuedRequestStarted = false
+  const queuedAt = Date.now()
+  const result = await governor.run('account-2', async () => {
+    queuedRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  }, {
+    signal: queuedController.signal,
+    deadlineAt: queuedAt + 100,
+  })
+  const waitedMs = Date.now() - queuedAt
+
+  assert.equal(queuedRequestStarted, false)
+  assert.equal(result.status, 504)
+  assert.equal(result.errorCode, 'qwen_ai_request_timeout')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, undefined)
+  assert.equal(result.headers, undefined)
+  assert.match(result.error, /cumulative request deadline/)
+  assert.ok(waitedMs >= 50, `request deadline fired too early: ${waitedMs}ms`)
+  assert.ok(waitedMs < 750, `request deadline fired too late: ${waitedMs}ms`)
   assert.equal(getEventListeners(queuedController.signal, 'abort').length, 0)
 
   activeResult.resolve({ success: true, status: 200, body: {} })
@@ -1200,7 +1242,8 @@ test('Qwen AI cancellation and timeout paths are not retried or logged as succes
   assert.match(qwenAiSource, /Qwen AI response stream aborted before reading started/)
   assert.match(qwenAiSource, /QWEN_AI_STREAM_FAILURE_EVENT/)
   assert.match(qwenAiSource, /transStream\.qwenAiFailure = error/)
-  assert.match(qwenAiSource, /stream\.once\('error', \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight\) \{\s*return/)
+  assert.match(qwenAiSource, /const onUpstreamError = \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight\) \{\s*return/)
+  assert.match(qwenAiSource, /stream\.once\('error', onUpstreamError\)[\s\S]*if \(options\.signal\?\.aborted\)/)
   assert.match(forwarderSource, /retryable = status === 499[\s\S]*status === 403[\s\S]*status === 429[\s\S]*status === 504[\s\S]*\? false/)
 
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')

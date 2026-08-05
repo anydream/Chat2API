@@ -106,7 +106,7 @@ test('Qwen AI adapter refreshes expiring web tokens by signing in with saved ema
   assert.match(refresherSource, /async refreshAfterUnauthorized\(account: Account, signal\?: AbortSignal\)/)
   assert.match(refresherSource, /timeout:\s*15000,\s*signal,/)
   assert.match(adapterSource, /const chatType = imageGeneration\?\.chatType \?\? 't2t'/)
-  assert.match(adapterSource, /createChat\(modelId, 'OpenAI_API_Chat', request\.signal, chatType\)/)
+  assert.match(adapterSource, /createChat\(modelId, 'OpenAI_API_Chat', scope\.signal, chatType\)/)
 })
 
 test('Qwen AI token refresher persists signin Set-Cookie values for web sessions', () => {

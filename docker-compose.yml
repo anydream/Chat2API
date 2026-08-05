@@ -40,9 +40,9 @@ services:
       # Ordinary pre-output 401/403/429/5xx failures also traverse the active
       # Qwen pool. A positive value can impose a deployment-specific cap.
       CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:-0}
-      # Queue admission is independent from the active response budget.
-      # Keep it configurable so deployments can choose how long clients wait
-      # for a governor slot before receiving a retryable 429.
+      # Queue admission has its own limit, but remains inside the cumulative
+      # request deadline. Keep it configurable so deployments can choose how
+      # long clients wait for a governor slot before receiving a retryable 429.
       CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS: ${CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000}
       # Reserve this many effective governor slots for ordinary client
       # requests while context compaction is running. Zero opts into a shared
@@ -62,8 +62,12 @@ services:
       # count. Set a non-negative integer only for an explicit deployment cap.
       CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS: ${CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS-}
       # One cumulative no-progress budget covers transport resumes and
-      # workflow continuations; normal active generation is not counted.
+      # workflow continuations. Active generation does not spend this smaller
+      # budget, but remains bounded by QWEN_AI_REQUEST_TIMEOUT_MS.
       CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000}
+      # Once semantic recovery begins, cap the full continuation chain even
+      # while replacement branches keep producing incomplete progress.
+      CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-300000}
       # A busy-chat admission response retries the exact same continuation
       # payload; it never creates another user turn or switches accounts.
       # Busy-chat admission has its own wall-clock budget; it must not inherit
@@ -81,10 +85,11 @@ services:
       CHAT2API_QWEN_AI_MAX_CONCURRENT: ${CHAT2API_QWEN_AI_MAX_CONCURRENT:-16}
       CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_GLOBAL_MIN_INTERVAL_MS-}
       CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
-      # Long-context provider responses are bounded separately from idle stalls.
-      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-600000}
-      # Zero disables the absolute wall-clock cap; meaningful inactivity is
-      # still bounded by QWEN_AI_STREAM_IDLE_TIMEOUT_MS.
+      # Leave transport headroom for downstream clients and proxy layers to
+      # receive a structured terminal response. Override per deployment.
+      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-540000}
+      # Zero disables only the additional post-admission response cap. The
+      # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline remains authoritative.
       QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-0}
       QWEN_AI_STREAM_IDLE_TIMEOUT_MS: ${QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000}
       # Emit protocol-neutral SSE comments while a downstream stream is quiet.

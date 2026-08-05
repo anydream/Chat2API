@@ -28,7 +28,8 @@ services:
       LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-false}"
       # cancel_on_disconnect is enabled in the mounted LiteLLM configuration.
       # LiteLLM applies this to outer connect/read waits. Streaming activity
-      # refreshes that budget; Chat2API separately enforces meaningful idle.
+      # refreshes that budget; Chat2API separately enforces meaningful idle
+      # and the cumulative Qwen request deadline.
       REQUEST_TIMEOUT: "${LITELLM_REQUEST_TIMEOUT:-900}"
       # Anthropic ping events keep downstream byte-idle watchdogs alive while
       # the translated upstream stream is temporarily quiet. Zero disables it.

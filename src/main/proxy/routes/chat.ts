@@ -38,6 +38,7 @@ import {
 import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../utils/errors'
 import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 import { classifyChatRequest } from '../requestIntent'
+import { createAssistantOutputBoundaryStream } from '../toolCalling/assistantOutputBoundary'
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -134,6 +135,23 @@ function streamFailureCode(error: Error | undefined): string | undefined {
 function streamFailureAccountFault(error: Error | undefined): boolean | undefined {
   const accountFault = (error as (Error & { accountFault?: unknown }) | undefined)?.accountFault
   return typeof accountFault === 'boolean' ? accountFault : undefined
+}
+
+function streamFailureStringField(
+  error: Error | undefined,
+  field: 'type' | 'param',
+): string | undefined {
+  const value = (error as (Error & Record<string, unknown>) | undefined)?.[field]
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function streamFailureRetryable(error: Error | undefined): boolean | undefined {
+  const retryable = (error as (Error & { retryable?: unknown }) | undefined)?.retryable
+  return typeof retryable === 'boolean' ? retryable : undefined
+}
+
+function isUpstreamProtocolStreamError(error: Error | undefined): boolean {
+  return streamFailureStringField(error, 'type') === 'upstream_protocol_error'
 }
 
 function streamFailureHeaders(error: Error | undefined): Record<string, string> | undefined {
@@ -507,10 +525,7 @@ router.post('/completions', async (ctx: Context) => {
 
     const deferStreamOutcome = request.stream === true
       && Boolean(result.stream)
-      && (
-        KimiAdapter.isKimiProvider(provider)
-        || QwenAiAdapter.isQwenAiProvider(provider)
-      )
+      && result.skipTransform === true
 
     if (!deferStreamOutcome) {
       loadBalancer.clearAccountFailure(account.id)
@@ -615,9 +630,11 @@ router.post('/completions', async (ctx: Context) => {
       // Collect stream content for logging (raw SSE output)
       let collectedContent = ''
       let streamOutcomeRecorded = !deferStreamOutcome
+      let outputStreamEnded = false
+      const sourceStream = result.stream as PassThrough
 
       const qwenAiStream = QwenAiAdapter.isQwenAiProvider(provider)
-        ? result.stream as QwenAiOutputStream
+        ? sourceStream as QwenAiOutputStream
         : undefined
       const getDeferredStreamSelection = (): AccountSelection => resolveEffectiveSelection(
         { account, provider, actualModel },
@@ -748,8 +765,9 @@ router.post('/completions', async (ctx: Context) => {
         }
       }
 
-      // Handle stream errors
-      result.stream.once('error', (err: Error) => {
+      const handleOutputStreamError = (err: Error) => {
+        if (outputStreamEnded) return
+        outputStreamEnded = true
         const clientCancelled = context.signal?.aborted || isClientCancellationError(err)
         if (clientCancelled) {
           console.log('[Chat] Stream cancelled:', err.message)
@@ -766,21 +784,27 @@ router.post('/completions', async (ctx: Context) => {
         // Kimi's Connect handler deliberately withholds [DONE] when an
         // upstream trailer reports an error. Preserve that signal so clients
         // do not mistake a permission/auth failure for a successful answer.
-        if (qwenAiStream) {
+        if (qwenAiStream || isUpstreamProtocolStreamError(err)) {
           const status = streamFailureStatus(err, context.signal?.aborted)
+          const errorType = streamFailureStringField(err, 'type')
+          const errorParam = streamFailureStringField(err, 'param')
+          const retryable = streamFailureRetryable(err)
           wrapperStream.write(`event: error\ndata: ${JSON.stringify({
             error: {
               message: err.message,
-              type: 'api_error',
-              code: streamFailureCode(err) || 'qwen_ai_stream_error',
+              type: errorType || 'api_error',
+              code: streamFailureCode(err) || (qwenAiStream ? 'qwen_ai_stream_error' : 'upstream_stream_error'),
               status,
-              retryable: false,
+              ...(retryable === undefined
+                ? (qwenAiStream ? { retryable: false } : {})
+                : { retryable }),
+              ...(errorParam === undefined ? {} : { param: errorParam }),
               ...(streamFailureAccountFault(err) === undefined
                 ? {}
                 : { accountFault: streamFailureAccountFault(err) }),
             },
           })}\n\n`)
-          wrapperStream.write('data: [DONE]\n\n')
+          if (qwenAiStream) wrapperStream.write('data: [DONE]\n\n')
         } else if (KimiAdapter.isKimiProvider(provider)) {
           wrapperStream.write(`data: ${JSON.stringify({
             error: {
@@ -816,19 +840,31 @@ router.post('/completions', async (ctx: Context) => {
             model: request.model,
           })
         }
-      })
+      }
 
       // Check if stream is already in correct SSE format (from adapters like Kimi, GLM, DeepSeek)
       if (result.skipTransform) {
-        // Stream is already formatted, pipe through wrapper and collect
-        result.stream.on('data', (chunk: Buffer) => {
+        // Built-in adapters already emit OpenAI-compatible SSE. Enforce the
+        // reserved assistant-output boundary once more at the route edge so
+        // every provider and visible text channel receives the same policy.
+        const guardedStream = createAssistantOutputBoundaryStream()
+        sourceStream.once('error', (error: Error) => guardedStream.destroy(error))
+        guardedStream.once('error', (error: Error) => {
+          if (!sourceStream.destroyed) sourceStream.destroy()
+          handleOutputStreamError(error)
+        })
+
+        guardedStream.on('data', (chunk: Buffer) => {
           collectedContent += chunk.toString()
         })
 
-        result.stream.pipe(wrapperStream, { end: false })
+        sourceStream.pipe(guardedStream)
+        guardedStream.pipe(wrapperStream, { end: false })
 
         // When source stream ends normally, update log and end wrapper
-        result.stream.once('end', () => {
+        guardedStream.once('end', () => {
+          if (outputStreamEnded) return
+          outputStreamEnded = true
           const qwenAiFailure = qwenAiStream?.qwenAiFailure
           recordDeferredStreamOutcome(!qwenAiFailure, qwenAiFailure)
           // Update log with collected response
@@ -849,16 +885,26 @@ router.post('/completions', async (ctx: Context) => {
             storeManager.addLog('debug', `Stream response completed`, { requestId })
           }
         )
+        const guardedStream = createAssistantOutputBoundaryStream()
+        sourceStream.once('error', (error: Error) => transformStream.destroy(error))
+        transformStream.once('error', (error: Error) => guardedStream.destroy(error))
+        guardedStream.once('error', (error: Error) => {
+          if (!sourceStream.destroyed) sourceStream.destroy()
+          handleOutputStreamError(error)
+        })
 
         // Collect from transform stream output
-        transformStream.on('data', (chunk: Buffer) => {
+        guardedStream.on('data', (chunk: Buffer) => {
           collectedContent += chunk.toString()
         })
 
-        result.stream.pipe(transformStream)
-        transformStream.pipe(wrapperStream, { end: false })
+        sourceStream.pipe(transformStream)
+        transformStream.pipe(guardedStream)
+        guardedStream.pipe(wrapperStream, { end: false })
 
-        transformStream.once('end', () => {
+        guardedStream.once('end', () => {
+          if (outputStreamEnded) return
+          outputStreamEnded = true
           // Update log with collected response
           if (logEntryId) {
             storeManager.updateRequestLog(logEntryId, {

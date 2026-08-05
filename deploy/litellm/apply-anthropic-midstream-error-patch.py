@@ -1132,6 +1132,42 @@ ANTHROPIC_RESPONSES_TOOL_ERROR_PATCH = '''                            # Preserve
                                 tool_result_item["is_error"] = is_error
                             input_items.append(tool_result_item)
 '''
+ANTHROPIC_RESPONSES_ASSISTANT_ORDER_MARKER = (
+    "Flush buffered assistant text before the top-level tool call"
+)
+ANTHROPIC_RESPONSES_ASSISTANT_ORDER_ANCHOR = '''                        elif btype == "tool_use":
+                            # tool_use becomes a top-level function_call item
+                            input_items.append(
+                                {
+                                    "type": "function_call",
+                                    "call_id": block.get("id", ""),
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                }
+                            )
+'''
+ANTHROPIC_RESPONSES_ASSISTANT_ORDER_PATCH = '''                        elif btype == "tool_use":
+                            # Flush buffered assistant text before the top-level tool call
+                            # so Responses input items retain Anthropic content-block order.
+                            if asst_parts:
+                                input_items.append(
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": asst_parts,
+                                    }
+                                )
+                                asst_parts = []
+                            # tool_use becomes a top-level function_call item
+                            input_items.append(
+                                {
+                                    "type": "function_call",
+                                    "call_id": block.get("id", ""),
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                }
+                            )
+'''
 
 
 def replace_exact(source: str, old: str, new: str, description: str) -> str:
@@ -1423,17 +1459,25 @@ def patch_anthropic_adapter_source(source: str) -> str:
 
 
 def patch_anthropic_responses_transformation_source(source: str) -> str:
-    if ANTHROPIC_RESPONSES_TOOL_ERROR_MARKER in source:
+    if ANTHROPIC_RESPONSES_ASSISTANT_ORDER_MARKER in source:
         raise RuntimeError(
-            "LiteLLM already contains the Anthropic Responses tool-result error bridge patch; "
+            "LiteLLM already contains the Anthropic Responses assistant-order patch; "
             "review the base image before removing this build patch."
         )
 
+    patched = source
+    if ANTHROPIC_RESPONSES_TOOL_ERROR_MARKER not in patched:
+        patched = replace_exact(
+            patched,
+            ANTHROPIC_RESPONSES_TOOL_ERROR_ANCHOR,
+            ANTHROPIC_RESPONSES_TOOL_ERROR_PATCH,
+            "Anthropic Responses tool-result error anchor",
+        )
     patched = replace_exact(
-        source,
-        ANTHROPIC_RESPONSES_TOOL_ERROR_ANCHOR,
-        ANTHROPIC_RESPONSES_TOOL_ERROR_PATCH,
-        "Anthropic Responses tool-result error anchor",
+        patched,
+        ANTHROPIC_RESPONSES_ASSISTANT_ORDER_ANCHOR,
+        ANTHROPIC_RESPONSES_ASSISTANT_ORDER_PATCH,
+        "Anthropic Responses assistant content ordering anchor",
     )
     compile(patched, str(ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH), "exec")
     return patched

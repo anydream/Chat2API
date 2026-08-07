@@ -77,6 +77,7 @@ function loadQwenAiModule() {
     },
     '../toolCalling/workflowCompletion': {
       hasManagedWorkflowCompletionMarker: () => false,
+      parseManagedWorkflowCompletionProof: content => ({ complete: false, content }),
       requiresManagedWorkflowCompletionMarker: () => false,
       stripManagedWorkflowCompletionMarker: content => content,
     },
@@ -91,6 +92,19 @@ function loadQwenAiModule() {
       isCompleteJsonText: () => true,
       mergeNativeToolArguments: (_current, next) => next,
       normalizeNativeFunctionCallDelta: () => [],
+    },
+    './qwen-ai-feature-config': {
+      createQwenAiFeatureConfig: ({ thinkingEnabled, thinkingBudget }) => ({
+        thinking_enabled: thinkingEnabled,
+        output_schema: 'phase',
+        research_mode: 'normal',
+        auto_thinking: thinkingEnabled,
+        auto_search: false,
+        ...(thinkingEnabled ? {
+          thinking_format: 'summary',
+          ...(thinkingBudget ? { thinking_budget: thinkingBudget } : {}),
+        } : {}),
+      }),
     },
   }
   const testRequire = specifier => {
@@ -360,7 +374,9 @@ async function captureQwenPayload(image_generation) {
     messages: [{ role: 'user', content: 'draw a lighthouse' }],
     ...(image_generation ? { image_generation } : {}),
   })
-  return requests.map(request => request.payload)
+  return requests.map(request => (
+    typeof request.payload === 'string' ? JSON.parse(request.payload) : request.payload
+  ))
 }
 
 test('Qwen AI explicit image_generation switches create-chat and message payloads to t2i', async () => {

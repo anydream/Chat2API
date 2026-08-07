@@ -199,6 +199,8 @@ router.post('/responses', async (ctx: Context) => {
     reason: requestIntent.reason,
     signals: requestIntent.signals,
     messageCount: requestIntent.messageCount,
+    toolCount: requestIntent.toolCount,
+    toolResultCount: requestIntent.toolResultCount,
     textChars: requestIntent.textChars,
   }))
   const imageResolver = createResponseImageResolver({ signal: abort.controller.signal })

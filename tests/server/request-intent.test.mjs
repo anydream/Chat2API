@@ -44,6 +44,57 @@ test('request intent detects the observed Claude context summary protocol', () =
   assert.match(result.lastUserTextPrefix, /CRITICAL: Respond with TEXT ONLY/)
 })
 
+test('request intent detects Claude summary turns that omit the tool prohibition', () => {
+  const result = classifyChatRequest({
+    model: 'Qwen3.8-Max',
+    stream: true,
+    tools: Array.from({ length: 35 }, (_, index) => ({
+      type: 'function',
+      function: { name: `tool_${index}` },
+    })),
+    messages: [
+      { role: 'user', content: 'Complete the implementation.' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'tool_1', arguments: '{}' },
+        }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'call_1',
+          content: 'large tool result',
+        }],
+      },
+      {
+        role: 'user',
+        content: 'CRITICAL: Respond with TEXT ONLY. Create a detailed summary of the conversation context.',
+      },
+    ],
+  })
+
+  assert.equal(result.intent, 'context_compaction')
+  assert.equal(result.reason, 'text_only_summary_with_tool_history')
+  assert.equal(result.toolResultCount, 1)
+  assert.ok(result.signals.includes('terminal_tool_history'))
+})
+
+test('a text-only summary without tool history remains a normal request', () => {
+  const result = classifyChatRequest({
+    model: 'Qwen3.8-Max',
+    tools: [{ type: 'function', function: { name: 'Read' } }],
+    messages: [{ role: 'user', content: 'Respond with text only and summarize this note.' }],
+  })
+
+  assert.equal(result.intent, 'normal')
+  assert.equal(result.toolResultCount, 0)
+})
+
 test('ordinary summary requests remain normal provider requests', () => {
   const result = classifyChatRequest({
     model: 'Qwen3.8-Max-Preview',

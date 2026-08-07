@@ -69,6 +69,11 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverCompose, /CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:\s*\$\{CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS:-1000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
   assert.match(serverCompose, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-540000\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:\s*\$\{CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_RETRY_COUNT:-1\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-1\}/)
+  assert.match(serverCompose, /CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1\}/)
   const transcriptEnvironmentNames = [
     'MAX_BYTES',
     'REQUEST_RESERVE_BYTES',
@@ -87,6 +92,11 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_RETRY_COUNT=1/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1/)
+  assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000/)
   assert.match(serverDockerfile, /ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000/)
   assert.doesNotMatch(serverDockerfile, /ENV CHAT2API_QWEN_AI_STREAM_PREFLIGHT_MAX_HOLD_MS=/)
@@ -1105,7 +1115,9 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     url: `${liteLlmBaseUrl}/health/liveliness`,
     child: liteLlmChild,
     output: liteLlmOutput,
-    timeoutMs: 60_000,
+    // The upstream image can spend over a minute importing/compiling its
+    // provider catalog on a cold Docker Desktop filesystem.
+    timeoutMs: 150_000,
     serviceName: 'LiteLLM',
   })
 
@@ -1660,6 +1672,26 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
     assert.equal(Number.isInteger(baseline.body?.input_tokens), true, baseline.text)
     assert.equal(Number.isInteger(result.body?.input_tokens), true, result.text)
     assert.ok(result.body.input_tokens > baseline.body.input_tokens, result.text)
+    assert.equal(mock.calls.length, callsBefore)
+  })
+
+  await t.test('estimates a 512k-scale ASCII Anthropic request in Qwen token units', async () => {
+    const callsBefore = mock.calls.length
+    const corpus = 'A'.repeat(3 * 512 * 1024)
+    const result = await requestJson(`${liteLlmBaseUrl}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({
+        model: MOCK_MODEL_ALIAS,
+        messages: [{ role: 'user', content: corpus }],
+      }),
+    })
+
+    assert.equal(result.response.status, 200, result.text)
+    assert.equal(Number.isInteger(result.body?.input_tokens), true, result.text)
+    assert.ok(result.body.input_tokens >= 500_000, result.text)
+    assert.ok(result.body.input_tokens <= 550_000, result.text)
     assert.equal(mock.calls.length, callsBefore)
   })
 

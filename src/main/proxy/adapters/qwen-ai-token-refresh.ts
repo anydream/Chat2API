@@ -306,6 +306,15 @@ export class QwenAiTokenRefresher {
     return this.refresh(account, signal)
   }
 
+  async repairWebSession(account: Account, signal?: AbortSignal): Promise<Account> {
+    const cookies = String(account.credentials.cookies || account.credentials.cookie || '').trim()
+    if (hasQwenAiSessionCookie(cookies) || !this.canRefresh(account)) {
+      return account
+    }
+
+    return this.refresh(account, signal)
+  }
+
   async refreshAfterUnauthorized(account: Account, signal?: AbortSignal): Promise<Account> {
     if (!this.canRefresh(account)) {
       return account

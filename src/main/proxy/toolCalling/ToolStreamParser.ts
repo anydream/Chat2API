@@ -97,6 +97,12 @@ export class ToolStreamParser {
       }
     }
 
+    // Hermes parallel calls are adjacent, individually delimited blocks. Wait
+    // for stream completion so the first block does not suppress later calls.
+    if (this.plan.protocol === 'qwen_hermes') {
+      return chunks
+    }
+
     const parsed = parseFirstValidToolBlock(this.buffer, this.plan)
     if (parsed.toolCalls.length > 0) {
       for (const toolCall of uniqueResponseToolCalls(parsed.toolCalls)) {
@@ -311,6 +317,9 @@ function parseFirstValidToolBlock(
   options: { allowPartial?: boolean } = {},
 ) {
   const parsed = parseBufferedToolCall(content, plan, options)
+  if (plan.protocol === 'qwen_hermes') {
+    return parsed
+  }
   if (parsed.toolCalls.length === 0 || parsed.rawMatches.length <= 1) {
     return parsed
   }
@@ -365,8 +374,7 @@ function hasProtocolMarker(buffer: string, plan: ToolCallingPlan): boolean {
 
 function mayBecomeValidToolCall(buffer: string, plan: ToolCallingPlan): boolean {
   void buffer
-  if (plan.protocol !== 'managed_xml') return false
-  return true
+  return plan.protocol === 'managed_xml' || plan.protocol === 'qwen_hermes'
 }
 
 function fencedRanges(content: string): Array<{ start: number; end: number }> {

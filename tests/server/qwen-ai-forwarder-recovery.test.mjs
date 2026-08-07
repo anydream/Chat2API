@@ -91,7 +91,7 @@ function loadRequestForwarder(overrides = {}) {
     './adapters/perplexity': { PerplexityAdapter: adapterWithMatcher('isPerplexityProvider') },
     './adapters/perplexity-stream': { PerplexityStreamHandler: StreamHandler },
     './toolCalling/ToolCallingEngine': {
-      ToolCallingEngine: class {},
+      ToolCallingEngine: overrides.ToolCallingEngine || class {},
       createToolWorkflowContinuationMessage: overrides.createToolWorkflowContinuationMessage
         || (() => ({ role: 'user', content: 'generic workflow continuation' })),
     },
@@ -175,6 +175,43 @@ function loadRequestForwarder(overrides = {}) {
   new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
   return module.exports.RequestForwarder
 }
+
+test('adapter registry passes the Qwen profile key for a custom provider id', () => {
+  let capturedInput
+  class EndpointMatchedQwenAdapter {
+    static isQwenAiProvider(provider) {
+      return provider.apiEndpoint.includes('chat.qwen.ai')
+    }
+  }
+  class CapturingToolCallingEngine {
+    transformRequest(input) {
+      capturedInput = input
+      return {
+        messages: input.request.messages,
+        tools: input.request.tools,
+        plan: {},
+      }
+    }
+  }
+  const RequestForwarder = loadRequestForwarder({
+    QwenAiAdapter: EndpointMatchedQwenAdapter,
+    ToolCallingEngine: CapturingToolCallingEngine,
+  })
+  const forwarder = new RequestForwarder()
+  const provider = {
+    id: 'custom-qwen-instance',
+    apiEndpoint: 'https://chat.qwen.ai',
+  }
+
+  forwarder.transformRequestForPromptToolUse({
+    model: 'configured-model',
+    messages: [{ role: 'user', content: 'complete the task' }],
+    tools: [{ type: 'function', function: { name: 'read_file', parameters: {} } }],
+  }, provider)
+
+  assert.equal(capturedInput.providerProfileKey, 'qwen-ai')
+  assert.equal(capturedInput.provider.id, 'custom-qwen-instance')
+})
 
 function createHarness(results) {
   const RequestForwarder = loadRequestForwarder()
@@ -464,6 +501,31 @@ test('outer Qwen forwarding preserves account-neutral failures from results and 
   }
 })
 
+test('outer Qwen forwarding preserves parse-stage next-account classification', async () => {
+  const parseTimeout = Object.assign(new Error('Qwen AI file parse timed out'), {
+    status: 504,
+    code: 'qwen_ai_file_parse_timeout',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  })
+  const { attempts, execute } = createHarness([parseTimeout])
+
+  const result = await execute({
+    model: 'model-1',
+    messages: [],
+    stream: true,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.status, 504)
+  assert.equal(result.errorCode, 'qwen_ai_file_parse_timeout')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, 'next-account')
+  assert.equal(attempts.length, 1, 'the same account must not replay the upload')
+})
+
 test('outer Qwen forwarding clears account classification when the client aborts', async () => {
   for (const upstreamStatus of [502, 499]) {
     const RequestForwarder = loadRequestForwarder()
@@ -516,6 +578,40 @@ test('an explicit zero retry count disables managed-tool recovery', async () => 
 
     assert.equal(result.success, false)
     assert.equal(attempts.length, 1)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_RETRY_COUNT = previous
+    if (previousBuffer === undefined) delete process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+    else process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = previousBuffer
+  }
+})
+
+test('managed-tool recovery honors the configured retry count', async () => {
+  const previous = process.env.CHAT2API_QWEN_AI_RETRY_COUNT
+  const previousBuffer = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
+  process.env.CHAT2API_QWEN_AI_RETRY_COUNT = '2'
+  process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS = 'true'
+  try {
+    const failure = {
+      success: false,
+      status: 502,
+      error: 'buffered upstream stream ended early',
+      recoveryHint: 'managed_tool_stream_validation',
+    }
+    const { attempts, execute } = createHarness([failure, failure, {
+      success: true,
+      status: 200,
+      body: { choices: [] },
+    }])
+    const result = await execute({
+      model: 'model-1',
+      messages: [],
+      stream: true,
+      tools: [{ type: 'function', function: { name: 'lookup', parameters: {} } }],
+    })
+
+    assert.equal(result.success, true)
+    assert.equal(attempts.length, 3)
   } finally {
     if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_RETRY_COUNT
     else process.env.CHAT2API_QWEN_AI_RETRY_COUNT = previous
@@ -595,6 +691,129 @@ test('Qwen upstream busy retries the same account and can recover within the req
   assert.ok(attempts.every(item => item.qwenAiRequestTimeoutMs > 0))
   assert.ok(attempts[1].qwenAiRequestTimeoutMs <= attempts[0].qwenAiRequestTimeoutMs)
   assert.deepEqual(delays, [1000])
+})
+
+test('Qwen upstream busy recovery honors the configured retry count', async () => {
+  const previous = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = '2'
+  try {
+    const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+    const forwarder = new RequestForwarder()
+    let attempts = 0
+    let delayCalls = 0
+    forwarder.delay = async () => {
+      delayCalls += 1
+      return true
+    }
+    forwarder.doForward = async () => {
+      attempts += 1
+      return {
+        success: false,
+        status: 503,
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+
+    const result = await forwarder.forwardChatCompletion(
+      { model: 'model-1', messages: [], stream: true },
+      { id: 'account-1' },
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      'model-1',
+      { signal: new AbortController().signal },
+    )
+
+    assert.equal(result.success, false)
+    assert.equal(result.errorCode, 'qwen_ai_upstream_busy')
+    assert.equal(attempts, 3)
+    assert.equal(delayCalls, 2)
+  } finally {
+    if (previous === undefined) delete process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+    else process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT = previous
+  }
+})
+
+test('Qwen managed-tool busy retry switches to hybrid document transport', async () => {
+  const RequestForwarder = loadRequestForwarder({ qwenAiRequestTimeoutMs: 600_000 })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.delay = async () => true
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    if (attempts.length === 1) {
+      return {
+        success: false,
+        status: 503,
+        error: 'Qwen AI upstream is busy',
+        errorCode: 'qwen_ai_upstream_busy',
+        retryable: true,
+        accountFault: false,
+      }
+    }
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    {
+      model: 'configured-model',
+      messages: [{ role: 'user', content: 'read the requested file' }],
+      stream: true,
+      tools: [{
+        type: 'function',
+        function: { name: 'read_file', parameters: { type: 'object' } },
+      }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'configured-model',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.equal(attempts.length, 2)
+  assert.deepEqual(
+    attempts.map(item => item.qwenAiMessageTransport),
+    ['inline', 'document'],
+  )
+  assert.deepEqual(
+    attempts.map(item => item.qwenAiRecoveryBypassAccountInterval),
+    [false, true],
+  )
+})
+
+test('Qwen large managed-tool request stays inline until the provider reports busy', async () => {
+  const RequestForwarder = loadRequestForwarder({
+    qwenAiRequestTimeoutMs: 600_000,
+    estimateQwenAiRequestInputTokens: () => 120_000,
+  })
+  const forwarder = new RequestForwarder()
+  const attempts = []
+  forwarder.doForward = async (...args) => {
+    attempts.push(args.at(-1))
+    return { success: true, status: 200, body: { choices: [] } }
+  }
+
+  const result = await forwarder.forwardChatCompletion(
+    {
+      model: 'configured-model',
+      messages: [{ role: 'user', content: 'continue the current task' }],
+      stream: true,
+      tools: [{
+        type: 'function',
+        function: { name: 'read_file', parameters: { type: 'object' } },
+      }],
+    },
+    { id: 'account-1' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'configured-model',
+    { signal: new AbortController().signal },
+  )
+
+  assert.equal(result.success, true)
+  assert.equal(attempts.length, 1)
+  assert.equal(attempts[0].qwenAiMessageTransport, 'inline')
 })
 
 test('Qwen upstream busy stops at the cumulative request budget', async () => {

@@ -227,6 +227,37 @@ test('account-neutral preflight failures replay independently of account fault',
   assert.equal(outcome.failoverCount, 1)
 })
 
+test('account-neutral file parse timeout continues on the next account', async () => {
+  const first = selection('account-1')
+  const second = selection('account-2')
+  const parseTimeout: ForwardResult = {
+    success: false,
+    status: 504,
+    error: 'Qwen AI file parse timed out',
+    errorCode: 'qwen_ai_file_parse_timeout',
+    retryable: false,
+    accountFault: false,
+    retryScope: 'next-account',
+  }
+  const attempted: string[] = []
+
+  const outcome = await forwardWithAccountFailover({
+    initialSelection: first,
+    maxFailovers: 1,
+    forward: async ({ selection: current }) => {
+      attempted.push(current.account.id)
+      return current.account.id === first.account.id
+        ? parseTimeout
+        : { success: true, status: 200, body: { choices: [] } }
+    },
+    selectNext: excluded => excluded.has(first.account.id) ? second : null,
+  })
+
+  assert.deepEqual(attempted, ['account-1', 'account-2'])
+  assert.equal(outcome.result.success, true)
+  assert.equal(outcome.failoverCount, 1)
+})
+
 test('exhausted malformed-tool recovery replays the complete request on the next account', async () => {
   const accounts = [selection('account-1'), selection('account-2')]
   const attempted: string[] = []

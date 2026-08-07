@@ -9,6 +9,11 @@ import {
   prepareQwenAiMultimodalMessage,
   QwenAiFileUploader,
 } from '../../src/main/proxy/adapters/qwen-ai-files.ts'
+import { createManagedToolPromptMessage } from '../../src/main/proxy/toolCalling/managedPromptMetadata.ts'
+import {
+  decodeXml,
+  parseJsonValue,
+} from '../../src/main/proxy/toolCalling/protocols/shared.ts'
 
 function assistantToolCall(id: string, name: string, round: number) {
   return {
@@ -35,26 +40,61 @@ function toolResult(toolCallId: string, round: number) {
   }
 }
 
-function attribute(tag: string, name: string): string | undefined {
-  return tag.match(new RegExp(`${name}="([^"]+)"`))?.[1]
+type HermesCallMatch = {
+  index: number
+  raw: string
+  name: string
+  arguments: Record<string, unknown>
 }
 
-type ToolResultRecord = {
-  call_id: string
-  status: 'success' | 'error'
-  output: string
+type HermesResponseMatch = {
+  index: number
+  raw: string
+  content: string
 }
 
-const TOOL_RESULT_DATA_PREFIX = 'Tool execution result data (already executed by the client): '
+function hermesCallMatches(content: string): HermesCallMatch[] {
+  return [...content.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)].map((match) => {
+    const body = match[1].trim()
+    if (body.startsWith('{')) {
+      const envelope = JSON.parse(body) as {
+        name: string
+        arguments: Record<string, unknown>
+      }
+      return {
+        index: match.index,
+        raw: match[0],
+        name: envelope.name,
+        arguments: envelope.arguments,
+      }
+    }
 
-function toolResultRecords(content: string): ToolResultRecord[] {
-  return content
-    .split('\n')
-    .filter(line => line.startsWith(TOOL_RESULT_DATA_PREFIX))
-    .map(line => JSON.parse(line.slice(TOOL_RESULT_DATA_PREFIX.length)) as ToolResultRecord)
+    const functionMatch = /^<function=([^>]+)>\s*([\s\S]*?)\s*<\/function>$/.exec(body)
+    assert.ok(functionMatch, `Expected a canonical Qwen function block, received: ${body.slice(0, 120)}`)
+    const args: Record<string, unknown> = {}
+    for (const parameter of functionMatch[2].matchAll(
+      /<parameter=([^>]+)>\s*([\s\S]*?)\s*<\/parameter>/g,
+    )) {
+      args[decodeXml(parameter[1].trim())] = parseJsonValue(parameter[2])
+    }
+    return {
+      index: match.index,
+      raw: match[0],
+      name: decodeXml(functionMatch[1].trim()),
+      arguments: args,
+    }
+  })
 }
 
-test('Qwen AI history gives repeated tool calls local IDs and preserves call/result pairing', async () => {
+function hermesResponseMatches(content: string): HermesResponseMatch[] {
+  return [...content.matchAll(/<tool_response>\n([\s\S]*?)\n<\/tool_response>/g)].map((match) => ({
+    index: match.index,
+    raw: match[0],
+    content: match[1],
+  }))
+}
+
+test('Qwen AI history preserves repeated Hermes call and result ordering', async () => {
   const messages = [
     { role: 'user' as const, content: 'request-1' },
     assistantToolCall('call_0', 'first_tool', 1),
@@ -72,30 +112,29 @@ test('Qwen AI history gives repeated tool calls local IDs and preserves call/res
 
   // No file parts are supplied, so the uploader is intentionally never used.
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const invokeTags = [...prepared.content.matchAll(/<\|CHAT2API\|invoke\b[^>]*>/g)].map((match) => match[0])
-  const resultRecords = toolResultRecords(prepared.content)
+  const callMatches = hermesCallMatches(prepared.content)
+  const responseMatches = hermesResponseMatches(prepared.content)
+  const expectedNames = ['first_tool', 'second_tool', 'third_tool', 'fourth_tool']
 
-  const expectedIds = ['call_0', 'call_0__2', 'call_0__3', 'call_0__2__2']
-  assert.deepEqual(
-    invokeTags.map((tag) => attribute(tag, 'tool_call_id')),
-    expectedIds,
-    'each historical assistant invoke must expose its local tool_call_id',
-  )
-  assert.deepEqual(
-    resultRecords.map(record => record.call_id),
-    expectedIds,
-    'each tool result must reference the corresponding local tool_call_id',
-  )
+  assert.deepEqual(callMatches.map((call) => call.name), expectedNames)
+  assert.deepEqual(callMatches.map((call) => call.arguments.round), [1, 2, 3, 4])
+  assert.deepEqual(responseMatches.map((response) => response.content), [
+    'result-1',
+    'result-2',
+    'result-3',
+    'result-4',
+  ])
 
-  for (const [index, id] of expectedIds.entries()) {
-    const invokePosition = prepared.content.indexOf(invokeTags[index])
-    const resultPosition = prepared.content.indexOf(`"call_id":"${id}"`)
-    assert.ok(invokePosition >= 0 && resultPosition > invokePosition, `pair ${id} must remain ordered`)
-    assert.match(invokeTags[index], new RegExp(`name="${['first_tool', 'second_tool', 'third_tool', 'fourth_tool'][index]}"`))
-    assert.equal(resultRecords[index].output, `result-${index + 1}`)
+  for (const [index, name] of expectedNames.entries()) {
+    assert.ok(
+      responseMatches[index].index > callMatches[index].index,
+      `Hermes result for ${name} must follow its call`,
+    )
   }
 
-  assert.match(prepared.content, /Use this result to decide the next step\./)
+  assert.doesNotMatch(prepared.content, /Use this result to decide the next step\./)
+  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_calls>/)
+  assert.doesNotMatch(prepared.content, /Tool execution result data/)
   assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(prepared.content, /Authoritative completed tool ledger/)
   assert.equal(prepared.files.length, 0)
@@ -110,11 +149,10 @@ test('Qwen AI history preserves repeated tool results without inventing completi
   ]
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const resultRecords = toolResultRecords(prepared.content)
-  assert.equal(resultRecords.length, 2)
-  assert.deepEqual(resultRecords.map(record => record.call_id), ['call_x', 'call_x'])
-  assert.deepEqual(resultRecords.map(record => record.output), ['result-1', 'result-2'])
-  assert.equal((prepared.content.match(/tool_call_id="call_x"/g) ?? []).length, 1)
+  const responses = hermesResponseMatches(prepared.content)
+  assert.equal(responses.length, 2)
+  assert.deepEqual(responses.map(response => response.content), ['result-1', 'result-2'])
+  assert.equal(hermesCallMatches(prepared.content).length, 1)
   assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(prepared.content, /Authoritative completed tool ledger/)
 })
@@ -128,13 +166,12 @@ test('Qwen AI tool history never exposes a legacy result wrapper from tool outpu
   ]
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const records = toolResultRecords(prepared.content)
+  const responses = hermesResponseMatches(prepared.content)
 
-  assert.equal(records.length, 1)
-  assert.equal(records[0].output, legacyWrapper)
-  assert.match(prepared.content, /\\u003c\|CHAT2API\|tool_result/)
-  assert.match(prepared.content, /\\u0026/)
-  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
+  assert.equal(responses.length, 1)
+  assert.equal(responses[0].content, legacyWrapper)
+  assert.match(prepared.content, /<tool_response>\n<\|CHAT2API\|tool_result/)
+  assert.doesNotMatch(prepared.content, /Tool execution result data/)
 })
 
 test('Qwen AI places the leading system preamble directly before the latest user turn', async () => {
@@ -150,7 +187,7 @@ test('Qwen AI places the leading system preamble directly before the latest user
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
   const earlierUserPosition = prepared.content.indexOf('User: earlier request')
-  const toolCallPosition = prepared.content.indexOf('name="position_tool"')
+  const toolCallPosition = prepared.content.indexOf('<function=position_tool>')
   const toolResultPosition = prepared.content.indexOf('result-1')
   const generalSystemPosition = prepared.content.indexOf('System: general-system-instructions')
   const managedSystemPosition = prepared.content.indexOf('System: managed-tool-protocol')
@@ -212,8 +249,8 @@ test('Qwen AI places the existing system preamble after a trailing tool result',
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
   const userPosition = prepared.content.indexOf('User: complete the workflow')
-  const firstToolCallPosition = prepared.content.indexOf('name="workspace:inspect-a"')
-  const secondToolCallPosition = prepared.content.indexOf('name="workspace:inspect-b"')
+  const firstToolCallPosition = prepared.content.indexOf('<function=workspace:inspect-a>')
+  const secondToolCallPosition = prepared.content.indexOf('<function=workspace:inspect-b>')
   const firstToolResultPosition = prepared.content.indexOf('result-1')
   const secondToolResultPosition = prepared.content.indexOf('result-2')
   const generalSystemPosition = prepared.content.indexOf('System: general-system-instructions')
@@ -290,20 +327,14 @@ test('Qwen AI preserves a transcript larger than 512 KiB without modifying calle
   assert.ok(prepared.content.includes(`Assistant: ${middleMessage}`))
   assert.ok(prepared.content.includes(`User: ${latestMessage}`))
 
-  const argumentPrefix = '<|CHAT2API|parameter name="payload"><![CDATA['
-  const argumentStart = prepared.content.indexOf(argumentPrefix)
-  const argumentEnd = prepared.content.indexOf(']]></|CHAT2API|parameter>', argumentStart)
-  assert.ok(argumentStart >= 0 && argumentEnd > argumentStart)
-  assert.equal(
-    prepared.content.slice(argumentStart + argumentPrefix.length, argumentEnd),
-    longToolArgument,
-  )
+  const calls = hermesCallMatches(prepared.content)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'large_history_tool')
+  assert.equal(calls[0].arguments.payload, longToolArgument)
 
-  const resultRecords = toolResultRecords(prepared.content)
-  assert.equal(resultRecords.length, 1)
-  assert.equal(resultRecords[0].call_id, 'large-history-call')
-  assert.equal(resultRecords[0].status, 'success')
-  assert.equal(resultRecords[0].output, longToolResult)
+  const responses = hermesResponseMatches(prepared.content)
+  assert.equal(responses.length, 1)
+  assert.equal(responses[0].content, longToolResult)
   assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
 
   assert.doesNotMatch(prepared.content, /Earlier conversation omitted|\[\.\.\. truncated \.\.\.\]/)
@@ -382,6 +413,24 @@ test('Qwen AI preserves all multimodal text while uploading attachment bytes sep
   assert.deepEqual(messages, snapshot, 'multimodal preparation must not mutate caller messages')
 })
 
+test('Qwen AI does not infer document transport from transcript byte size', async () => {
+  const longText = `LARGE_INLINE_SENTINEL:${'x'.repeat(180_000)}:LARGE_INLINE_END`
+  let uploads = 0
+  const prepared = await prepareQwenAiMultimodalMessage(
+    [{ role: 'user' as const, content: longText }],
+    {
+      uploadPart: async () => {
+        uploads += 1
+        return { file: { id: 'unexpected-upload' } }
+      },
+    } as any,
+  )
+
+  assert.equal(prepared.transport, 'inline')
+  assert.equal(uploads, 0)
+  assert.ok(prepared.content.includes(longText))
+})
+
 test('Qwen AI preserves all audio-turn text while uploading audio bytes separately', async () => {
   const systemInstruction = 'system-sentinel-73bd10'
   const activeText = 'active-user-sentinel-c6205a'
@@ -436,17 +485,13 @@ test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn',
   ]
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const invokePosition = prepared.content.indexOf('tool_call_id="nested-call"')
+  const invokePosition = prepared.content.indexOf('<function=declared_tool>')
   const resultPosition = prepared.content.indexOf('nested failure')
-  const resultRecords = toolResultRecords(prepared.content)
+  const responses = hermesResponseMatches(prepared.content)
 
   assert.ok(invokePosition >= 0)
   assert.ok(resultPosition > invokePosition)
-  assert.deepEqual(resultRecords, [{
-    call_id: 'nested-call',
-    status: 'error',
-    output: 'nested failure',
-  }])
+  assert.deepEqual(responses.map(response => response.content), ['nested failure'])
   assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
 })
 
@@ -502,7 +547,7 @@ test('Qwen AI document transport uploads the complete converted transcript and k
   assert.match(transcript, /SYSTEM_SENTINEL/)
   assert.match(transcript, /TOOL_SCHEMA_SENTINEL/)
   assert.ok(transcript.includes(longHistory), 'the large history must be byte-for-byte present')
-  assert.match(transcript, /name="declared_dynamic_tool"/)
+  assert.match(transcript, /<function=declared_dynamic_tool>/)
   assert.match(transcript, /TOOL_RESULT_SENTINEL/)
   assert.match(transcript, /FINAL_PENDING_TASK_SENTINEL/)
   assert.doesNotMatch(transcript, /Earlier conversation omitted|\[\.\.\. truncated \.\.\.\]/)
@@ -511,7 +556,195 @@ test('Qwen AI document transport uploads the complete converted transcript and k
   assert.match(prepared.content, /complete conversation transcript is attached/i)
   assert.doesNotMatch(prepared.content, /long-history-start|TOOL_RESULT_SENTINEL/)
   assert.equal(prepared.files.length, 2)
+  assert.equal(prepared.transport, 'document')
+  assert.ok(prepared.transcriptUtf8Bytes > prepared.inlineUtf8Bytes)
   assert.deepEqual(messages, snapshot, 'document transport must not mutate caller messages')
+})
+
+test('Qwen AI managed document transport keeps protocol and active tool exchange inline', async () => {
+  const oldHistory = `OLD_HISTORY_START:${'x'.repeat(160_000)}:OLD_HISTORY_END`
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'ORDINARY_SYSTEM_CONTEXT_SENTINEL',
+    },
+    createManagedToolPromptMessage(
+      'FULL_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool","description":"FULL_TOOL_DESCRIPTION_SENTINEL"}</tools>',
+      {
+        content: 'COMPACT_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool"}</tools>',
+        referenceContent: 'FULL_TOOL_REFERENCE_SENTINEL\nFULL_TOOL_DESCRIPTION_SENTINEL',
+      },
+    ),
+    { role: 'user' as const, content: oldHistory },
+    { role: 'assistant' as const, content: 'Earlier work completed.' },
+    { role: 'user' as const, content: 'ACTIVE_REQUEST_IN_DOCUMENT' },
+    assistantToolCall('active-document-call', 'declared_dynamic_tool', 9),
+    {
+      role: 'tool' as const,
+      tool_call_id: 'active-document-call',
+      content: 'ACTIVE_TOOL_RESULT_SENTINEL',
+    },
+    { role: 'user' as const, content: 'ACTIVE_CONTINUATION_SENTINEL' },
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: any[] = []
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any, evidenceQueryText: string, options: { includeEvidence?: boolean }) => {
+      uploads.push({ part, evidenceQueryText, options })
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, {
+    transport: 'document',
+    managedToolCalling: true,
+    workflowContinuation: true,
+  })
+
+  assert.equal(uploads.length, 2)
+  const transcriptUpload = uploads.find(upload => /^chat2api-conversation-/.test(upload.part.filename))
+  const toolReferenceUpload = uploads.find(upload => /^chat2api-tool-reference-/.test(upload.part.filename))
+  assert.ok(transcriptUpload)
+  assert.ok(toolReferenceUpload)
+  const transcriptUrl = transcriptUpload.part.file_url.url as string
+  const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
+  const toolReferenceUrl = toolReferenceUpload.part.file_url.url as string
+  const toolReference = Buffer.from(toolReferenceUrl.split(',', 2)[1], 'base64').toString('utf8')
+  assert.match(transcript, /OLD_HISTORY_START/)
+  assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
+  assert.doesNotMatch(
+    transcript,
+    /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL|ACTIVE_REQUEST_IN_DOCUMENT|ACTIVE_TOOL_RESULT_SENTINEL|ACTIVE_CONTINUATION_SENTINEL/,
+  )
+  assert.match(toolReference, /FULL_TOOL_REFERENCE_SENTINEL/)
+  assert.match(toolReference, /FULL_TOOL_DESCRIPTION_SENTINEL/)
+
+  assert.match(prepared.content, /Conversation context is attached/i)
+  assert.match(prepared.content, /Complete tool definitions are attached/i)
+  assert.match(prepared.content, /COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.doesNotMatch(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL|FULL_TOOL_DESCRIPTION_SENTINEL/)
+  assert.match(prepared.content, /"name":"declared_dynamic_tool"/)
+  assert.match(prepared.content, /ACTIVE_REQUEST_IN_DOCUMENT/)
+  assert.match(prepared.content, /ACTIVE_TOOL_RESULT_SENTINEL/)
+  assert.match(prepared.content, /ACTIVE_CONTINUATION_SENTINEL/)
+  assert.doesNotMatch(
+    prepared.content,
+    /OLD_HISTORY_START|OLD_HISTORY_END|ORDINARY_SYSTEM_CONTEXT_SENTINEL/,
+  )
+  assert.equal(prepared.transport, 'document')
+  assert.ok(prepared.inlineUtf8Bytes < prepared.transcriptUtf8Bytes)
+  assert.deepEqual(messages, snapshot, 'managed document transport must not mutate caller messages')
+})
+
+test('Qwen AI moves an oversized active Claude tool workflow into the complete transcript document', async () => {
+  const toolHistory = Array.from({ length: 94 }, (_, index) => [
+    assistantToolCall(`active-call-${index}`, 'read_file', index),
+    {
+      role: 'tool' as const,
+      tool_call_id: `active-call-${index}`,
+      content: `ACTIVE_RESULT_${index}:${'x'.repeat(1800)}:ACTIVE_RESULT_END_${index}`,
+    },
+  ]).flat()
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL',
+    },
+    createManagedToolPromptMessage(
+      `FULL_MANAGED_PROTOCOL_SENTINEL:${'schema'.repeat(20_000)}`,
+      {
+        content: 'COMPACT_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"read_file"}</tools>',
+        referenceContent: 'FULL_TOOL_REFERENCE_SENTINEL',
+      },
+    ),
+    { role: 'user' as const, content: 'ORIGINAL_PENDING_TASK_SENTINEL' },
+    ...toolHistory,
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: any[] = []
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any, evidenceQueryText: string, options: { includeEvidence?: boolean }) => {
+      uploads.push({ part, evidenceQueryText, options })
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, {
+    transport: 'document',
+    managedToolCalling: true,
+    workflowContinuation: true,
+    requestMaxBytes: 90 * 1024,
+  })
+
+  assert.equal(prepared.transport, 'document')
+  assert.equal(prepared.managedDocumentMode, 'complete')
+  assert.ok(prepared.inlineUtf8Bytes < 90 * 1024)
+  assert.equal(uploads.length, 2)
+
+  const transcriptUpload = uploads.find(upload => /^chat2api-conversation-/.test(upload.part.filename))
+  const toolReferenceUpload = uploads.find(upload => /^chat2api-tool-reference-/.test(upload.part.filename))
+  assert.ok(transcriptUpload)
+  assert.ok(toolReferenceUpload)
+  const transcriptUrl = transcriptUpload.part.file_url.url as string
+  const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
+
+  assert.match(transcript, /ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL/)
+  assert.match(transcript, /ORIGINAL_PENDING_TASK_SENTINEL/)
+  assert.match(transcript, /ACTIVE_RESULT_0/)
+  assert.match(transcript, /ACTIVE_RESULT_93/)
+  assert.doesNotMatch(transcript, /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.match(prepared.content, /complete managed conversation transcript is attached/i)
+  assert.match(prepared.content, /COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.doesNotMatch(prepared.content, /ORIGINAL_PENDING_TASK_SENTINEL|ACTIVE_RESULT_0|ACTIVE_RESULT_93/)
+  assert.deepEqual(messages, snapshot, 'complete document fallback must not mutate caller messages')
+})
+
+test('Qwen AI managed document retry changes a first-turn inline payload', async () => {
+  const archivedHistory = `ARCHIVED_USER_HISTORY:${'x'.repeat(160_000)}:ARCHIVED_HISTORY_END`
+  const userRequest = 'FIRST_TURN_REQUEST_SENTINEL'
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'ORDINARY_SYSTEM_CONTEXT_SENTINEL',
+    },
+    createManagedToolPromptMessage(
+      'HERMES_PROTOCOL_SENTINEL\n<tools>{"name":"read_file"}</tools>',
+    ),
+    { role: 'user' as const, content: archivedHistory },
+    { role: 'assistant' as const, content: 'ARCHIVED_ASSISTANT_RESPONSE_SENTINEL' },
+    { role: 'user' as const, content: userRequest },
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: any[] = []
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any) => {
+      uploads.push(part)
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, {
+    transport: 'document',
+    managedToolCalling: true,
+  })
+
+  assert.equal(prepared.transport, 'document')
+  assert.equal(uploads.length, 1)
+  const transcriptUrl = uploads[0].file_url?.url || uploads[0].part?.file_url?.url
+  const transcript = Buffer.from(String(transcriptUrl).split(',', 2)[1], 'base64').toString('utf8')
+  assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
+  assert.match(transcript, /ARCHIVED_USER_HISTORY/)
+  assert.match(transcript, /ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/)
+  assert.doesNotMatch(
+    transcript,
+    /HERMES_PROTOCOL_SENTINEL|FIRST_TURN_REQUEST_SENTINEL/,
+  )
+  assert.match(prepared.content, /HERMES_PROTOCOL_SENTINEL/)
+  assert.match(prepared.content, /User: FIRST_TURN_REQUEST_SENTINEL/)
+  assert.match(prepared.content, /Conversation context is attached/i)
+  assert.doesNotMatch(
+    prepared.content,
+    /ORDINARY_SYSTEM_CONTEXT_SENTINEL|ARCHIVED_USER_HISTORY|ARCHIVED_HISTORY_END|ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/,
+  )
+  assert.ok(prepared.inlineUtf8Bytes < prepared.transcriptUtf8Bytes)
+  assert.deepEqual(messages, snapshot, 'managed first-turn document retry must not mutate caller messages')
 })
 
 test('Qwen AI content-hash cache reuses an in-memory transcript upload for the same account', async () => {
@@ -580,6 +813,7 @@ test('Qwen AI file upload rejects an expired request deadline before physical up
       assert.equal(error.code, 'qwen_ai_request_timeout')
       assert.equal(error.retryable, false)
       assert.equal(error.accountFault, false)
+      assert.equal(error.retryScope, undefined)
       return true
     },
   )
@@ -743,10 +977,51 @@ test('Qwen AI parse polling delay exits promptly when the client aborts', async 
   await assert.rejects(waiting, (error: any) => {
     assert.equal(error.name, 'AbortError')
     assert.equal(error.code, 'ERR_CANCELED')
+    assert.equal(error.retryScope, undefined)
     return true
   })
   assert.ok(Date.now() - startedAt < 500, 'abort must interrupt the two-second poll delay')
   assert.equal(statusRequests, 0)
+})
+
+test('Qwen AI parse-stage timeout requests account-neutral failover', async () => {
+  const previousInterval = process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS
+  const previousTimeout = process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS
+  process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS = '5'
+  process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS = '250'
+  let statusRequests = 0
+
+  try {
+    const fileId = 'parse-timeout-file'
+    const uploader = new QwenAiFileUploader({
+      post: async () => {
+        statusRequests += 1
+        return {
+          status: 200,
+          data: { data: { [fileId]: { status: 'running' } } },
+        }
+      },
+    } as any, () => ({}))
+    const startedAt = Date.now()
+
+    await assert.rejects((uploader as any).waitForParse(fileId), (error: any) => {
+      assert.equal(error.status, 504)
+      assert.equal(error.code, 'qwen_ai_file_parse_timeout')
+      assert.equal(error.retryable, false)
+      assert.equal(error.accountFault, false)
+      assert.equal(error.retryScope, 'next-account')
+      assert.match(error.message, /last status: running/)
+      return true
+    })
+
+    assert.ok(statusRequests > 0)
+    assert.ok(Date.now() - startedAt < 1_000)
+  } finally {
+    if (previousInterval === undefined) delete process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS
+    else process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS = previousInterval
+    if (previousTimeout === undefined) delete process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS
+    else process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS = previousTimeout
+  }
 })
 
 test('Qwen AI OSS upload cancels its dedicated client on client abort or deadline', async () => {

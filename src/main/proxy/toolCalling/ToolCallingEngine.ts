@@ -19,7 +19,16 @@ import {
   hasTrailingMatchedToolResultBatch,
   isToolResultMessage,
 } from './workflowHeuristics.ts'
-import { MANAGED_WORKFLOW_COMPLETE_MARKER } from './workflowCompletion.ts'
+import {
+  MANAGED_WORKFLOW_COMPLETE_MARKER,
+  requiresManagedWorkflowCompletionMarker,
+} from './workflowCompletion.ts'
+import { getToolStreamValidationFailure } from './streamValidationPolicy.ts'
+import {
+  createManagedToolPromptMessage,
+  type ManagedToolDocumentPrompt,
+} from './managedPromptMetadata.ts'
+import { createQwenHermesDocumentPrompt } from './protocols/qwenHermes.ts'
 
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
 
@@ -39,8 +48,7 @@ export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'If any requested operation remains, respond only with the next appropriate available tool call; do not describe, promise, or announce the operation instead.',
   'If a previous tool call was rejected or had schema validation errors, discard that malformed call and retry it using the declared JSON Schema exactly: include every required field, use only declared properties when the schema is strict, and preserve the declared value types.',
   'Treat progress updates and plans as incomplete.',
-  `Return a final answer only after all requested operations are complete and verified by tool results, and end that final answer with the exact marker ${MANAGED_WORKFLOW_COMPLETE_MARKER}.`,
-  'Do not emit the completion marker in a progress update or alongside a tool call.',
+  'Return a final answer only after all requested operations are complete and verified by tool results.',
 ].join(' ')
 
 const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
@@ -51,10 +59,21 @@ const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
 export function createToolWorkflowContinuationMessage(options: {
   failedToolResultPending?: boolean
   requireManagedToolCall?: boolean
-  plan?: Pick<ToolCallingPlan, 'protocol' | 'tools'>
+  plan?: Pick<
+    ToolCallingPlan,
+    | 'protocol'
+    | 'tools'
+    | 'shouldParseResponse'
+    | 'allowedToolNames'
+    | 'workflowContinuation'
+    | 'failedToolResultPending'
+  >
 } = {}): ChatMessage {
   const recoveryPrompt = (options.failedToolResultPending || options.requireManagedToolCall) && options.plan
     ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(options.plan.tools)
+    : undefined
+  const completionPrompt = options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
+    ? MANAGED_WORKFLOW_COMPLETION_PROMPT
     : undefined
 
   return {
@@ -63,6 +82,7 @@ export function createToolWorkflowContinuationMessage(options: {
       TOOL_WORKFLOW_CONTINUATION_PROMPT,
       options.failedToolResultPending ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT : undefined,
       recoveryPrompt,
+      completionPrompt,
     ].filter((part): part is string => Boolean(part)).join('\n\n'),
   }
 }
@@ -84,15 +104,17 @@ export class ToolCallingEngine {
   transformRequest(input: {
     request: ChatCompletionRequest
     provider: Provider
+    providerProfileKey?: string
     actualModel: string
     requestId?: string
   }): ToolCallingTransformResult {
-    const { request, provider, actualModel, requestId } = input
+    const { request, provider, providerProfileKey, actualModel, requestId } = input
     const adapter = getToolClientAdapter(this.config.clientAdapterId)
     const clientRequest = adapter.normalizeRequest(request)
     const plan = buildToolCallingRuntimePlan({
       requestId,
       providerId: provider.id,
+      providerProfileKey,
       actualModel,
       model: request.model,
       config: this.config,
@@ -124,8 +146,14 @@ export class ToolCallingEngine {
       }
     }
 
+    const renderedPrompt = renderPrompt(planWithWorkflow, this.config)
     return {
-      messages: injectPrompt(workflow.messages, renderPrompt(planWithWorkflow, this.config)),
+      messages: injectPrompt(
+        workflow.messages,
+        renderedPrompt.content,
+        planWithWorkflow.protocol === 'qwen_hermes',
+        renderedPrompt.documentPrompt,
+      ),
       tools: undefined,
       plan: planWithWorkflow,
     }
@@ -200,13 +228,30 @@ export class ToolCallingEngine {
     plan.diagnostics.invalidToolNames = parseResult.invalidToolNames
     plan.diagnostics.malformedReason = parseResult.malformedReason
 
-    if (deduplicated.toolCalls.length === 0) {
-      if (
-        parseResult.rawMatches.length > 0 &&
-        (plan.toolChoiceMode === 'forced' || plan.toolChoiceMode === 'required')
-      ) {
-        throw new Error('Provider returned a malformed or empty tool call block for a required tool call')
+    const validationFailure = getToolStreamValidationFailure({
+      plan,
+      emittedToolCall: deduplicated.toolCalls.length > 0,
+      pendingToolProtocol: parseResult.rawMatches.length > 0,
+    })
+    if (validationFailure) {
+      const error = new Error(validationFailure.message) as Error & {
+        status?: number
+        type?: string
+        param?: string
+        code?: string
+        retryable?: boolean
+        accountFault?: boolean
       }
+      error.status = 422
+      error.type = validationFailure.type
+      error.param = validationFailure.param
+      error.code = validationFailure.code
+      error.retryable = false
+      error.accountFault = false
+      throw error
+    }
+
+    if (deduplicated.toolCalls.length === 0) {
       if (parseResult.rawMatches.length > 0) {
         message.content = parseResult.content || null
       }
@@ -287,7 +332,14 @@ function appendToolWorkflowContinuation(
   return {
     messages: [
       ...messages,
-      createToolWorkflowContinuationMessage({ failedToolResultPending, plan }),
+      createToolWorkflowContinuationMessage({
+        failedToolResultPending,
+        plan: {
+          ...plan,
+          workflowContinuation: true,
+          failedToolResultPending,
+        },
+      }),
     ],
     appended: true,
   }
@@ -421,22 +473,35 @@ function safeContentPartTypes(content: ChatMessage['content']): string[] {
 function renderPrompt(
   plan: ToolCallingPlan,
   config: ToolCallingConfig,
-): string {
-  const protocolPrompt = getToolProtocol(plan.protocol).renderPrompt(plan.tools)
+): { content: string; documentPrompt?: ManagedToolDocumentPrompt } {
   const policyPrompt = renderToolChoicePolicyPrompt(plan)
-  const completionPrompt = plan.providerId === 'qwen-ai' && plan.allowedToolNames.size > 0
+  const completionPrompt = requiresManagedWorkflowCompletionMarker(plan)
     ? MANAGED_WORKFLOW_COMPLETION_PROMPT
     : ''
-  const prompt = [protocolPrompt, policyPrompt, completionPrompt].filter(Boolean).join('\n\n')
   const customPromptTemplate = config.diagnosticsEnabled
     ? config.advanced.customPromptTemplate
     : undefined
-  if (!customPromptTemplate) return prompt
+  const finishPrompt = (protocolPrompt: string): string => {
+    const prompt = [protocolPrompt, policyPrompt, completionPrompt].filter(Boolean).join('\n\n')
+    if (!customPromptTemplate) return prompt
 
-  return customPromptTemplate
-    .replace(/\{\{tools\}\}/g, prompt)
-    .replace(/\{\{tool_names\}\}/g, plan.tools.map((tool) => tool.name).join(', '))
-    .replace(/\{\{format\}\}/g, plan.protocol)
+    return customPromptTemplate
+      .replace(/\{\{tools\}\}/g, prompt)
+      .replace(/\{\{tool_names\}\}/g, plan.tools.map((tool) => tool.name).join(', '))
+      .replace(/\{\{format\}\}/g, plan.protocol)
+  }
+
+  const content = finishPrompt(getToolProtocol(plan.protocol).renderPrompt(plan.tools))
+  if (plan.protocol !== 'qwen_hermes') return { content }
+
+  const documentVariant = createQwenHermesDocumentPrompt(plan.tools)
+  return {
+    content,
+    documentPrompt: {
+      content: finishPrompt(documentVariant.compactPrompt),
+      referenceContent: documentVariant.referenceContent,
+    },
+  }
 }
 
 function renderToolChoicePolicyPrompt(plan: ToolCallingPlan): string {
@@ -459,7 +524,22 @@ function renderToolChoicePolicyPrompt(plan: ToolCallingPlan): string {
   return ''
 }
 
-function injectPrompt(messages: ChatMessage[], prompt: string): ChatMessage[] {
+function injectPrompt(
+  messages: ChatMessage[],
+  prompt: string,
+  keepPromptSeparate: boolean,
+  documentPrompt?: ManagedToolDocumentPrompt,
+): ChatMessage[] {
+  if (keepPromptSeparate) {
+    const firstNonSystemIndex = messages.findIndex(message => message.role !== 'system')
+    const insertionIndex = firstNonSystemIndex === -1 ? messages.length : firstNonSystemIndex
+    return [
+      ...messages.slice(0, insertionIndex),
+      createManagedToolPromptMessage(prompt, documentPrompt),
+      ...messages.slice(insertionIndex),
+    ]
+  }
+
   const [first, ...rest] = messages
   if (first?.role === 'system' && typeof first.content === 'string') {
     return [{ ...first, content: `${first.content}\n\n${prompt}` }, ...rest]

@@ -13,6 +13,7 @@ export interface ChatRequestIntentInfo {
   signals: string[]
   messageCount: number
   toolCount: number
+  toolResultCount: number
   textChars: number
   lastUserTextChars: number
   lastUserTextPrefix?: string
@@ -36,6 +37,18 @@ function contentToText(content: ChatMessage['content']): string {
 
 function messageText(message: ChatMessage): string {
   return contentToText(message.content)
+}
+
+function messageToolResultCount(message: ChatMessage): number {
+  const nestedCount = Array.isArray(message.content)
+    ? message.content.filter(part => (
+        Boolean(part)
+        && typeof part === 'object'
+        && (part as { type?: unknown }).type === 'tool_result'
+      )).length
+    : 0
+  if (nestedCount > 0) return nestedCount
+  return message.role === 'tool' || Boolean(message.tool_call_id) ? 1 : 0
 }
 
 function redactPrefix(value: string): string {
@@ -231,12 +244,19 @@ function isCompleteCompactionInstruction(signals: string[]): boolean {
     && signals.includes('terminal_summary_requested')
 }
 
-function classifyTerminalText(messages: ChatMessage[]): { matched: boolean; signals: string[] } {
+function classifyTerminalText(
+  messages: ChatMessage[],
+  toolResultCount: number,
+): { matched: boolean; signals: string[] } {
   const terminal = messages.slice(-4)
   const lastUserText = [...messages].reverse().find(message => message.role === 'user')
   const lastUser = lastUserText ? messageText(lastUserText) : ''
   const signals = compactionInstructionSignals(lastUser)
   const hasTerminalCompactionInstruction = isCompleteCompactionInstruction(signals)
+  const hasToolHistorySummaryInstruction = toolResultCount > 0
+    && signals.includes('terminal_text_only')
+    && signals.includes('terminal_summary_requested')
+  if (hasToolHistorySummaryInstruction) signals.push('terminal_tool_history')
   const continuationAfterInstruction = isShortContinuation(lastUser)
     && terminal.slice(0, -1).some(message => (
       isCompleteCompactionInstruction(compactionInstructionSignals(messageText(message)))
@@ -244,17 +264,18 @@ function classifyTerminalText(messages: ChatMessage[]): { matched: boolean; sign
 
   if (continuationAfterInstruction) signals.push('continuation_after_compaction_instruction')
   return {
-    matched: hasTerminalCompactionInstruction || continuationAfterInstruction,
+    matched: hasTerminalCompactionInstruction
+      || hasToolHistorySummaryInstruction
+      || continuationAfterInstruction,
     signals,
   }
 }
 
 /**
  * Detect the protocol-level context summary request emitted by Claude Code
- * through LiteLLM. The classifier uses structural instructions (text-only,
- * tool prohibition, and a summary of conversation/history), rather than a
- * fixed prompt or a fixed message/token count. Deployments can disable it or
- * add a pattern with environment configuration.
+ * through LiteLLM. The classifier uses structural instructions and tool-result
+ * history rather than a fixed prompt or a fixed message/token count.
+ * Deployments can disable it or add a pattern with environment configuration.
  */
 export function classifyChatRequest(request: ChatCompletionRequest): ChatRequestIntentInfo {
   const messages = Array.isArray(request.messages) ? request.messages : []
@@ -265,6 +286,10 @@ export function classifyChatRequest(request: ChatCompletionRequest): ChatRequest
     .find(message => message.role === 'user')
   const lastUserText = lastUser ? messageText(lastUser) : ''
   const toolCount = Array.isArray(request.tools) ? request.tools.length : 0
+  const toolResultCount = messages.reduce(
+    (total, message) => total + messageToolResultCount(message),
+    0,
+  )
   const textChars = messageTexts.reduce((total, value) => total + value.length, 0)
   const signals: string[] = []
 
@@ -275,6 +300,7 @@ export function classifyChatRequest(request: ChatCompletionRequest): ChatRequest
       signals,
       messageCount: messages.length,
       toolCount,
+      toolResultCount,
       textChars,
       lastUserTextChars: lastUserText.length,
       lastUserTextPrefix: redactPrefix(lastUserText),
@@ -282,7 +308,7 @@ export function classifyChatRequest(request: ChatCompletionRequest): ChatRequest
   }
 
   const explicit = explicitCompactionMarker(request, allText)
-  const terminal = classifyTerminalText(messages)
+  const terminal = classifyTerminalText(messages, toolResultCount)
   signals.push(...explicit.signals, ...terminal.signals)
 
   const isCompaction = explicit.matched || terminal.matched
@@ -293,7 +319,9 @@ export function classifyChatRequest(request: ChatCompletionRequest): ChatRequest
     : terminal.matched
       ? terminal.signals.includes('continuation_after_compaction_instruction')
         ? 'continuation_after_compaction_instruction'
-        : 'text_only_tool_prohibition_summary'
+        : terminal.signals.includes('terminal_tool_history')
+          ? 'text_only_summary_with_tool_history'
+          : 'text_only_tool_prohibition_summary'
       : 'no_compaction_signal'
 
   return {
@@ -302,6 +330,7 @@ export function classifyChatRequest(request: ChatCompletionRequest): ChatRequest
     signals,
     messageCount: messages.length,
     toolCount,
+    toolResultCount,
     textChars,
     lastUserTextChars: lastUserText.length,
     lastUserTextPrefix: redactPrefix(lastUserText),

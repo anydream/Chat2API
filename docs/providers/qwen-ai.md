@@ -10,14 +10,13 @@
 
 ## 默认模型
 
-内置默认模型使用当前 Qwen AI 官方模型清单。Qwen3.8-Max-Preview 是当前旗舰预览模型，其官方元数据要求始终启用思考模式。
+内置默认模型使用当前 Qwen AI 官方模型清单。`Qwen3.8-Max` 会映射到 `qwen3.8-max`；Preview 模型仅在客户端明确选择对应名称时使用。
 
 | 显示名称 | 实际模型 ID |
 | --- | --- |
-| Qwen3.8-Max-Preview | qwen3.8-max-preview |
+| Qwen3.8-Max | qwen3.8-max |
 | Qwen3.7-Plus | qwen3.7-plus |
 | Qwen3.7-Max | qwen3.7-max |
-| Qwen3.6-Plus | qwen3.6-plus |
 
 ## 其他官网模型
 

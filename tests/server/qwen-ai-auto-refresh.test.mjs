@@ -103,6 +103,7 @@ test('Qwen AI adapter refreshes expiring web tokens by signing in with saved ema
   assert.match(adapterSource, /createOptions: \(\) => Record<string, any>/)
   assert.match(adapterSource, /resolveQwenAiAuthHeaders\(token, cookies\)/)
   assert.match(refresherSource, /async refreshIfNeeded\(account: Account, signal\?: AbortSignal\)/)
+  assert.match(refresherSource, /async repairWebSession\(account: Account, signal\?: AbortSignal\)/)
   assert.match(refresherSource, /async refreshAfterUnauthorized\(account: Account, signal\?: AbortSignal\)/)
   assert.match(refresherSource, /timeout:\s*15000,\s*signal,/)
   assert.match(adapterSource, /const chatType = imageGeneration\?\.chatType \?\? 't2t'/)
@@ -165,6 +166,31 @@ test('Qwen AI keeps a fresh desktop JWT that has no web cookies', async () => {
 
   assert.equal(result, account)
   assert.equal(signInCalls, 0)
+})
+
+test('Qwen AI explicitly repairs a web session that has no cookies yet', async () => {
+  let signInCalls = 0
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    post: async () => {
+      signInCalls += 1
+      return {
+        status: 200,
+        data: { data: { token: 'refreshed-jwt' } },
+        headers: { 'set-cookie': ['token=session-cookie; Path=/; HttpOnly'] },
+      }
+    },
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: '',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  const result = await new QwenAiTokenRefresher().repairWebSession(account)
+
+  assert.equal(signInCalls, 1)
+  assert.equal(result.credentials.cookies, 'token=session-cookie')
 })
 
 test('Qwen AI authentication mode is selected from the actual session credential', () => {

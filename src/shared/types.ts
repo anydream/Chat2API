@@ -84,6 +84,11 @@ export interface QwenAiGovernorAccountStatus {
   loadBalancerReason?: string
   loadBalancerFailures: number
   recentFailover?: QwenAiAccountFailoverRecord
+  /** Whether the stored cookies contain the Qwen Web session token used for routing. */
+  webSessionReady?: boolean
+  webSessionRepairable?: boolean
+  webSessionRepairState?: 'ready' | 'pending' | 'repairing' | 'backoff' | 'unrepairable'
+  webSessionNextAttemptAt?: number
 }
 
 export interface QwenAiGovernorStatus {
@@ -111,6 +116,12 @@ export interface QwenAiGovernorStatus {
   globalRecoveryNextInMs: number
   recentRiskEvents: number
   recentRiskAccounts: number
+  sessionRepair?: {
+    running: boolean
+    inFlightAccountId?: string
+    nextRunAt?: number
+    globalPauseUntil?: number
+  }
   accounts: QwenAiGovernorAccountStatus[]
 }
 

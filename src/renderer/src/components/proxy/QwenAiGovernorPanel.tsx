@@ -418,12 +418,18 @@ export function QwenAiGovernorPanel() {
 
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
+          <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-2">
               <ShieldAlert className="h-5 w-5 text-primary" />
               <CardTitle>{t('proxy.qwenGovernor.accountStatus')}</CardTitle>
             </div>
-            <Button variant="outline" size="sm" onClick={handleClearAll} disabled={accounts.length === 0}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full justify-center sm:w-auto"
+              onClick={handleClearAll}
+              disabled={accounts.length === 0}
+            >
               <Trash2 className="mr-2 h-4 w-4" />
               {t('proxy.qwenGovernor.clearAllCooldowns')}
             </Button>
@@ -432,11 +438,12 @@ export function QwenAiGovernorPanel() {
         </CardHeader>
         <CardContent>
           <div className="overflow-x-auto">
-          <Table className="min-w-[1280px]">
+          <Table className="min-w-[1380px]">
             <TableHeader>
               <TableRow>
                 <TableHead>{t('providers.accountName')}</TableHead>
                 <TableHead>{t('providers.status')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.webSession')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.queue')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.nextAvailable')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.priorityRecovery')}</TableHead>
@@ -449,7 +456,7 @@ export function QwenAiGovernorPanel() {
             <TableBody>
               {accounts.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-8 text-center text-muted-foreground">
+                  <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">
                     {t('proxy.qwenGovernor.noAccounts')}
                   </TableCell>
                 </TableRow>
@@ -475,6 +482,26 @@ export function QwenAiGovernorPanel() {
                       <Badge variant={account.status === 'active' ? 'default' : 'secondary'}>
                         {account.status}
                       </Badge>
+                    </TableCell>
+                    <TableCell>
+                      {account.webSessionRepairState ? (
+                        <div className="space-y-1">
+                          <Badge
+                            variant={account.webSessionRepairState === 'ready'
+                              ? 'default'
+                              : account.webSessionRepairState === 'unrepairable'
+                                ? 'destructive'
+                                : 'secondary'}
+                          >
+                            {t(`proxy.qwenGovernor.webSessionStates.${account.webSessionRepairState}`)}
+                          </Badge>
+                          {account.webSessionNextAttemptAt && account.webSessionNextAttemptAt > Date.now() ? (
+                            <p className="text-xs text-muted-foreground">
+                              {formatTimestamp(account.webSessionNextAttemptAt)}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : <span>-</span>}
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">

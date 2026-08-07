@@ -486,13 +486,22 @@ function isQwenRiskControlText(value: string | undefined): boolean {
 
 function qwenAiRetryCountFromEnv(recoverManagedToolStream: boolean): number {
   const raw = process.env.CHAT2API_QWEN_AI_RETRY_COUNT
-  // Capacity/risk failover must get a bounded second account attempt even
-  // for ordinary streaming requests; otherwise a mid-stream 429 is exposed
-  // directly to Claude as an API error.
-  if (raw === undefined) return recoverManagedToolStream ? 20 : 20
+  const fallback = recoverManagedToolStream ? 1 : 0
+  // Managed protocol correction is bounded. Deterministic parse/schema
+  // failures are surfaced as 4xx and never consume this retry budget.
+  if (raw === undefined || raw.trim() === '') return fallback
 
   const value = Number(raw)
-  return Number.isInteger(value) && value >= 0 && value <= 100 ? value : 0
+  if (!Number.isSafeInteger(value) || value < 0) return fallback
+  return value
+}
+
+function qwenAiBusyRetryCountFromEnv(): number {
+  const raw = process.env.CHAT2API_QWEN_AI_BUSY_RETRY_COUNT
+  if (raw === undefined || raw.trim() === '') return 1
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < 0) return 1
+  return value
 }
 
 function qwenAiValidatedStreamMaxBytesFromEnv(): number {
@@ -775,7 +784,7 @@ export function prepareQwenAiCompactionRequest(
 }
 
 type ProviderForwarder = {
-  name: string
+  profileKey: string
   matches: (provider: Provider) => boolean
   forward: (
     request: ChatCompletionRequest,
@@ -808,31 +817,31 @@ export class RequestForwarder {
 
   private readonly providerForwarders: ProviderForwarder[] = [
     {
-      name: 'deepseek',
+      profileKey: 'deepseek',
       matches: DeepSeekAdapter.isDeepSeekProvider,
       forward: (request, account, provider, actualModel, startTime, context) =>
         this.forwardDeepSeek(request, account, provider, actualModel, startTime, context),
     },
     {
-      name: 'glm',
+      profileKey: 'glm',
       matches: GLMAdapter.isGLMProvider,
       forward: (request, account, provider, actualModel, startTime) =>
         this.forwardGLM(request, account, provider, actualModel, startTime),
     },
     {
-      name: 'kimi',
+      profileKey: 'kimi',
       matches: KimiAdapter.isKimiProvider,
       forward: (request, account, provider, actualModel, startTime, context) =>
         this.forwardKimi(request, account, provider, actualModel, startTime, context),
     },
     {
-      name: 'qwen',
+      profileKey: 'qwen',
       matches: QwenAdapter.isQwenProvider,
       forward: (request, account, provider, actualModel, startTime) =>
         this.forwardQwen(request, account, provider, actualModel, startTime),
     },
     {
-      name: 'qwen-ai',
+      profileKey: 'qwen-ai',
       matches: QwenAiAdapter.isQwenAiProvider,
       forward: (request, account, provider, actualModel, startTime, context, options) =>
         this.forwardQwenAiGoverned(
@@ -846,25 +855,25 @@ export class RequestForwarder {
         ),
     },
     {
-      name: 'zai',
+      profileKey: 'zai',
       matches: ZaiAdapter.isZaiProvider,
       forward: (request, account, provider, actualModel, startTime) =>
         this.forwardZai(request, account, provider, actualModel, startTime),
     },
     {
-      name: 'minimax',
+      profileKey: 'minimax',
       matches: MiniMaxAdapter.isMiniMaxProvider,
       forward: (request, account, provider, actualModel, startTime) =>
         this.forwardMiniMax(request, account, provider, actualModel, startTime),
     },
     {
-      name: 'mimo',
+      profileKey: 'mimo',
       matches: MimoAdapter.isMimoProvider,
       forward: (request, account, provider, actualModel, startTime) =>
         this.forwardMimo(request, account, provider, actualModel, startTime),
     },
     {
-      name: 'perplexity',
+      profileKey: 'perplexity',
       matches: PerplexityAdapter.isPerplexityProvider,
       forward: (request, account, provider, actualModel, startTime) =>
         this.forwardPerplexity(request, account, provider, actualModel, startTime),
@@ -882,6 +891,9 @@ export class RequestForwarder {
   ): ToolCallingTransformResult {
     const config = storeManager.getConfig().toolCallingConfig
     const engine = new ToolCallingEngine(config)
+    const providerProfileKey = provider
+      ? this.matchProviderForwarder(provider)?.profileKey
+      : undefined
 
     return engine.transformRequest({
       request,
@@ -896,8 +908,13 @@ export class RequestForwarder {
         createdAt: 0,
         updatedAt: 0,
       },
+      providerProfileKey,
       actualModel: request.model,
     })
+  }
+
+  private matchProviderForwarder(provider: Provider): ProviderForwarder | undefined {
+    return this.providerForwarders.find(forwarder => forwarder.matches(provider))
   }
 
   private applyToolCallsToResponse(result: any, transformed: ToolCallingTransformResult): void {
@@ -1026,6 +1043,7 @@ export class RequestForwarder {
       model: request.model,
       messageCount: request.messages?.length || 0,
       toolCount: request.tools?.length || 0,
+      toolResultCount: requestIntentInfo.toolResultCount,
       textChars: requestIntentInfo.textChars,
       reason: requestIntentInfo.reason,
       signals: requestIntentInfo.signals,
@@ -1122,7 +1140,9 @@ export class RequestForwarder {
       const observedAt = Date.now()
       const delayMs = qwenAiUpstreamBusyRetryDelayMs(result, qwenAiBusyRetries)
       const remainingBudgetMs = Math.max(0, qwenAiRequestDeadline - observedAt)
-      const willRetry = !context.signal?.aborted
+      const retryLimit = qwenAiBusyRetryCountFromEnv()
+      const willRetry = qwenAiBusyRetries < retryLimit
+        && !context.signal?.aborted
         && observedAt + delayMs < qwenAiRequestDeadline
       const nextMessageTransport: QwenAiMessageTransport = qwenAiMessageTransport === 'inline'
         ? 'document'
@@ -1145,7 +1165,9 @@ export class RequestForwarder {
           ? 'client_aborted'
           : willRetry
             ? undefined
-            : 'request_budget_exhausted',
+            : qwenAiBusyRetries >= retryLimit
+              ? 'retry_limit_exhausted'
+              : 'request_budget_exhausted',
       }))
       if (!willRetry) return false
 
@@ -1170,10 +1192,7 @@ export class RequestForwarder {
         && !recoveryBypassUsed
         && (
           previousRecoveryHint === 'managed_tool_stream_validation'
-          || (
-            qwenAiBusyRetries > 0
-            && qwenAiMessageTransport === 'document'
-          )
+          || qwenAiBusyRetries > 0
         )
       if (useRecoveryBypass) {
         recoveryBypassUsed = true
@@ -1439,7 +1458,7 @@ export class RequestForwarder {
   ): Promise<ForwardResult> {
     const startTime = Date.now()
 
-    const dedicatedForwarder = this.providerForwarders.find(forwarder => forwarder.matches(provider))
+    const dedicatedForwarder = this.matchProviderForwarder(provider)
     if (dedicatedForwarder) {
       return dedicatedForwarder.forward(request, account, provider, actualModel, startTime, context, options)
     }
@@ -3005,6 +3024,7 @@ export class RequestForwarder {
         requestId: context?.requestId,
         messageCount: intentInfo.messageCount,
         toolCountBefore: intentInfo.toolCount,
+        toolResultCount: intentInfo.toolResultCount,
         toolCountAfter: Array.isArray(providerRequest.tools) ? providerRequest.tools.length : 0,
         toolChoiceAfter: providerRequest.tool_choice ?? 'unset',
         textChars: intentInfo.textChars,
@@ -3045,6 +3065,8 @@ export class RequestForwarder {
             ? Boolean(providerRequest.reasoning_effort)
             : undefined,
         thinking_budget: providerRequest.thinking_budget,
+        managedToolCalling: transformed.plan.shouldParseResponse,
+        managedToolWorkflowContinuation: transformed.plan.workflowContinuation,
         image_generation: providerRequest.image_generation,
         signal: context?.signal,
         deadlineAt: options.requestDeadlineAt,
@@ -3124,6 +3146,7 @@ export class RequestForwarder {
                   || recoveryCode === 'qwen_ai_invalid_tool_arguments'
                   || recoveryCode === 'undeclared_native_tool_call'
                   || recoveryCode === 'malformed_tool_call'
+                  || recoveryCode === 'missing_tool_call'
                 const workflowContinuationMessage = createToolWorkflowContinuationMessage({
                   failedToolResultPending: transformed.plan.failedToolResultPending,
                   requireManagedToolCall,
@@ -3180,6 +3203,7 @@ export class RequestForwarder {
                       ? Boolean(providerRequest.reasoning_effort)
                       : undefined,
                   thinking_budget: providerRequest.thinking_budget,
+                  managedToolCalling: true,
                   signal: recoverySignal || context?.signal,
                 })
               },

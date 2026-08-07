@@ -6,6 +6,10 @@ import mime from 'mime-types'
 import path from 'path'
 import type { ChatMessage, ChatMessageContent } from '../types.ts'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import {
+  getManagedToolDocumentPrompt,
+  isManagedToolPromptMessage,
+} from '../toolCalling/managedPromptMetadata.ts'
 import { getRuntime } from '../../runtime/index.ts'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
@@ -19,8 +23,6 @@ const QWEN_AI_FILE_CACHE_TTL_MS = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_TTL
 const QWEN_AI_FILE_CACHE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_MAX_ENTRIES', 512)
 const QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS = positiveIntegerFromEnv('QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS', 60 * 60 * 1000)
 const QWEN_AI_DIRECT_FILE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_DIRECT_FILE_MAX_ENTRIES', 512)
-const PARSE_POLL_INTERVAL_MS = 2000
-const PARSE_POLL_TIMEOUT_MS = 120000
 const DOCUMENT_EVIDENCE_MAX_TEXT_BYTES = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_TEXT_BYTES', 32 * 1024 * 1024)
 const DOCUMENT_EVIDENCE_MAX_TOTAL_CHARS = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_TOTAL_CHARS', 24000)
 const DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS', 12000)
@@ -160,9 +162,14 @@ interface QwenStsInfo {
 export interface PreparedQwenAiMessage {
   content: string
   files: any[]
+  transport: QwenAiMessageTransport
+  managedDocumentMode?: QwenAiManagedDocumentMode
+  transcriptUtf8Bytes: number
+  inlineUtf8Bytes: number
 }
 
 export type QwenAiMessageTransport = 'inline' | 'document'
+export type QwenAiManagedDocumentMode = 'hybrid' | 'complete'
 
 export interface QwenAiFileOperationOptions {
   signal?: AbortSignal
@@ -171,6 +178,12 @@ export interface QwenAiFileOperationOptions {
 
 export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperationOptions {
   transport?: QwenAiMessageTransport
+  managedToolCalling?: boolean
+  workflowContinuation?: boolean
+  /** Force the managed document layout. Undefined starts hybrid and escalates when needed. */
+  managedDocumentMode?: QwenAiManagedDocumentMode
+  /** Target for automatic document offload. Zero disables automatic offload. */
+  requestMaxBytes?: number
 }
 
 export interface QwenAiFileUploadPartOptions extends QwenAiFileOperationOptions {
@@ -333,6 +346,14 @@ function positiveIntegerFromEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
 }
 
+function qwenAiFileParsePollIntervalMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS', 2000)
+}
+
+function qwenAiFileParseTimeoutMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_TIMEOUT_MS', 120000)
+}
+
 function boundedPositiveIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, positiveIntegerFromEnv(name, fallback)))
 }
@@ -350,6 +371,7 @@ type QwenAiFileOperationError = Error & {
   code?: string
   retryable?: boolean
   accountFault?: boolean
+  retryScope?: 'next-account'
 }
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647
@@ -374,6 +396,22 @@ function createQwenAiFileAbortError(): QwenAiFileOperationError {
   error.code = 'ERR_CANCELED'
   error.retryable = false
   error.accountFault = false
+  return error
+}
+
+function createQwenAiFileParseTimeoutError(
+  timeoutMs: number,
+  lastStatus: string,
+): QwenAiFileOperationError {
+  const statusDetail = lastStatus ? ` (last status: ${lastStatus})` : ''
+  const error = new Error(
+    `Qwen AI file parse timed out after ${timeoutMs}ms${statusDetail}`,
+  ) as QwenAiFileOperationError
+  error.status = 504
+  error.code = 'qwen_ai_file_parse_timeout'
+  error.retryable = false
+  error.accountFault = false
+  error.retryScope = 'next-account'
   return error
 }
 
@@ -1300,7 +1338,7 @@ function isQwenToolResultMessage(message: ChatMessage): boolean {
 
 function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
   const transcriptMessages = messages
-  const toolProfile = getProviderToolProfile('qwen')
+  const toolProfile = getProviderToolProfile('qwen-ai')
   const transcriptParts: string[] = []
   const fileParts: ChatMessageContent[] = []
   const usedLocalToolCallIds = new Set<string>()
@@ -1338,14 +1376,11 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
     const pending = pendingLocalIds.get(rawToolCallId) ?? []
     const localId = pending[0] ?? rawToolCallId
     pendingLocalIds.set(rawToolCallId, pending.slice(1))
-    transcriptParts.push([
-      toolProfile.formatToolResult({
-        toolCallId: localId,
-        content: resultText,
-        isError,
-      }),
-      'Use this result to decide the next step.',
-    ].join('\n'))
+    transcriptParts.push(toolProfile.formatToolResult({
+      toolCallId: localId,
+      content: resultText,
+      isError,
+    }))
   }
 
   for (let messageIndex = 0; messageIndex < transcriptMessages.length; messageIndex += 1) {
@@ -1428,6 +1463,111 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
 
 function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
   return renderQwenAiTranscript(messages)
+}
+
+function partitionQwenAiManagedMessages(
+  messages: ChatMessage[],
+  workflowContinuation: boolean,
+  documentMode: QwenAiManagedDocumentMode,
+): {
+  archiveMessages: ChatMessage[]
+  activeMessages: ChatMessage[]
+  toolReferenceContents: string[]
+} {
+  let leadingSystemCount = 0
+  while (messages[leadingSystemCount]?.role === 'system') {
+    leadingSystemCount += 1
+  }
+
+  const leadingSystemMessages = messages.slice(0, leadingSystemCount)
+  const managedPromptMessages = leadingSystemMessages.filter(isManagedToolPromptMessage)
+  const toolReferenceContents: string[] = []
+  const inlineManagedPromptMessages = managedPromptMessages.map((message) => {
+    const documentPrompt = getManagedToolDocumentPrompt(message)
+    if (!documentPrompt) return message
+
+    toolReferenceContents.push(documentPrompt.referenceContent)
+    return { ...message, content: documentPrompt.content }
+  })
+  const ordinarySystemMessages = leadingSystemMessages.filter(message => (
+    !isManagedToolPromptMessage(message)
+  ))
+
+  if (documentMode === 'complete') {
+    return {
+      archiveMessages: [
+        ...ordinarySystemMessages,
+        ...messages.slice(leadingSystemCount),
+      ],
+      activeMessages: inlineManagedPromptMessages,
+      toolReferenceContents,
+    }
+  }
+
+  let activeStartIndex = messages.length
+  for (let index = messages.length - 1; index >= leadingSystemCount; index -= 1) {
+    const message = messages[index]
+    if (message.role === 'user' && !isQwenToolResultMessage(message)) {
+      activeStartIndex = index
+      break
+    }
+  }
+
+  if (workflowContinuation) {
+    let includedToolExchange = false
+    for (let index = activeStartIndex - 1; index >= leadingSystemCount; index -= 1) {
+      const message = messages[index]
+      const isAssistantToolCall = message.role === 'assistant'
+        && Boolean(message.tool_calls?.length)
+      if (isQwenToolResultMessage(message) || isAssistantToolCall) {
+        activeStartIndex = index
+        includedToolExchange = true
+        continue
+      }
+      if (
+        includedToolExchange
+        && message.role === 'user'
+        && !isQwenToolResultMessage(message)
+      ) {
+        activeStartIndex = index
+      }
+      break
+    }
+  }
+
+  const archiveMessages = [
+    ...ordinarySystemMessages,
+    ...messages.slice(leadingSystemCount, activeStartIndex),
+  ]
+  const activeMessages = [
+    ...inlineManagedPromptMessages,
+    ...messages.slice(activeStartIndex),
+  ]
+  return { archiveMessages, activeMessages, toolReferenceContents }
+}
+
+function renderQwenAiManagedDocumentContext(
+  messages: ChatMessage[],
+  documentMode: QwenAiManagedDocumentMode,
+): string {
+  const activeContext = renderQwenAiTranscript(messages).content
+  if (!activeContext) return ''
+
+  const label = documentMode === 'complete'
+    ? 'Managed tool control'
+    : 'Active managed tool context'
+  return [
+    documentMode === 'complete'
+      ? 'Follow this inline managed-tool control and use the attached transcript for the complete conversation and current task.'
+      : 'Follow this inline control context and use the attached transcript for the archived conversation context.',
+    `[${label}]`,
+    activeContext,
+    `[/${label}]`,
+  ].join('\n')
+}
+
+function qwenAiJsonStringUtf8Bytes(content: string): number {
+  return Buffer.byteLength(JSON.stringify(content), 'utf8')
 }
 
 function validateSupportedParts(content: ChatMessageContent[]): void {
@@ -2349,7 +2489,9 @@ export class QwenAiFileUploader {
     options: QwenAiFileOperationOptions = {},
   ): Promise<void> {
     throwIfQwenAiFileOperationStopped(options)
-    const parseDeadlineAt = Date.now() + PARSE_POLL_TIMEOUT_MS
+    const parsePollIntervalMs = qwenAiFileParsePollIntervalMsFromEnv()
+    const parseTimeoutMs = qwenAiFileParseTimeoutMsFromEnv()
+    const parseDeadlineAt = Date.now() + parseTimeoutMs
     const requestDeadlineAt = operationDeadlineAt(options)
     const pollingDeadlineAt = requestDeadlineAt === undefined
       ? parseDeadlineAt
@@ -2357,7 +2499,7 @@ export class QwenAiFileUploader {
     let lastStatus = ''
 
     while (Date.now() < pollingDeadlineAt) {
-      const waitMs = Math.min(PARSE_POLL_INTERVAL_MS, pollingDeadlineAt - Date.now())
+      const waitMs = Math.min(parsePollIntervalMs, pollingDeadlineAt - Date.now())
       await delay(waitMs, options)
       throwIfQwenAiFileOperationStopped(options)
       if (Date.now() >= pollingDeadlineAt) break
@@ -2397,9 +2539,7 @@ export class QwenAiFileUploader {
     }
 
     throwIfQwenAiFileOperationStopped(options)
-    throw new Error(
-      `Qwen AI file parse timed out after ${PARSE_POLL_TIMEOUT_MS}ms${lastStatus ? ` (last status: ${lastStatus})` : ''}`,
-    )
+    throw createQwenAiFileParseTimeoutError(parseTimeoutMs, lastStatus)
   }
 
   private async postJson(
@@ -2431,12 +2571,12 @@ export class QwenAiFileUploader {
   }
 }
 
-function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
+function createQwenAiTextDocument(prefix: string, content: string): ChatMessageContent {
   const data = Buffer.from(content, 'utf8')
   const contentHash = createHash('sha256').update(data).digest('hex')
   return {
     type: 'file',
-    filename: `chat2api-conversation-${contentHash.slice(0, 16)}.txt`,
+    filename: `${prefix}-${contentHash.slice(0, 16)}.txt`,
     mime_type: 'text/plain',
     file_url: {
       url: `data:text/plain;base64,${data.toString('base64')}`,
@@ -2444,11 +2584,41 @@ function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
   }
 }
 
+function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
+  return createQwenAiTextDocument('chat2api-conversation', content)
+}
+
+function createQwenAiToolReferenceDocument(content: string): ChatMessageContent {
+  return createQwenAiTextDocument('chat2api-tool-reference', content)
+}
+
 function qwenAiTranscriptDocumentInstruction(filename: string): string {
   return [
     `The complete conversation transcript is attached as ${filename}.`,
     'Read the attachment in full and treat it as the authoritative conversation context.',
     'Preserve every role, system instruction, tool declaration, tool call, tool result, and original attachment, then continue the final pending user task.',
+  ].join(' ')
+}
+
+function qwenAiEarlierTranscriptDocumentInstruction(filename: string): string {
+  return [
+    `Conversation context is attached as ${filename}.`,
+    'Read it first, then follow the active managed-tool protocol and current turn context provided inline below.',
+  ].join(' ')
+}
+
+function qwenAiCompleteManagedTranscriptDocumentInstruction(filename: string): string {
+  return [
+    `The complete managed conversation transcript is attached as ${filename}.`,
+    'Read it in full and treat its final event as the current workflow state, including the pending user task and every completed tool result.',
+    'Use the inline managed-tool control for any next tool call, and do not repeat work already completed in the transcript.',
+  ].join(' ')
+}
+
+function qwenAiToolReferenceDocumentInstruction(filename: string): string {
+  return [
+    `Complete tool definitions are attached as ${filename}.`,
+    'The inline tool catalog is optimized for routing and argument construction; consult the attachment whenever additional tool semantics or schema annotations are needed.',
   ].join(' ')
 }
 
@@ -2460,16 +2630,81 @@ export async function prepareQwenAiMultimodalMessage(
   throwIfQwenAiFileOperationStopped(options)
   const { content: userContent, fileParts } = buildQwenAiTranscript(messages)
   const uniqueFileParts = deduplicateQwenFileParts(fileParts)
-  const transport = options.transport ?? 'inline'
-  const transcriptDocument = transport === 'document'
-    ? createQwenAiTranscriptDocument(userContent)
-    : undefined
-  const uploadedParts = transcriptDocument
-    ? [...uniqueFileParts, transcriptDocument]
-    : uniqueFileParts
-  const inlineContent = transcriptDocument
-    ? qwenAiTranscriptDocumentInstruction(transcriptDocument.filename || 'the attached transcript')
-    : userContent
+  const transcriptUtf8Bytes = qwenAiJsonStringUtf8Bytes(userContent)
+  const requestedTransport = options.transport ?? 'inline'
+  const requestMaxBytes = Math.max(0, Math.floor(options.requestMaxBytes ?? 0))
+  const shouldUseDocument = requestedTransport === 'document'
+    || (requestMaxBytes > 0 && transcriptUtf8Bytes > requestMaxBytes)
+  let generatedDocuments: ChatMessageContent[] = []
+  let inlineContent = userContent
+  let managedDocumentMode: QwenAiManagedDocumentMode | undefined
+
+  if (shouldUseDocument && options.managedToolCalling) {
+    const buildManagedDocument = (documentMode: QwenAiManagedDocumentMode): {
+      documents: ChatMessageContent[]
+      content: string
+    } => {
+      const { archiveMessages, activeMessages, toolReferenceContents } = partitionQwenAiManagedMessages(
+        messages,
+        options.workflowContinuation === true,
+        documentMode,
+      )
+      const activeContext = renderQwenAiManagedDocumentContext(activeMessages, documentMode)
+      const archiveContent = renderQwenAiTranscript(archiveMessages).content
+      const documents: ChatMessageContent[] = []
+      const inlineInstructions: string[] = []
+      if (archiveContent) {
+        const transcriptDocument = createQwenAiTranscriptDocument(archiveContent)
+        documents.push(transcriptDocument)
+        inlineInstructions.push(
+          documentMode === 'complete'
+            ? qwenAiCompleteManagedTranscriptDocumentInstruction(
+                transcriptDocument.filename || 'the attached transcript',
+              )
+            : qwenAiEarlierTranscriptDocumentInstruction(
+                transcriptDocument.filename || 'the attached transcript',
+              ),
+        )
+      }
+      if (toolReferenceContents.length > 0) {
+        const toolReferenceDocument = createQwenAiToolReferenceDocument(
+          toolReferenceContents.join('\n\n'),
+        )
+        documents.push(toolReferenceDocument)
+        inlineInstructions.push(
+          qwenAiToolReferenceDocumentInstruction(
+            toolReferenceDocument.filename || 'the attached tool reference',
+          ),
+        )
+      }
+      return {
+        documents,
+        content: [...inlineInstructions, activeContext].filter(Boolean).join('\n\n'),
+      }
+    }
+
+    managedDocumentMode = options.managedDocumentMode ?? 'hybrid'
+    let managedDocument = buildManagedDocument(managedDocumentMode)
+    if (
+      options.managedDocumentMode === undefined
+      && requestMaxBytes > 0
+      && qwenAiJsonStringUtf8Bytes(managedDocument.content) > requestMaxBytes
+    ) {
+      managedDocumentMode = 'complete'
+      managedDocument = buildManagedDocument(managedDocumentMode)
+    }
+    generatedDocuments = managedDocument.documents
+    inlineContent = managedDocument.content
+  } else if (shouldUseDocument) {
+    const transcriptDocument = createQwenAiTranscriptDocument(userContent)
+    generatedDocuments.push(transcriptDocument)
+    inlineContent = qwenAiTranscriptDocumentInstruction(
+      transcriptDocument.filename || 'the attached transcript',
+    )
+  }
+
+  const transport: QwenAiMessageTransport = generatedDocuments.length > 0 ? 'document' : 'inline'
+  const uploadedParts = [...uniqueFileParts, ...generatedDocuments]
 
   const files: any[] = []
   const evidences: QwenAiDocumentEvidence[] = []
@@ -2499,5 +2734,9 @@ export async function prepareQwenAiMultimodalMessage(
   return {
     content,
     files,
+    transport,
+    managedDocumentMode,
+    transcriptUtf8Bytes,
+    inlineUtf8Bytes: qwenAiJsonStringUtf8Bytes(content),
   }
 }

@@ -238,8 +238,8 @@ branch until terminal validation completes, and performs account failover in
 the background. Neither the keep-alive nor a failed account's partial branch
 becomes model content. Validation failures can then be retried before any model
 bytes are committed. Set
-`CHAT2API_QWEN_AI_RETRY_COUNT=0` to disable the opt-in recovery retry or use an
-integer from `1` to `10` to override its count.
+`CHAT2API_QWEN_AI_RETRY_COUNT=0` to disable the opt-in recovery retry. Positive
+values are honored within the cumulative request deadline; the default is one.
 Set `CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=false` only to opt out of atomic
 managed-stream recovery.
 
@@ -288,6 +288,13 @@ requests to receive `429`. Do not
 raise the queue timeout solely because a single generation is slow; raise it
 only when the client and deployment are intended to tolerate a longer
 admission wait.
+Document parsing is separately bounded per account by
+`QWEN_AI_FILE_PARSE_TIMEOUT_MS` (default `120000` ms), with polling controlled
+by `QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS` (default `2000` ms). A parse-stage
+timeout occurs before generation is submitted, so Chat2API can continue the
+same client request on another eligible account. It is account-neutral and
+does not penalize the previous account. Expiry of the cumulative request
+deadline remains terminal and is not converted into account failover.
 Qwen transport resets are continued by response id instead of submitting the
 prompt a second time. `CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` defaults to `3`
 and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` to `1000` ms; set attempts to `0`
@@ -308,18 +315,27 @@ no-progress budget or reach LiteLLM's outer timeout. It is clamped to the
  workflow timer is reported as `504/qwen_ai_workflow_recovery_timeout`; expiry
  of the earlier cumulative request deadline is
  `504/qwen_ai_request_timeout`. Neither marks the account faulty.
-Chat2API forwards the complete rendered Qwen transcript without applying a
-proxy-side size limit or compacting messages, tool arguments, or tool results.
+Before the first Qwen completion POST, Chat2API measures the exact serialized
+UTF-8 JSON body. `CHAT2API_QWEN_AI_REQUEST_MAX_BYTES` defaults to `92160` as a
+document-offload target rather than a local request ceiling. An oversized body
+first moves archived history and complete tool documentation to Qwen documents
+while keeping the active task and tool exchange inline. If the hybrid layout is
+still above the target, Chat2API moves the complete managed conversation into
+the transcript document and keeps only compact tool control inline. It then
+submits the reduced request instead of returning a local HTTP 413. `0` disables
+automatic offload. The original messages and validation schemas remain
+unchanged. The compact inline tool-description limit is configurable through
+`CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS`; `0` omits those
+summaries while retaining the complete attached reference.
 For managed-tool semantic terminals, the proxy submits a generic continuation
 user turn in the same Qwen chat, parented to the latest response id, without
 replaying the transcript or uploaded documents. Only an undeclared native tool
 branch is isolated through a fresh-chat replay. The
-`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is blank, so genuine
-Qwen progress can continue past an arbitrary turn count within the absolute
-workflow recovery deadline, while the shared no-progress budget separately
-bounds stalled admission and empty retry loops. A positive integer imposes an
-explicit deployment cap; `0` disables this path. The continuation does not
-replay the original prompt or uploaded files.
+`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is `1`, so a malformed
+or incomplete branch gets at most one corrective user turn. `0` disables this
+path; positive values are honored within the absolute workflow recovery
+deadline. The continuation does not replay the original prompt or uploaded
+files.
 Qwen can briefly reject that continuation with HTTP 200 and
 `code=CHAT_IN_PROGRESS` while it finalizes the parent response. The proxy then
 retries the exact same continuation payload in the same chat with exponential

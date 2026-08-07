@@ -12,6 +12,7 @@ import managementRoutes from './routes/management'
 import { proxyStatusManager } from './status'
 import { storeManager } from '../store/store'
 import { sessionManager } from './sessionManager'
+import { qwenAiSessionRepairService } from './qwenAiSessionRepair'
 import { mountWebAdminAssets } from '../../server/admin/assets'
 
 const SLOW_REQUEST_THRESHOLD_MS = 1500
@@ -409,6 +410,7 @@ export class ProxyServer {
           proxyStatusManager.setHost(this.host)
 
           storeManager.addLog('info', `Proxy server started successfully, listening on ${this.host}:${this.port}`)
+          qwenAiSessionRepairService.start()
 
           resolve(true)
         })
@@ -419,11 +421,13 @@ export class ProxyServer {
           } else {
             storeManager.addLog('error', `Server error: ${err.message}`)
           }
+          qwenAiSessionRepairService.stop()
           this.server = null
           resolve(false)
         })
 
         this.server.on('close', () => {
+          qwenAiSessionRepairService.stop()
           this.server = null
         })
       } catch (error) {
@@ -441,6 +445,7 @@ export class ProxyServer {
       return false
     }
     
+    qwenAiSessionRepairService.stop()
     sessionManager.destroy()
 
     return new Promise((resolve) => {

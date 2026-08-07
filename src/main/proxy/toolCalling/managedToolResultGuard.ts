@@ -31,6 +31,10 @@ const PROTECTED_TOOL_CALL_MARKERS: Partial<Record<
     starts: ['[function_calls]'],
     ends: ['[/function_calls]'],
   },
+  qwen_hermes: {
+    starts: ['<tool_call>'],
+    ends: ['</tool_call>'],
+  },
   anthropic_tool_use: {
     starts: ['<antml:function_calls>'],
     ends: ['</antml:function_calls>'],

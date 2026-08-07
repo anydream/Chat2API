@@ -5,6 +5,7 @@ import { storeManager } from '../../../store/store'
 import { managementAuthMiddleware } from '../../middleware/managementAuth'
 import { loadBalancer } from '../../loadbalancer'
 import { qwenAiRequestGovernor } from '../../qwenAiRequestGovernor'
+import { qwenAiSessionRepairService } from '../../qwenAiSessionRepair'
 import type {
   ManagementApiResponse,
   QwenAiGovernorConfig,
@@ -21,7 +22,7 @@ function getQwenAiAccounts() {
     .filter(provider => provider.id === 'qwen-ai' || provider.apiEndpoint.includes('chat.qwen.ai'))
     .map(provider => provider.id)
 
-  const accounts = storeManager.getAccounts()
+  const accounts = storeManager.getAccounts(true)
     .filter(account => qwenAiProviderIds.includes(account.providerId))
 
   return { accounts, providers }
@@ -29,14 +30,31 @@ function getQwenAiAccounts() {
 
 router.get('/status', async (ctx: Context) => {
   const { accounts, providers } = getQwenAiAccounts()
+  const status = qwenAiRequestGovernor.getStatus(
+    accounts,
+    providers,
+    loadBalancer.getAccountFailureSnapshot(),
+  )
+  const accountById = new Map(accounts.map(account => [account.id, account]))
 
   ctx.body = {
     success: true,
-    data: qwenAiRequestGovernor.getStatus(
-      accounts,
-      providers,
-      loadBalancer.getAccountFailureSnapshot(),
-    ),
+    data: {
+      ...status,
+      sessionRepair: qwenAiSessionRepairService.getRuntimeStatus(),
+      accounts: status.accounts.map(accountStatus => {
+        const account = accountById.get(accountStatus.accountId)
+        if (!account) return accountStatus
+        const repairStatus = qwenAiSessionRepairService.getAccountStatus(account)
+        return {
+          ...accountStatus,
+          webSessionReady: repairStatus.ready,
+          webSessionRepairable: repairStatus.repairable,
+          webSessionRepairState: repairStatus.state,
+          webSessionNextAttemptAt: repairStatus.nextAttemptAt,
+        }
+      }),
+    },
   } as ManagementApiResponse<QwenAiGovernorStatus>
 })
 

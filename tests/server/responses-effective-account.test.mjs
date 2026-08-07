@@ -623,3 +623,35 @@ test('Responses reaches account six after five Qwen 403 and 429 failures', async
     assert.equal(calls.stats[0][4], 'account-pool-6')
   })
 })
+
+test('Responses absorbs an account-neutral Qwen file parse timeout by switching accounts', async () => {
+  const { handler, calls } = loadResponsesRoute(({ attempt }) => attempt === 1
+    ? {
+        success: false,
+        status: 504,
+        error: 'Qwen AI file parse timed out',
+        errorCode: 'qwen_ai_file_parse_timeout',
+        retryable: false,
+        accountFault: false,
+        retryScope: 'next-account',
+      }
+    : {
+        success: true,
+        status: 200,
+        body: { choices: [] },
+      }, {
+    activeAccountCount: 2,
+    retryCount: 0,
+  })
+  const ctx = createContext({ model: 'claude-client-model', input: 'continue the request' })
+
+  await handler(ctx)
+
+  assert.deepEqual(calls.attemptedAccountIds, ['account-initial', 'account-pool-2'])
+  assert.deepEqual(calls.failed, [], 'an unfinished parse must not penalize the account')
+  assert.deepEqual(calls.cleared, ['account-pool-2'])
+  assert.equal(calls.accountFailovers.length, 1)
+  assert.equal(calls.accountFailovers[0].details.errorCode, 'qwen_ai_file_parse_timeout')
+  assert.equal(calls.accountFailovers[0].details.accountFault, false)
+  assert.equal(ctx.body.model, 'qwen-initial-model')
+})

@@ -280,6 +280,7 @@ router.post('/completions', async (ctx: Context) => {
     reason: requestIntent.reason,
     messageCount: requestIntent.messageCount,
     toolCount: requestIntent.toolCount,
+    toolResultCount: requestIntent.toolResultCount,
     textChars: requestIntent.textChars,
     lastUserTextChars: requestIntent.lastUserTextChars,
     lastUserTextPrefix: requestIntent.lastUserTextPrefix,

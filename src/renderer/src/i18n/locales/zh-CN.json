@@ -545,6 +545,14 @@
       "globalRiskThreshold": "全局熔断阈值",
       "accountStatus": "账号冷却状态",
       "accountStatusDesc": "显示 Qwen AI 账号当前排队、限速等待、风控冷却和负载均衡熔断状态。",
+      "webSession": "Web 会话",
+      "webSessionStates": {
+        "ready": "就绪",
+        "pending": "等待修复",
+        "repairing": "修复中",
+        "backoff": "退避重试",
+        "unrepairable": "缺少登录信息"
+      },
       "queue": "排队",
       "activeShort": "执行",
       "nextAvailable": "下次可用",

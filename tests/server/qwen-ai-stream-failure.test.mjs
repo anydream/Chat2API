@@ -6,6 +6,8 @@ import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
 import { ToolStreamParser as RealToolStreamParser } from '../../src/main/proxy/toolCalling/ToolStreamParser.ts'
+import { getToolProtocol as realGetToolProtocol } from '../../src/main/proxy/toolCalling/protocols/index.ts'
+import { getToolStreamValidationFailure as realGetToolStreamValidationFailure } from '../../src/main/proxy/toolCalling/streamValidationPolicy.ts'
 import {
   ManagedToolResultGuard as RealManagedToolResultGuard,
   stripManagedToolResultWrappers as realStripManagedToolResultWrappers,
@@ -14,6 +16,13 @@ import {
   getToolArgumentValidationIssues as realGetToolArgumentValidationIssues,
   normalizeArguments as realNormalizeArguments,
 } from '../../src/main/proxy/toolCalling/protocols/shared.ts'
+import { createQwenAiFeatureConfig as realCreateQwenAiFeatureConfig } from '../../src/main/proxy/adapters/qwen-ai-feature-config.ts'
+import {
+  hasManagedWorkflowCompletionMarker as realHasManagedWorkflowCompletionMarker,
+  parseManagedWorkflowCompletionProof as realParseManagedWorkflowCompletionProof,
+  requiresManagedWorkflowCompletionMarker as realRequiresManagedWorkflowCompletionMarker,
+  stripManagedWorkflowCompletionMarker as realStripManagedWorkflowCompletionMarker,
+} from '../../src/main/proxy/toolCalling/workflowCompletion.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 
@@ -79,19 +88,14 @@ function loadQwenAiStreamHandler(overrides = {}) {
     },
     '../toolCalling/protocols': {
       getToolProtocol: overrides.getToolProtocol || (() => ({
-        parse: () => ({ toolCalls: [] }),
+        parse: () => ({ toolCalls: [], rawMatches: [] }),
       })),
     },
     '../toolCalling/workflowCompletion': {
-      hasManagedWorkflowCompletionMarker: content => content.includes('<chat2api_workflow_complete/>'),
-      requiresManagedWorkflowCompletionMarker: plan => Boolean(
-        plan?.shouldParseResponse
-          && (plan?.providerId === 'qwen-ai' || plan?.workflowContinuation)
-          && plan?.allowedToolNames?.size > 0,
-      ),
-      stripManagedWorkflowCompletionMarker: content => content
-        .replaceAll('<chat2api_workflow_complete/>', '')
-        .trimEnd(),
+      hasManagedWorkflowCompletionMarker: realHasManagedWorkflowCompletionMarker,
+      parseManagedWorkflowCompletionProof: realParseManagedWorkflowCompletionProof,
+      requiresManagedWorkflowCompletionMarker: realRequiresManagedWorkflowCompletionMarker,
+      stripManagedWorkflowCompletionMarker: realStripManagedWorkflowCompletionMarker,
     },
     '../toolCalling/streamValidationPolicy': {
       getToolStreamValidationFailure: overrides.getToolStreamValidationFailure || (() => undefined),
@@ -123,6 +127,9 @@ function loadQwenAiStreamHandler(overrides = {}) {
       isCompleteJsonText: overrides.isCompleteJsonText || (() => true),
       mergeNativeToolArguments: overrides.mergeNativeToolArguments || ((_current, next) => next),
       normalizeNativeFunctionCallDelta: overrides.normalizeNativeFunctionCallDelta || (() => []),
+    },
+    './qwen-ai-feature-config': {
+      createQwenAiFeatureConfig: overrides.createQwenAiFeatureConfig || realCreateQwenAiFeatureConfig,
     },
   }
   const testRequire = specifier => {
@@ -158,6 +165,26 @@ class PassthroughToolStreamParser {
   recoverFromContent() { return [] }
   hasPendingToolProtocol() { return false }
   hasEmittedToolCall() { return false }
+}
+
+function qwenHermesCompletionPlan(overrides = {}) {
+  const tools = overrides.tools ?? [{ name: 'declared_tool', parameters: {}, source: 'openai' }]
+  return {
+    mode: 'managed',
+    protocol: 'qwen_hermes',
+    clientAdapterId: 'standard-openai-tools',
+    providerId: 'qwen-ai',
+    shouldInjectPrompt: true,
+    shouldParseResponse: true,
+    toolChoiceMode: 'auto',
+    workflowContinuation: false,
+    failedToolResultPending: false,
+    diagnostics: {},
+    ...overrides,
+    tools,
+    allowedToolNames: overrides.allowedToolNames
+      ?? new Set(tools.map(tool => tool.name)),
+  }
 }
 
 function isCompleteJsonText(value) {
@@ -723,7 +750,7 @@ test('Qwen AI response-id resume and workflow continuation share one recovery bu
   assert.ok(Date.now() - startedAt < 250, 'recovery phases must not receive separate full budgets')
 })
 
-test('Qwen AI default workflow recovery follows provider progress beyond three continuations', async () => {
+test('Qwen AI default workflow recovery is bounded to one corrective continuation', async () => {
   const previousAttempts = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
   process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = ''
 
@@ -757,20 +784,35 @@ test('Qwen AI default workflow recovery follows provider progress beyond three c
       recoveryBudgetMs: 1_000,
     })
     output.on('error', () => {})
-    const chunks = []
-    output.on('data', chunk => chunks.push(chunk))
-    const ended = once(output, 'end')
+    const failure = once(output, 'error')
 
     initial.end('data: provider progress 0\n\n')
-    await ended
+    const [error] = await failure
 
-    assert.deepEqual(continuationParents, [
-      'response-progress-0',
-      'response-progress-1',
-      'response-progress-2',
-      'response-progress-3',
-    ])
-    assert.match(Buffer.concat(chunks).toString(), /final provider answer/)
+    assert.deepEqual(continuationParents, ['response-progress-0'])
+    assert.equal(error.code, 'qwen_ai_semantic_incomplete')
+  } finally {
+    if (previousAttempts === undefined) {
+      delete process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
+    } else {
+      process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = previousAttempts
+    }
+  }
+})
+
+test('Qwen AI workflow continuation count honors non-negative deployment values', () => {
+  const previousAttempts = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
+  const { qwenAiWorkflowContinuationAttemptsFromEnv } = loadQwenAiStreamHandler()
+
+  try {
+    process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = '0'
+    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 0)
+
+    process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = '12'
+    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 12)
+
+    process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS = 'invalid'
+    assert.equal(qwenAiWorkflowContinuationAttemptsFromEnv(), 1)
   } finally {
     if (previousAttempts === undefined) {
       delete process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
@@ -856,6 +898,7 @@ test('Qwen AI outer request deadline includes active workflow replacement stream
     maxAttempts: 0,
     delayMs: 0,
     recoveryBudgetMs: 1_000,
+    workflowContinuationAttempts: 2,
     workflowRecoveryTimeoutMs: 1_000,
     workflowRecoveryDeadlineAt: Date.now() + 200,
   })
@@ -1507,7 +1550,7 @@ test('Qwen AI stream rejects a reasoning-only terminal response when continuatio
 
   const [failure] = await failurePromise
   await ended
-  assert.equal(failure.status, 502)
+  assert.equal(failure.status, 422)
   assert.equal(failure.code, 'qwen_ai_semantic_empty')
   assert.equal(failure.retryable, false)
   assert.match(failure.message, /reasoning but without an answer or tool call/)
@@ -1808,23 +1851,14 @@ test('Qwen AI non-stream uses same-chat continuation after a failed tool result 
   assert.equal(result.choices[0].message.tool_calls[0].function.name, 'declared_tool')
 })
 
-test('Qwen AI continues when a successful tool result is followed by an unproven progress answer', async () => {
+test('Qwen AI stream accepts terminal assistant text after a successful tool result', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
-    normalizeNativeFunctionCallDelta: delta => delta.function_call
-      ? [{
-          key: 'native-workflow-retry-0',
-          index: 0,
-          name: delta.function_call.name,
-          arguments: delta.function_call.arguments,
-        }]
-      : [],
   })
   const initial = new PassThrough()
-  const continued = new PassThrough()
   initial.on('error', () => {})
-  continued.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
+    protocol: 'qwen_hermes',
     shouldParseResponse: true,
     workflowContinuation: true,
     failedToolResultPending: false,
@@ -1839,7 +1873,7 @@ test('Qwen AI continues when a successful tool result is followed by an unproven
     isComplete: () => handler.isComplete(),
     continueWorkflow: async parentId => {
       parents.push(parentId)
-      return { data: continued }
+      throw new Error('terminal text after a successful result must not start a correction')
     },
     onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
     maxAttempts: 0,
@@ -1861,26 +1895,14 @@ test('Qwen AI continues when a successful tool result is followed by an unproven
     'response.created': { response_id: 'workflow-text-only', response_index: 0 },
   })}\n\ndata: ${JSON.stringify({
     response_id: 'workflow-text-only',
-    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'I will inspect the folder and continue.' } }],
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'The requested inspection is complete.' } }],
   })}\n\ndata: [DONE]\n\n`)
-  setImmediate(() => {
-    continued.end(`data: ${JSON.stringify({
-      'response.created': { response_id: 'workflow-tool-call', response_index: 0 },
-    })}\n\ndata: ${JSON.stringify({
-      response_id: 'workflow-tool-call',
-      choices: [{ delta: {
-        phase: 'answer',
-        status: 'finished',
-        function_call: { name: 'declared_tool', arguments: '{}' },
-      } }],
-    })}\n\ndata: [DONE]\n\n`)
-  })
   await ended
   const body = Buffer.concat(chunks).toString()
-  assert.deepEqual(parents, ['workflow-text-only'])
+  assert.deepEqual(parents, [])
   assert.equal(failure, undefined)
-  assert.doesNotMatch(body, /I will inspect the folder and continue\./)
-  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.match(body, /The requested inspection is complete\./)
+  assert.doesNotMatch(body, /chat2api_workflow_complete|event: error/)
 })
 
 test('Qwen AI preserves a terminal final answer after a successful tool result', async () => {
@@ -1888,6 +1910,7 @@ test('Qwen AI preserves a terminal final answer after a successful tool result',
   const initial = new PassThrough()
   initial.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
+    protocol: 'qwen_hermes',
     shouldParseResponse: true,
     workflowContinuation: true,
     failedToolResultPending: false,
@@ -1918,7 +1941,7 @@ test('Qwen AI preserves a terminal final answer after a successful tool result',
     'response.created': { response_id: 'workflow-final-text-first', response_index: 0 },
   })}\n\ndata: ${JSON.stringify({
     response_id: 'workflow-final-text-first',
-    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'The requested work is complete.<chat2api_workflow_complete/>' } }],
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'The requested work is complete.' } }],
   })}\n\ndata: [DONE]\n\n`)
   const result = await resultPromise
   assert.deepEqual(parents, [])
@@ -2003,7 +2026,7 @@ test('Qwen AI non-stream preserves prose without a structural pending state', as
   assert.equal(result.choices[0].message.tool_calls, undefined)
 })
 
-test('Qwen AI workflow completion proof retries prose once within the configured budget', async () => {
+test('Qwen AI initial workflow completion proof retries prose once within the configured budget', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
   })
@@ -2012,8 +2035,9 @@ test('Qwen AI workflow completion proof retries prose once within the configured
   initial.on('error', () => {})
   continued.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
+    protocol: 'qwen_hermes',
     shouldParseResponse: true,
-    workflowContinuation: true,
+    workflowContinuation: false,
     failedToolResultPending: false,
     allowedToolNames: new Set(['declared_tool']),
     tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
@@ -2068,14 +2092,255 @@ test('Qwen AI workflow completion proof retries prose once within the configured
   assert.doesNotMatch(body, /chat2api_workflow_complete/)
 })
 
-test('Qwen AI continues an initial managed request until final completion is proven', async () => {
+test('Qwen AI stream corrects a marker-only proof and accepts a terminal marker split across deltas', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({ ToolStreamParser: PassthroughToolStreamParser })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    qwenHermesCompletionPlan(),
+  )
+  handler.setChatId('marker-only-stream-chat')
+  const continuationParents = []
+  const continuationCodes = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async (parentId, recoveryError) => {
+      continuationParents.push(parentId)
+      continuationCodes.push(recoveryError?.code)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'marker-only-stream-first', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: '<chat2api_workflow_complete/>',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+  setImmediate(() => continued.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'marker-only-stream-corrected', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'typing',
+      content: 'Completed after correction.<chat2api_workflow_',
+    } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'complete/>',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join('')))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(continuationParents, ['marker-only-stream-first'])
+  assert.deepEqual(continuationCodes, ['qwen_ai_semantic_incomplete'])
+  assert.equal(failure, undefined)
+  assert.match(body, /Completed after correction\./)
+  assert.doesNotMatch(body, /chat2api_workflow_complete|event: error/)
+})
+
+test('Qwen AI non-stream corrects a marker-only completion proof once', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler()
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    qwenHermesCompletionPlan(),
+  )
+  handler.setChatId('marker-only-non-stream-chat')
+  const continuationParents = []
+  const continuationCodes = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async (parentId, recoveryError) => {
+      continuationParents.push(parentId)
+      continuationCodes.push(recoveryError?.code)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    maxAttempts: 0,
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const resultPromise = handler.handleNonStream(bridge, {
+    responseTimeoutMs: 1_000,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'marker-only-non-stream-first', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: '<chat2api_workflow_complete/>',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+  setImmediate(() => continued.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'marker-only-non-stream-corrected', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'Completed after non-stream correction.<chat2api_workflow_complete/>',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join('')))
+
+  const result = await resultPromise
+  assert.deepEqual(continuationParents, ['marker-only-non-stream-first'])
+  assert.deepEqual(continuationCodes, ['qwen_ai_semantic_incomplete'])
+  assert.equal(result.choices[0].message.content, 'Completed after non-stream correction.')
+})
+
+test('Qwen AI stream rejects a non-terminal completion marker when correction is disabled', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({ ToolStreamParser: PassthroughToolStreamParser })
+  const initial = new PassThrough()
+  initial.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    qwenHermesCompletionPlan(),
+  )
+  handler.setChatId('middle-marker-chat')
+  let continuationCalls = 0
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async () => {
+      continuationCalls += 1
+      throw new Error('workflow continuation must remain disabled')
+    },
+    maxAttempts: 0,
+    workflowContinuationAttempts: 0,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'middle-marker-first', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: 'Premature <chat2api_workflow_complete/> work is still running.',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.equal(continuationCalls, 0)
+  assert.equal(failure?.status, 422)
+  assert.equal(failure?.code, 'qwen_ai_semantic_incomplete')
+  assert.doesNotMatch(body, /Premature|work is still running/)
+  assert.match(body, /event: error/)
+})
+
+test('Qwen AI non-stream preserves literal completion marker text outside the capable protocol', async (t) => {
+  const markerText = 'Literal protocol text: <chat2api_workflow_complete/>'
+  const scenarios = [
+    { name: 'unmanaged response', plan: undefined },
+    {
+      name: 'managed XML response',
+      plan: {
+        protocol: 'managed_xml',
+        shouldParseResponse: true,
+        allowedToolNames: new Set(['declared_tool']),
+        tools: [{ name: 'declared_tool', parameters: {}, source: 'openai' }],
+        toolChoiceMode: 'auto',
+        failedToolResultPending: false,
+      },
+    },
+  ]
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const { QwenAiStreamHandler } = loadQwenAiStreamHandler()
+      const upstream = new PassThrough()
+      upstream.on('error', () => {})
+      const handler = new QwenAiStreamHandler('test-model', undefined, scenario.plan)
+      const resultPromise = handler.handleNonStream(upstream, { responseTimeoutMs: 1_000 })
+
+      upstream.end([
+        `data: ${JSON.stringify({ choices: [{ delta: {
+          phase: 'answer',
+          status: 'finished',
+          content: markerText,
+        } }] })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join(''))
+
+      const result = await resultPromise
+      assert.equal(result.choices[0].message.content, markerText)
+    })
+  }
+})
+
+test('Qwen AI initial managed auto request replaces an unproven acknowledgement with a tool call', async () => {
+  const { createQwenAiResumableStream, QwenAiStreamHandler } = loadQwenAiStreamHandler({
+    normalizeNativeFunctionCallDelta: delta => delta.function_call
+      ? [{
+          key: 'native-initial-auto-recovery-0',
+          index: 0,
+          name: delta.function_call.name,
+          arguments: delta.function_call.arguments,
+        }]
+      : [],
+  })
   const initial = new PassThrough()
   const continued = new PassThrough()
   initial.on('error', () => {})
   continued.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
     providerId: 'qwen-ai',
+    protocol: 'qwen_hermes',
     shouldParseResponse: true,
     workflowContinuation: false,
     failedToolResultPending: false,
@@ -2104,21 +2369,28 @@ test('Qwen AI continues an initial managed request until final completion is pro
     'response.created': { response_id: 'initial-auto-progress', response_index: 0 },
   })}\n\ndata: ${JSON.stringify({
     response_id: 'initial-auto-progress',
-    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'I will inspect the project next.' } }],
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'Yes' } }],
   })}\n\ndata: [DONE]\n\n`)
   setImmediate(() => {
     continued.end(`data: ${JSON.stringify({
-      response_id: 'initial-auto-complete',
-      choices: [{ delta: { phase: 'answer', status: 'finished', content: 'The requested work is complete.<chat2api_workflow_complete/>' } }],
+      'response.created': { response_id: 'initial-auto-tool', response_index: 0 },
+    })}\n\ndata: ${JSON.stringify({
+      response_id: 'initial-auto-tool',
+      choices: [{ delta: {
+        phase: 'answer',
+        status: 'finished',
+        function_call: { name: 'declared_tool', arguments: '{}' },
+      } }],
     })}\n\ndata: [DONE]\n\n`)
   })
 
   const result = await resultPromise
   assert.deepEqual(parents, ['initial-auto-progress'])
-  assert.equal(result.choices[0].message.content, 'The requested work is complete.')
+  assert.equal(result.choices[0].finish_reason, 'tool_calls')
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, 'declared_tool')
 })
 
-test('Qwen AI continues initial managed stream prose into a declared tool call', async () => {
+test('Qwen AI initial managed auto stream replaces an unproven acknowledgement with a tool call', async () => {
   const { createQwenAiResumableStream, QwenAiStreamHandler, QWEN_AI_STREAM_FAILURE_EVENT } = loadQwenAiStreamHandler({
     ToolStreamParser: PassthroughToolStreamParser,
     normalizeNativeFunctionCallDelta: delta => delta.function_call
@@ -2136,6 +2408,7 @@ test('Qwen AI continues initial managed stream prose into a declared tool call',
   continued.on('error', () => {})
   const handler = new QwenAiStreamHandler('test-model', undefined, {
     providerId: 'qwen-ai',
+    protocol: 'qwen_hermes',
     shouldParseResponse: true,
     workflowContinuation: false,
     failedToolResultPending: false,
@@ -2172,7 +2445,7 @@ test('Qwen AI continues initial managed stream prose into a declared tool call',
     'response.created': { response_id: 'initial-followup-progress', response_index: 0 },
   })}\n\ndata: ${JSON.stringify({
     response_id: 'initial-followup-progress',
-    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'I will inspect the folder next.' } }],
+    choices: [{ delta: { phase: 'answer', status: 'finished', content: 'Yes' } }],
   })}\n\ndata: [DONE]\n\n`)
   setImmediate(() => {
     continued.end(`data: ${JSON.stringify({
@@ -2191,7 +2464,8 @@ test('Qwen AI continues initial managed stream prose into a declared tool call',
   const body = Buffer.concat(chunks).toString()
   assert.deepEqual(parents, ['initial-followup-progress'])
   assert.equal(failure, undefined)
-  assert.doesNotMatch(body, /I will inspect the folder next\./)
+  assert.doesNotMatch(body, /Yes/)
+  assert.match(body, /"name":"declared_tool"/)
   assert.match(body, /"finish_reason":"tool_calls"/)
 })
 
@@ -2550,7 +2824,7 @@ test('Qwen AI stream waits for terminal output before rejecting an undeclared na
   const [failure] = await failurePromise
   await ended
 
-  assert.equal(failure.status, 502)
+  assert.equal(failure.status, 422)
   assert.equal(failure.type, 'upstream_tool_error')
   assert.equal(failure.param, 'tool_calls')
   assert.equal(failure.code, 'undeclared_native_tool_call')
@@ -3149,7 +3423,7 @@ test('Qwen AI stream rejects incomplete declared native tool arguments only at t
 
   const [failure] = await failurePromise
   await ended
-  assert.equal(failure.status, 502)
+  assert.equal(failure.status, 422)
   assert.equal(failure.type, 'tool_call_parse_error')
   assert.equal(failure.param, 'tool_calls')
   assert.equal(failure.code, 'malformed_tool_call')
@@ -3194,7 +3468,7 @@ test('Qwen AI stream rejects an empty declared native tool argument block', asyn
 
   const [failure] = await failurePromise
   await ended
-  assert.equal(failure.status, 502)
+  assert.equal(failure.status, 422)
   assert.equal(failure.type, 'tool_call_parse_error')
   assert.equal(failure.code, 'malformed_tool_call')
   assert.equal(failure.accountFault, false)
@@ -3244,7 +3518,7 @@ test('Qwen AI stream rejects an incomplete declared call before complete calls o
   const [failure] = await failurePromise
   await ended
   const body = Buffer.concat(chunks).toString()
-  assert.equal(failure.status, 502)
+  assert.equal(failure.status, 422)
   assert.equal(failure.code, 'malformed_tool_call')
   assert.equal(failure.retryable, false)
   assert.equal(failure.accountFault, false)
@@ -3310,7 +3584,7 @@ test('Qwen AI non-stream parsing rejects an undeclared native tool only at termi
   })}\n\n`)
 
   await assert.rejects(result, error => (
-    error.status === 502
+    error.status === 422
     && error.type === 'upstream_tool_error'
     && error.param === 'tool_calls'
     && error.code === 'undeclared_native_tool_call'
@@ -3438,7 +3712,7 @@ test('Qwen AI non-stream parsing rejects terminal incomplete declared native too
   ].join(''))
 
   await assert.rejects(result, error => (
-    error.status === 502
+    error.status === 422
     && error.type === 'tool_call_parse_error'
     && error.param === 'tool_calls'
     && error.code === 'malformed_tool_call'
@@ -3486,7 +3760,7 @@ test('Qwen AI non-stream rejects an incomplete declared call before complete cal
   } }] })}\n\n`)
 
   await assert.rejects(result, error => (
-    error.status === 502
+    error.status === 422
     && error.type === 'tool_call_parse_error'
     && error.code === 'malformed_tool_call'
     && error.retryable === false
@@ -4348,7 +4622,11 @@ test('Qwen AI chat deadline races a preflight stage that ignores AbortSignal', a
     },
   })
   const adapter = new QwenAiAdapter(
-    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    {
+      id: 'qwen-ai',
+      apiEndpoint: 'https://chat.qwen.ai',
+      modelMappings: { 'Qwen3.8-Max': 'qwen3.8-max' },
+    },
     { id: 'account-1', credentials: { token: 'test-token' } },
   )
   adapter.refreshTokenIfNeeded = async () => {}
@@ -4551,6 +4829,361 @@ test('Qwen AI chat success disposes its linked deadline listener and clamps HTTP
   responseStream.destroy()
 })
 
+test('Qwen AI managed tools preserve the configured model and requested thinking mode', async () => {
+  let postedPayload
+  let createdModel
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+  const { QwenAiAdapter } = loadQwenAiStreamHandler({
+    prepareQwenAiMultimodalMessage: async () => ({ content: 'managed tool prompt', files: [] }),
+  })
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: { token: 'test-token' } },
+  )
+  adapter.refreshTokenIfNeeded = async () => {}
+  adapter.createChat = async (model) => {
+    createdModel = model
+    return 'managed-tool-chat'
+  }
+  adapter.postWithRefreshRetry = async (_url, payload) => {
+    postedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload
+    return {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+      data: responseStream,
+    }
+  }
+  adapter.assertChatCompletionStreamResponse = async () => {}
+
+  await adapter.chatCompletion({
+    model: 'Qwen3.8-Max',
+    messages: [{ role: 'user', content: 'use the declared tool' }],
+    enable_thinking: true,
+    managedToolCalling: true,
+  })
+
+  const featureConfig = postedPayload.messages[0].feature_config
+  assert.equal(createdModel, 'qwen3.8-max')
+  assert.equal(postedPayload.model, 'qwen3.8-max')
+  assert.deepEqual(postedPayload.messages[0].models, ['qwen3.8-max'])
+  assert.equal(featureConfig.thinking_enabled, true)
+  assert.equal(featureConfig.auto_thinking, true)
+  assert.equal('thinking_mode' in featureConfig, false)
+  assert.equal(featureConfig.thinking_format, 'summary')
+  assert.equal('thinking_budget' in featureConfig, false)
+  assert.equal('function_calling' in featureConfig, false)
+  assert.equal('plugins_enabled' in featureConfig, false)
+  responseStream.destroy()
+})
+
+test('Qwen AI provider model mappings override compatibility aliases', () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const adapter = new QwenAiAdapter(
+    {
+      id: 'custom-qwen-ai',
+      apiEndpoint: 'https://chat.qwen.ai',
+      modelMappings: { 'Qwen3.8-Max': 'deployment-selected-model' },
+    },
+    { id: 'account-1', credentials: { token: 'test-token' } },
+  )
+
+  assert.equal(adapter.mapModel('Qwen3.8-Max'), 'deployment-selected-model')
+  assert.equal(adapter.mapModel('unknown-live-model'), 'unknown-live-model')
+})
+
+test('Qwen AI measures the complete serialized payload and offloads before the first completion POST', async () => {
+  const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = '2048'
+  const preparationTransports = []
+  const preparationBudgets = []
+  let postedPayload
+  let postedOptions
+  let postedBody
+  let postCalls = 0
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async (_messages, _uploader, options) => {
+        preparationTransports.push(options.transport)
+        preparationBudgets.push(options.requestMaxBytes)
+        if (options.transport === 'document') {
+          return {
+            content: 'document-backed active request',
+            files: [{ id: 'uploaded-context-document' }],
+            transport: 'document',
+            transcriptUtf8Bytes: 8_000,
+            inlineUtf8Bytes: 32,
+          }
+        }
+        return {
+          content: 'x'.repeat(8_000),
+          files: [],
+          transport: 'inline',
+          transcriptUtf8Bytes: 8_002,
+          inlineUtf8Bytes: 8_002,
+        }
+      },
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'payload-budget-chat'
+    adapter.postWithRefreshRetry = async (_url, payload, createOptions) => {
+      postCalls += 1
+      postedBody = payload
+      postedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload
+      postedOptions = createOptions()
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    await adapter.chatCompletion({
+      model: 'client-configured-model',
+      messages: [{ role: 'user', content: 'active request' }],
+      messageTransport: 'inline',
+      managedToolCalling: true,
+    })
+
+    assert.deepEqual(preparationTransports, ['inline', 'document'])
+    assert.deepEqual(preparationBudgets, [2048, 2048])
+    assert.equal(postCalls, 1)
+    assert.equal(typeof postedBody, 'string')
+    assert.equal(postedPayload.messages[0].content, 'document-backed active request')
+    assert.ok(Buffer.byteLength(postedBody, 'utf8') <= 2048)
+    assert.equal(
+      Number(postedOptions.headers['Content-Length']),
+      Buffer.byteLength(postedBody, 'utf8'),
+    )
+  } finally {
+    responseStream.destroy()
+    if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+    else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+  }
+})
+
+test('Qwen AI escalates an over-target managed document and still submits it upstream', async () => {
+  const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = '1024'
+  const preparationModes = []
+  let postCalls = 0
+  let postedBody
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async (_messages, _uploader, options) => {
+        preparationModes.push(options.managedDocumentMode)
+        return {
+          content: 'x'.repeat(8_000),
+          files: [{ id: 'oversized-document-metadata' }],
+          transport: 'document',
+          managedDocumentMode: options.managedDocumentMode,
+          transcriptUtf8Bytes: 8_002,
+          inlineUtf8Bytes: 8_002,
+        }
+      },
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'over-budget-chat'
+    adapter.postWithRefreshRetry = async (_url, body) => {
+      postCalls += 1
+      postedBody = body
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    await adapter.chatCompletion({
+      model: 'client-configured-model',
+      messages: [{ role: 'user', content: 'active request' }],
+      managedToolCalling: true,
+    })
+
+    assert.deepEqual(preparationModes, [undefined, 'complete'])
+    assert.equal(postCalls, 1)
+    assert.ok(Buffer.byteLength(postedBody, 'utf8') > 1024)
+  } finally {
+    responseStream.destroy()
+    if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+    else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+  }
+})
+
+test('Qwen AI request payload budget can be disabled through configuration', async () => {
+  const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = '0'
+  const seenBudgets = []
+  let postCalls = 0
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+
+  try {
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async (_messages, _uploader, options) => {
+        seenBudgets.push(options.requestMaxBytes)
+        return {
+          content: 'x'.repeat(8_000),
+          files: [],
+          transport: 'inline',
+          transcriptUtf8Bytes: 8_002,
+          inlineUtf8Bytes: 8_002,
+        }
+      },
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'disabled-payload-budget-chat'
+    adapter.postWithRefreshRetry = async () => {
+      postCalls += 1
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    await adapter.chatCompletion({
+      model: 'client-configured-model',
+      messages: [{ role: 'user', content: 'active request' }],
+    })
+    assert.deepEqual(seenBudgets, [0])
+    assert.equal(postCalls, 1)
+  } finally {
+    responseStream.destroy()
+    if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+    else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+  }
+})
+
+test('Qwen AI payload target uses exact UTF-8 JSON bytes without becoming a local request ceiling', async () => {
+  const previousBudget = process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+  const escapedUnicodeContent = '\u4e2d\u6587 "quoted" \\ path\n'.repeat(20)
+
+  const run = async budget => {
+    process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = String(budget)
+    let postedBody
+    let postedContentLength
+    const responseStream = new PassThrough()
+    responseStream.on('error', () => {})
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async () => ({
+        content: escapedUnicodeContent,
+        files: [{ id: 'document-reference' }],
+        transport: 'document',
+        transcriptUtf8Bytes: Buffer.byteLength(escapedUnicodeContent, 'utf8'),
+        inlineUtf8Bytes: Buffer.byteLength(JSON.stringify(escapedUnicodeContent), 'utf8'),
+      }),
+    })
+    const adapter = new QwenAiAdapter(
+      { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async () => 'utf8-budget-chat'
+    adapter.deleteChat = async () => true
+    adapter.postWithRefreshRetry = async (_url, body, createOptions) => {
+      postedBody = body
+      postedContentLength = createOptions().headers['Content-Length']
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    try {
+      await adapter.chatCompletion({
+        model: 'client-configured-model',
+        messages: [{ role: 'user', content: 'boundary fixture' }],
+        managedToolCalling: true,
+      })
+      return { postedBody, postedContentLength }
+    } finally {
+      responseStream.destroy()
+    }
+  }
+
+  try {
+    const baseline = await run(0)
+    const exactBytes = Buffer.byteLength(baseline.postedBody, 'utf8')
+    assert.equal(Number(baseline.postedContentLength), exactBytes)
+    assert.match(baseline.postedBody, /\u4e2d\u6587/)
+    assert.match(baseline.postedBody, /\\"quoted\\"/)
+    assert.match(baseline.postedBody, /\\\\ path\\n/)
+
+    const exact = await run(exactBytes)
+    assert.equal(Buffer.byteLength(exact.postedBody, 'utf8'), exactBytes)
+
+    const belowTarget = await run(exactBytes - 1)
+    assert.equal(Buffer.byteLength(belowTarget.postedBody, 'utf8'), exactBytes)
+    assert.equal(Number(belowTarget.postedContentLength), exactBytes)
+  } finally {
+    if (previousBudget === undefined) delete process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES
+    else process.env.CHAT2API_QWEN_AI_REQUEST_MAX_BYTES = previousBudget
+  }
+})
+
+test('Qwen AI preserves an arbitrary client-selected model when no mapping applies', async () => {
+  const selectedModel = 'provider-model-selected-by-client'
+  let createdModel
+  let postedPayload
+  const responseStream = new PassThrough()
+  responseStream.on('error', () => {})
+  const { QwenAiAdapter } = loadQwenAiStreamHandler({
+    prepareQwenAiMultimodalMessage: async () => ({ content: 'model pass-through', files: [] }),
+  })
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: { token: 'test-token' } },
+  )
+  adapter.refreshTokenIfNeeded = async () => {}
+  adapter.createChat = async (model) => {
+    createdModel = model
+    return 'model-pass-through-chat'
+  }
+  adapter.postWithRefreshRetry = async (_url, payload) => {
+    postedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload
+    return {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+      data: responseStream,
+    }
+  }
+  adapter.assertChatCompletionStreamResponse = async () => {}
+
+  await adapter.chatCompletion({
+    model: selectedModel,
+    messages: [{ role: 'user', content: 'use the requested model' }],
+  })
+
+  assert.equal(createdModel, selectedModel)
+  assert.equal(postedPayload.model, selectedModel)
+  assert.deepEqual(postedPayload.messages[0].models, [selectedModel])
+  responseStream.destroy()
+})
+
 test('Qwen AI workflow continuation posts only a new parented user turn', async () => {
   const { QwenAiAdapter } = loadQwenAiStreamHandler()
   const adapter = new QwenAiAdapter(
@@ -4572,6 +5205,7 @@ test('Qwen AI workflow continuation posts only a new parented user turn', async 
     model: 'qwen3.8-max-preview',
     originalModel: 'Qwen3.8-Max-Preview',
     content: 'generic workflow continuation',
+    enable_thinking: true,
   })
 
   assert.equal(response.data, responseStream)
@@ -4592,6 +5226,10 @@ test('Qwen AI workflow continuation posts only a new parented user turn', async 
   assert.equal(message.childrenIds.length, 1)
   assert.match(message.childrenIds[0], /^[0-9a-f-]{36}$/)
   assert.notEqual(message.fid, message.childrenIds[0])
+  assert.equal(message.feature_config.thinking_enabled, true)
+  assert.equal(message.feature_config.auto_thinking, true)
+  assert.equal('thinking_mode' in message.feature_config, false)
+  assert.equal(message.feature_config.thinking_format, 'summary')
   assert.equal(payload.messages.some(item => item.content === 'original request'), false)
 })
 
@@ -5112,8 +5750,8 @@ test('Qwen AI stream classifies an upstream truncation as a non-retryable 502', 
   const [failure] = await failurePromise
   await ended
 
-  assert.equal(failure.status, 502)
   assert.equal(failure.code, 'qwen_ai_stream_incomplete')
+  assert.equal(failure.status, 502)
   assert.equal(failure.retryable, false)
   assert.match(failure.message, /ended before an upstream completion signal/)
   assert.match(Buffer.concat(chunks).toString(), /"code":"qwen_ai_stream_incomplete"/)
@@ -5179,7 +5817,7 @@ test('Qwen AI stream reports a managed tool validation failure through its failu
   const [failure] = await failurePromise
   await ended
 
-  assert.equal(failure.status, 502)
+  assert.equal(failure.status, 422)
   assert.equal(failure.type, validationFailure.type)
   assert.equal(failure.code, validationFailure.code)
   assert.equal(failure.retryable, false)
@@ -5192,8 +5830,177 @@ test('Qwen AI stream reports a managed tool validation failure through its failu
   assert.match(serialized, /"param":"tool_calls"/)
   assert.match(serialized, /"code":"malformed_tool_call"/)
   assert.match(serialized, /"accountFault":false/)
-  assert.match(serialized, /"status":502/)
+  assert.match(serialized, /"status":422/)
   assert.match(serialized, /"retryable":false/)
+})
+
+test('Qwen AI stream corrects malformed Hermes output once in the same chat', async () => {
+  const {
+    createQwenAiResumableStream,
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    getToolProtocol: realGetToolProtocol,
+    getToolStreamValidationFailure: realGetToolStreamValidationFailure,
+  })
+  const initial = new PassThrough()
+  const continued = new PassThrough()
+  initial.on('error', () => {})
+  continued.on('error', () => {})
+  const plan = {
+    mode: 'managed',
+    protocol: 'qwen_hermes',
+    clientAdapterId: 'standard-openai-tools',
+    providerId: 'qwen-ai',
+    tools: [{
+      name: 'Bash',
+      source: 'openai',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+    }],
+    shouldInjectPrompt: true,
+    shouldParseResponse: true,
+    toolChoiceMode: 'auto',
+    allowedToolNames: new Set(['Bash']),
+    workflowContinuation: false,
+    failedToolResultPending: false,
+    diagnostics: {},
+  }
+  const handler = new QwenAiStreamHandler('qwen3.8-max', undefined, plan)
+  handler.setChatId('hermes-correction-chat')
+  const continuationCodes = []
+  const bridge = createQwenAiResumableStream(initial, {
+    getResponseId: () => handler.getResponseId(),
+    getSemanticRecoveryError: () => handler.getPendingSemanticRecoveryError(),
+    isComplete: () => handler.isComplete(),
+    continueWorkflow: async (_parentId, recoveryError) => {
+      continuationCodes.push(recoveryError?.code)
+      return { data: continued }
+    },
+    onWorkflowContinuation: () => handler.prepareForWorkflowContinuation(),
+    workflowContinuationAttempts: 1,
+    delayMs: 0,
+  })
+  const output = await handler.handleStream(bridge, {
+    responseTimeoutMs: 1_000,
+    idleTimeoutMs: 100,
+    bufferManagedBranch: true,
+    recoverFromSemanticEmpty: (error, onResume) => bridge.recoverFromIdle(error, onResume),
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+
+  initial.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'hermes-invalid', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: '<tool_call>{"name":"Bash","arguments":{"command":',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+  setImmediate(() => continued.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'hermes-corrected', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: '<tool_call>{"name":"Bash","arguments":{"command":"npm test"}}</tool_call>',
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join('')))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  assert.deepEqual(continuationCodes, ['malformed_tool_call'])
+  assert.equal(failure, undefined)
+  assert.match(body, /"name":"Bash"/)
+  assert.match(body, /npm test/)
+  assert.match(body, /"finish_reason":"tool_calls"/)
+  assert.doesNotMatch(body, /hermes-invalid/)
+})
+
+test('Qwen AI stream converts wrapped Qwen XML into OpenAI tool calls', async () => {
+  const {
+    QwenAiStreamHandler,
+    QWEN_AI_STREAM_FAILURE_EVENT,
+  } = loadQwenAiStreamHandler({
+    ToolStreamParser: RealToolStreamParser,
+    getToolProtocol: realGetToolProtocol,
+    getToolStreamValidationFailure: realGetToolStreamValidationFailure,
+  })
+  const tools = [{
+    name: 'write_file',
+    source: 'openai',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string' },
+        content: { type: 'string' },
+      },
+      required: ['filePath', 'content'],
+      additionalProperties: false,
+    },
+  }]
+  const upstream = new PassThrough()
+  upstream.on('error', () => {})
+  const handler = new QwenAiStreamHandler(
+    'test-model',
+    undefined,
+    qwenHermesCompletionPlan({ tools }),
+  )
+  handler.setChatId('wrapped-qwen-xml-chat')
+  const output = await handler.handleStream(upstream, {
+    responseTimeoutMs: 1_000,
+    bufferManagedBranch: true,
+  })
+  const chunks = []
+  let failure
+  output.on('data', chunk => chunks.push(chunk))
+  output.once(QWEN_AI_STREAM_FAILURE_EVENT, error => { failure = error })
+  const ended = once(output, 'end')
+  const wrappedXml = [
+    '<tool_call>',
+    '<function=write_file>',
+    '<parameter=filePath>C:/tmp/from-qwen.txt</parameter>',
+    '<parameter=content>{"status":"done","items":[1,2]}</parameter>',
+    '</function>',
+    '</tool_call>',
+  ].join('\n')
+
+  upstream.end([
+    `data: ${JSON.stringify({ 'response.created': { response_id: 'wrapped-qwen-xml', response_index: 0 } })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: {
+      phase: 'answer',
+      status: 'finished',
+      content: wrappedXml,
+    } }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ].join(''))
+
+  await ended
+  const body = Buffer.concat(chunks).toString()
+  const events = body.split('\n\n')
+    .filter(block => block.startsWith('data: ') && !block.includes('[DONE]'))
+    .map(block => JSON.parse(block.slice('data: '.length)))
+  const toolCall = events.flatMap(event => event.choices?.[0]?.delta?.tool_calls || [])[0]
+  const terminal = events.find(event => event.choices?.[0]?.finish_reason === 'tool_calls')
+  assert.equal(failure, undefined)
+  assert.ok(toolCall)
+  assert.equal(toolCall.function.name, 'write_file')
+  assert.deepEqual(JSON.parse(toolCall.function.arguments), {
+    filePath: 'C:/tmp/from-qwen.txt',
+    content: '{"status":"done","items":[1,2]}',
+  })
+  assert.ok(terminal)
+  assert.doesNotMatch(body, /<function=write_file>|<parameter=/)
 })
 
 test('Qwen AI stream corrects a schema-invalid native tool call through same-chat continuation', async () => {
@@ -5400,7 +6207,7 @@ test('Qwen AI stream corrects incomplete native tool JSON through same-chat cont
   assert.match(body, /"finish_reason":"tool_calls"/)
 })
 
-test('Qwen AI exposes incomplete native tool JSON for next-account replay after continuation is exhausted', async () => {
+test('Qwen AI exposes incomplete native tool JSON as non-retryable after continuation is exhausted', async () => {
   const {
     createQwenAiResumableStream,
     QwenAiStreamHandler,
@@ -5471,9 +6278,11 @@ test('Qwen AI exposes incomplete native tool JSON for next-account replay after 
 
   const [failure] = await failurePromise
   await ended
+  assert.equal(failure.status, 422)
   assert.equal(failure.code, 'malformed_tool_call')
+  assert.equal(failure.retryable, false)
   assert.equal(failure.accountFault, false)
-  assert.equal(failure.retryScope, 'next-account')
+  assert.equal(failure.retryScope, undefined)
   assert.doesNotMatch(Buffer.concat(chunks).toString(), /"finish_reason":"tool_calls"/)
 })
 
@@ -6946,7 +7755,7 @@ test('Qwen AI blocks answer wrappers when managed response parsing is unavailabl
       await ended
       const body = Buffer.concat(chunks).toString()
       assert.doesNotMatch(body, /CHAT2API\|tool_result|fabricated wrapper result|unmanaged wrapper payload/)
-      assert.equal(failure?.status, 502)
+      assert.equal(failure?.status, 422)
       assert.equal(failure?.code, 'qwen_ai_wrapper_leak')
       assert.match(body, /event: error/)
     })
@@ -6987,7 +7796,7 @@ test('Qwen AI blocks tool-result wrappers in live reasoning content', async () =
   await ended
   const body = Buffer.concat(chunks).toString()
   assert.doesNotMatch(body, /CHAT2API\|tool_result|fabricated wrapper result|poisoned reasoning payload/)
-  assert.equal(failure?.status, 502)
+  assert.equal(failure?.status, 422)
   assert.equal(failure?.code, 'qwen_ai_wrapper_leak')
   assert.match(body, /event: error/)
 })
@@ -7273,7 +8082,7 @@ test('Qwen AI failed-result final answer fails without retry when workflow attem
   const body = Buffer.concat(chunks).toString()
   assert.equal(continuationCalls, 0)
   assert.equal(failure?.code, 'qwen_ai_semantic_incomplete')
-  assert.equal(failure?.status, 502)
+  assert.equal(failure?.status, 422)
   assert.doesNotMatch(body, /I am done without retrying/)
   assert.match(body, /event: error/)
 })

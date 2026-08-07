@@ -35,7 +35,7 @@ export function detectMarkers(buffer: string, markers: string[]): ToolProtocolDe
 }
 
 export function stripFencedCodeBlocks(content: string): string {
-  return content.replace(/```[\s\S]*?```/g, '')
+  return content.replace(/```[\s\S]*?(?:```|$)/g, '')
 }
 
 export function toolNames(tools: NormalizedToolDefinition[]): Set<string> {

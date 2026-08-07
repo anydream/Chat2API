@@ -6,7 +6,7 @@ const calls = [
   { id: 'call_1', name: 'default_api:read_file', arguments: '{"filePath":"/tmp/a"}' },
 ]
 
-test('first-version providers use managed prompt and managed xml by default', () => {
+test('legacy managed providers keep managed XML by default', () => {
   for (const providerId of ['deepseek', 'kimi', 'glm', 'qwen']) {
     const profile = getProviderToolProfile(providerId)
 
@@ -31,6 +31,16 @@ test('priority providers separate executable tool calls from inert tool-result h
   }
 })
 
+test('only qwen-ai selects the official Qwen Hermes managed protocol', () => {
+  const qwenAi = getProviderToolProfile('qwen-ai')
+  const qwen = getProviderToolProfile('qwen')
+
+  assert.equal(qwenAi.managedSupport, true)
+  assert.equal(qwenAi.supportsNativeTools, false)
+  assert.equal(qwenAi.preferredManagedProtocol, 'qwen_hermes')
+  assert.equal(qwen.preferredManagedProtocol, 'managed_xml')
+})
+
 test('managed tool-result history escapes legacy protocol markers as inert JSON data', () => {
   const profile = getProviderToolProfile('qwen')
   const formatted = profile.formatToolResult({
@@ -43,4 +53,17 @@ test('managed tool-result history escapes legacy protocol markers as inert JSON 
   assert.match(formatted, /\\u003c\|CHAT2API\|tool_result\\u003e/)
   assert.match(formatted, /\\u0026/)
   assert.doesNotMatch(formatted, /<\|CHAT2API\|tool_result/)
+})
+
+test('qwen-ai history uses matching Hermes call and result blocks', () => {
+  const profile = getProviderToolProfile('qwen-ai')
+
+  assert.equal(
+    profile.formatAssistantToolCalls(calls),
+    '<tool_call>\n<function=default_api:read_file>\n<parameter=filePath>\n/tmp/a\n</parameter>\n</function>\n</tool_call>',
+  )
+  assert.equal(
+    profile.formatToolResult({ toolCallId: 'call_1', content: 'file body' }),
+    '<tool_response>\nfile body\n</tool_response>',
+  )
 })

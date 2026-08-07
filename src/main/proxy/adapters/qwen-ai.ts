@@ -23,6 +23,7 @@ import {
   prepareQwenAiMultimodalMessage,
   type QwenAiDirectUploadInput,
   type QwenAiDirectUploadStartResult,
+  type QwenAiManagedDocumentMode,
   type QwenAiMessageTransport,
 } from './qwen-ai-files'
 import { createBaseChunk } from '../utils/streamToolHandler'
@@ -37,8 +38,8 @@ import {
 } from '../toolCalling/managedToolResultGuard'
 import {
   hasManagedWorkflowCompletionMarker,
+  parseManagedWorkflowCompletionProof,
   requiresManagedWorkflowCompletionMarker,
-  stripManagedWorkflowCompletionMarker,
 } from '../toolCalling/workflowCompletion'
 import {
   getToolArgumentValidationIssues,
@@ -55,11 +56,13 @@ import {
   normalizeNativeFunctionCallDelta,
   type NativeToolCallState,
 } from './qwen-ai-native-tools'
+import { createQwenAiFeatureConfig } from './qwen-ai-feature-config'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 300000)
 const QWEN_AI_RESPONSE_TIMEOUT_MS = nonNegativeNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', 0)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
+const QWEN_AI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
 const QWEN_AI_MANAGED_BRANCH_MAX_BYTES = positiveNumberFromEnv(
   'CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES',
   16 * 1024 * 1024,
@@ -195,6 +198,10 @@ interface ChatCompletionRequest {
   temperature?: number
   enable_thinking?: boolean
   thinking_budget?: number
+  /** Client-declared tools are encoded in Chat2API's managed text protocol. */
+  managedToolCalling?: boolean
+  /** Keep the immediately preceding tool exchange inline with document transport. */
+  managedToolWorkflowContinuation?: boolean
   /** Internal hint set by an OpenAI Responses image_generation tool request. */
   image_generation?: {
     enabled: true
@@ -222,6 +229,7 @@ interface QwenAiWorkflowContinuationRequest {
   content: string
   enable_thinking?: boolean
   thinking_budget?: number
+  managedToolCalling?: boolean
   signal?: AbortSignal
 }
 
@@ -260,6 +268,17 @@ export function qwenAiRequestTimeoutMsFromEnv(): number {
   return QWEN_AI_REQUEST_TIMEOUT_MS
 }
 
+export function qwenAiRequestMaxBytesFromEnv(): number {
+  return Math.floor(nonNegativeNumberFromEnv(
+    'CHAT2API_QWEN_AI_REQUEST_MAX_BYTES',
+    QWEN_AI_REQUEST_MAX_BYTES_DEFAULT,
+  ))
+}
+
+export function qwenAiSerializedPayloadBytes(payload: unknown): number {
+  return Buffer.byteLength(JSON.stringify(payload), 'utf8')
+}
+
 export function qwenAiStreamResumeAttemptsFromEnv(): number {
   return Math.min(
     10,
@@ -274,14 +293,15 @@ export function qwenAiStreamResumeDelayMsFromEnv(): number {
   )
 }
 
-export function qwenAiWorkflowContinuationAttemptsFromEnv(): number | undefined {
+export function qwenAiWorkflowContinuationAttemptsFromEnv(): number {
   const raw = process.env.CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS
   if (raw === undefined || raw.trim() === '' || /^auto$/i.test(raw.trim())) {
-    return undefined
+    return 1
   }
 
   const value = Number(raw)
-  return Number.isSafeInteger(value) && value >= 0 ? value : undefined
+  if (!Number.isSafeInteger(value) || value < 0) return 1
+  return value
 }
 
 /**
@@ -518,9 +538,10 @@ export function createQwenAiResumableStream(
   const delayMs = Math.max(0, options.delayMs ?? qwenAiStreamResumeDelayMsFromEnv())
   const configuredWorkflowContinuationAttempts = options.workflowContinuationAttempts
     ?? qwenAiWorkflowContinuationAttemptsFromEnv()
-  const workflowContinuationAttemptLimit = configuredWorkflowContinuationAttempts === undefined
-    ? undefined
-    : Math.max(0, Math.floor(configuredWorkflowContinuationAttempts))
+  const workflowContinuationAttemptLimit = Math.max(
+    0,
+    Math.floor(configuredWorkflowContinuationAttempts),
+  )
 
   let source = initialStream
   let sourceGeneration = 0
@@ -987,18 +1008,14 @@ export function createQwenAiResumableStream(
 
     // A response-id GET can only continue the provider's existing generation.
     // For a managed-tool semantic terminal, start a continuation user turn in
-    // the same chat instead of replaying that branch. By default, meaningful
-    // provider progress remains authoritative; the cumulative no-progress
-    // recovery budget still bounds admission failures and empty loops. A
-    // deployment may configure an explicit attempt limit, including zero.
+    // the same chat instead of replaying that branch. One bounded correction
+    // is allowed by default; the selected text protocol is responsible for
+    // making the initial branch unambiguous.
     if (
       !settled
       && semanticRecoveryEligible
       && options.continueWorkflow
-      && (
-        workflowContinuationAttemptLimit === undefined
-        || workflowContinuationAttempts < workflowContinuationAttemptLimit
-      )
+      && workflowContinuationAttempts < workflowContinuationAttemptLimit
     ) {
       const parentResponseId = options.getResponseId().trim()
       if (parentResponseId) {
@@ -1037,9 +1054,7 @@ export function createQwenAiResumableStream(
           console.warn('[QwenAI] Starting managed workflow continuation', JSON.stringify({
             parentResponseId,
             attempt: workflowContinuationAttempts,
-            ...(workflowContinuationAttemptLimit === undefined
-              ? { limitMode: 'provider_progress' }
-              : { maxAttempts: workflowContinuationAttemptLimit }),
+            maxAttempts: workflowContinuationAttemptLimit,
           }))
           const continued = await options.continueWorkflow(
             parentResponseId,
@@ -1761,6 +1776,7 @@ function createQwenAiSemanticEmptyError(): QwenAiUpstreamError {
   )
   // A reasoning-only completion is a response-shape problem, not evidence
   // that this account is invalid or rate limited.
+  error.status = 422
   error.accountFault = false
   return error
 }
@@ -1770,6 +1786,7 @@ function createQwenAiSemanticIncompleteError(): QwenAiUpstreamError {
     'Qwen AI completed with a dangling answer while managed tools were available',
     'qwen_ai_semantic_incomplete',
   )
+  error.status = 422
   error.accountFault = false
   return error
 }
@@ -1779,6 +1796,7 @@ function createQwenAiWrapperLeakError(): QwenAiUpstreamError {
     'Qwen AI returned an internal managed tool-result wrapper in assistant output',
     'qwen_ai_wrapper_leak',
   )
+  error.status = 422
   error.type = 'upstream_protocol_error'
   error.param = 'content'
   error.accountFault = false
@@ -1821,6 +1839,7 @@ function createQwenAiInvalidNativeToolArgumentsError(
   )
   error.type = 'tool_call_parse_error'
   error.param = 'tool_calls'
+  error.status = 422
   error.accountFault = false
   return error
 }
@@ -2039,10 +2058,35 @@ function isDanglingManagedToolAnswer(
   }
 
   return requiresManagedWorkflowCompletionMarker(plan)
-    && !hasManagedWorkflowCompletionMarker(content)
+    && !hasManagedWorkflowCompletionMarker(content, plan)
 }
 
-function stripManagedWorkflowMarkerFromSseFrames(frames: string[]): string[] {
+function logQwenAiManagedParseFailure(
+  path: 'stream' | 'non_stream',
+  plan: ToolCallingPlan,
+  parsed: {
+    toolCalls?: unknown[]
+    rawMatches?: unknown[]
+    invalidToolNames?: unknown[]
+    malformedReason?: string
+  },
+  content: string,
+): void {
+  console.warn('[QwenAI] Managed tool-call parse rejected', JSON.stringify({
+    path,
+    protocol: plan.protocol,
+    malformedReason: parsed.malformedReason || 'unspecified',
+    rawBlockCount: parsed.rawMatches?.length ?? 0,
+    parsedToolCallCount: parsed.toolCalls?.length ?? 0,
+    invalidToolNameCount: parsed.invalidToolNames?.length ?? 0,
+    contentCodePoints: Array.from(content).length,
+  }))
+}
+
+function replaceManagedWorkflowContentInSseFrames(
+  frames: string[],
+  visibleContent: string,
+): string[] {
   const parsedFrames = frames.map((frame) => {
     const match = /^data: ([^\r\n]+)/m.exec(frame)
     if (!match) return { frame }
@@ -2056,13 +2100,12 @@ function stripManagedWorkflowMarkerFromSseFrames(frames: string[]): string[] {
     return { frame, parsed, content: typeof content === 'string' ? content : undefined }
   })
   const combinedContent = parsedFrames.map(item => item.content ?? '').join('')
-  const strippedContent = stripManagedWorkflowCompletionMarker(combinedContent)
-  if (combinedContent === strippedContent) return frames
+  if (combinedContent === visibleContent) return frames
 
   let contentWritten = false
   return parsedFrames.map((item) => {
     if (item.content === undefined || !item.parsed) return item.frame
-    item.parsed.choices[0].delta.content = contentWritten ? '' : strippedContent
+    item.parsed.choices[0].delta.content = contentWritten ? '' : visibleContent
     contentWritten = true
     return `data: ${JSON.stringify(item.parsed)}\n\n`
   })
@@ -2078,13 +2121,14 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
     || code === 'qwen_ai_invalid_tool_arguments'
     || code === 'undeclared_native_tool_call'
     || code === 'malformed_tool_call'
+    || code === 'missing_tool_call'
 }
 
 function createQwenAiToolValidationError(
   failure: ToolStreamValidationFailure,
 ): QwenAiUpstreamError {
   const error = new Error(failure.message) as QwenAiUpstreamError
-  error.status = 502
+  error.status = 422
   error.type = failure.type
   error.param = failure.param
   error.code = failure.code
@@ -2098,7 +2142,7 @@ function createQwenAiUndeclaredNativeToolError(names: string[]): QwenAiUpstreamE
   const error = new Error(
     `Provider returned undeclared native tool call${uniqueNames.length === 1 ? '' : 's'}: ${uniqueNames.join(', ')}`,
   ) as QwenAiUpstreamError
-  error.status = 502
+  error.status = 422
   error.type = 'upstream_tool_error'
   error.param = 'tool_calls'
   error.code = 'undeclared_native_tool_call'
@@ -2119,12 +2163,12 @@ function isQwenAiInternalNativeTool(name: string): boolean {
 
 function createQwenAiIncompleteNativeToolError(names: string[]): QwenAiUpstreamError {
   const uniqueNames = [...new Set(names.filter(Boolean))]
-  return markQwenAiNextAccountReplay(createQwenAiToolValidationError({
+  return createQwenAiToolValidationError({
     message: `Provider returned declared native tool call${uniqueNames.length === 1 ? '' : 's'} with incomplete JSON arguments: ${uniqueNames.join(', ')}`,
     type: 'tool_call_parse_error',
     param: 'tool_calls',
     code: 'malformed_tool_call',
-  }))
+  })
 }
 
 function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
@@ -3042,16 +3086,16 @@ export class QwenAiAdapter {
     
     const lowerModel = model.toLowerCase()
     
-    if (MODEL_ALIASES[lowerModel]) {
-      return MODEL_ALIASES[lowerModel]
-    }
-    
     if (this.provider.modelMappings) {
       for (const [key, value] of Object.entries(this.provider.modelMappings)) {
         if (key.toLowerCase() === lowerModel) {
           return value
         }
       }
+    }
+
+    if (MODEL_ALIASES[lowerModel]) {
+      return MODEL_ALIASES[lowerModel]
     }
     
     return model
@@ -3235,14 +3279,24 @@ export class QwenAiAdapter {
         this.postWithRefreshRetry.bind(this),
         { providerId: this.provider.id, accountId: this.account.id },
       )
-      const preparedUserMessage = await scope.wait(
+      const requestMaxBytes = qwenAiRequestMaxBytesFromEnv()
+      const prepareUserMessage = (
+        transport: QwenAiMessageTransport | undefined,
+        managedDocumentMode?: QwenAiManagedDocumentMode,
+      ) => (
         prepareQwenAiMultimodalMessage(messages, uploader, {
-          transport: request.messageTransport,
+          transport,
+          managedToolCalling: request.managedToolCalling,
+          workflowContinuation: request.managedToolWorkflowContinuation,
+          managedDocumentMode,
+          requestMaxBytes,
           signal: scope.signal,
           deadlineAt: request.deadlineAt,
-        }),
+        })
       )
-      const qwenFiles = preparedUserMessage.files
+      let preparedUserMessage = await scope.wait(
+        prepareUserMessage(request.messageTransport),
+      )
 
       const fid = uuid()
       const childId = uuid()
@@ -3257,35 +3311,12 @@ export class QwenAiAdapter {
         modelCapability,
       )
 
-      console.info('[QwenAI] upstream request shape', JSON.stringify({
-        requestId: request.requestId,
-        accountId: this.account.id,
-        model: modelId,
-        sourceMessageCount: messages.length,
-        transcriptChars: preparedUserMessage.content.length,
-        transcriptUtf8Bytes: Buffer.byteLength(preparedUserMessage.content, 'utf8'),
-        conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
-        fileCount: qwenFiles.length,
-        messageTransport: request.messageTransport ?? 'inline',
+      const featureConfig = createQwenAiFeatureConfig({
         thinkingEnabled: shouldEnableThinking,
-        modelMaxContextTokens: modelCapability?.maxContextLength,
-        modelMaxSummaryTokens: modelCapability?.maxSummaryGenerationLength,
-      }))
-    
-      const featureConfig: Record<string, any> = {
-        thinking_enabled: shouldEnableThinking,
-        output_schema: 'phase',
-        research_mode: 'normal',
-        auto_thinking: shouldEnableThinking,
-        thinking_format: 'summary',
-        auto_search: false, // Default to disable auto search
-      }
+        thinkingBudget: request.thinking_budget,
+      })
 
-      if (request.thinking_budget) {
-        featureConfig.thinking_budget = request.thinking_budget
-      }
-
-      const payload = {
+      const createPayload = () => ({
         stream: true,
         version: '2.1',
         incremental_output: true,
@@ -3301,7 +3332,7 @@ export class QwenAiAdapter {
             role: 'user',
             content: preparedUserMessage.content,
             user_action: 'chat',
-            files: qwenFiles,
+            files: preparedUserMessage.files,
             timestamp: ts,
             models: [modelId],
             chat_type: chatType,
@@ -3320,7 +3351,69 @@ export class QwenAiAdapter {
         ],
         timestamp: ts + 1,
         ...(imageGeneration ? { size: imageGeneration.size } : {}),
+      })
+      let payload = createPayload()
+      let serializedPayload = JSON.stringify(payload)
+      let payloadBytes = Buffer.byteLength(serializedPayload, 'utf8')
+
+      // Treat the configured byte value as an offload target, not a client
+      // request ceiling. Qwen's document transport can preserve the complete
+      // context while reducing the completion JSON before its first POST.
+      if (
+        requestMaxBytes > 0
+        && payloadBytes > requestMaxBytes
+        && preparedUserMessage.transport !== 'document'
+      ) {
+        preparedUserMessage = await scope.wait(prepareUserMessage('document'))
+        payload = createPayload()
+        serializedPayload = JSON.stringify(payload)
+        payloadBytes = Buffer.byteLength(serializedPayload, 'utf8')
       }
+
+      if (
+        requestMaxBytes > 0
+        && payloadBytes > requestMaxBytes
+        && request.managedToolCalling
+        && preparedUserMessage.managedDocumentMode !== 'complete'
+      ) {
+        preparedUserMessage = await scope.wait(prepareUserMessage('document', 'complete'))
+        payload = createPayload()
+        serializedPayload = JSON.stringify(payload)
+        payloadBytes = Buffer.byteLength(serializedPayload, 'utf8')
+      }
+
+      if (requestMaxBytes > 0 && payloadBytes > requestMaxBytes) {
+        console.warn('[QwenAI] request remains above document-offload target', JSON.stringify({
+          requestId: request.requestId,
+          accountId: this.account.id,
+          payloadUtf8Bytes: payloadBytes,
+          requestTargetBytes: requestMaxBytes,
+          messageTransport: preparedUserMessage.transport,
+          managedDocumentMode: preparedUserMessage.managedDocumentMode,
+          fileCount: preparedUserMessage.files.length,
+        }))
+      }
+
+      console.info('[QwenAI] upstream request shape', JSON.stringify({
+        requestId: request.requestId,
+        accountId: this.account.id,
+        model: modelId,
+        sourceMessageCount: messages.length,
+        transcriptChars: preparedUserMessage.content.length,
+        transcriptUtf8Bytes: preparedUserMessage.transcriptUtf8Bytes,
+        inlineUtf8Bytes: preparedUserMessage.inlineUtf8Bytes,
+        payloadUtf8Bytes: payloadBytes,
+        requestTargetBytes: requestMaxBytes,
+        conservativeTextTokenEstimate: estimateQwenAiTranscriptTokens(preparedUserMessage.content),
+        fileCount: preparedUserMessage.files.length,
+        requestedMessageTransport: request.messageTransport ?? 'inline',
+        messageTransport: preparedUserMessage.transport,
+        managedDocumentMode: preparedUserMessage.managedDocumentMode,
+        managedToolCalling: request.managedToolCalling === true,
+        thinkingEnabled: shouldEnableThinking,
+        modelMaxContextTokens: modelCapability?.maxContextLength,
+        modelMaxSummaryTokens: modelCapability?.maxSummaryGenerationLength,
+      }))
 
       const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${chatId}`
 
@@ -3340,9 +3433,10 @@ export class QwenAiAdapter {
         request.timeoutMs ?? QWEN_AI_REQUEST_TIMEOUT_MS,
       ))
       response = await scope.wait(
-        this.postWithRefreshRetry(url, payload, () => ({
+        this.postWithRefreshRetry(url, serializedPayload, () => ({
           headers: {
             ...this.getHeaders(chatId),
+            'Content-Length': String(payloadBytes),
             'x-accel-buffering': 'no',
           },
           responseType: 'stream',
@@ -3466,17 +3560,10 @@ export class QwenAiAdapter {
       forceThinking,
       modelCapability,
     )
-    const featureConfig: Record<string, any> = {
-      thinking_enabled: shouldEnableThinking,
-      output_schema: 'phase',
-      research_mode: 'normal',
-      auto_thinking: shouldEnableThinking,
-      thinking_format: 'summary',
-      auto_search: false,
-    }
-    if (request.thinking_budget) {
-      featureConfig.thinking_budget = request.thinking_budget
-    }
+    const featureConfig = createQwenAiFeatureConfig({
+      thinkingEnabled: shouldEnableThinking,
+      thinkingBudget: request.thinking_budget,
+    })
 
     const fid = uuid()
     const childId = uuid()
@@ -4940,13 +5027,28 @@ export class QwenAiStreamHandler {
       }
 
       const emittedToolCall = this.toolStreamParser?.hasEmittedToolCall() ?? false
+      const managedParse = !emittedToolCall && this.toolCallingPlan?.shouldParseResponse
+        ? getToolProtocol(this.toolCallingPlan.protocol).parse(this.content, {
+            tools: this.toolCallingPlan.tools,
+            protocol: this.toolCallingPlan.protocol,
+            allowPartial: true,
+          })
+        : undefined
       const validationFailure = getToolStreamValidationFailure({
         plan: this.toolCallingPlan,
         emittedToolCall,
         pendingToolProtocol: hadPendingToolProtocol,
       })
       if (validationFailure) {
-        failStream(createQwenAiToolValidationError(validationFailure))
+        if (managedParse && this.toolCallingPlan) {
+          logQwenAiManagedParseFailure('stream', this.toolCallingPlan, managedParse, this.content)
+        }
+        const validationError = createQwenAiToolValidationError(validationFailure)
+        if (isQwenAiSemanticRecoveryError(validationError)) {
+          recoverFromSemanticEmpty(validationError)
+        } else {
+          failStream(validationError)
+        }
         return
       }
 
@@ -4958,10 +5060,21 @@ export class QwenAiStreamHandler {
         return
       }
 
-      if (!emittedToolCall && hasManagedWorkflowCompletionMarker(this.content)) {
-        this.content = stripManagedWorkflowCompletionMarker(this.content)
+      const completionProof = parseManagedWorkflowCompletionProof(
+        this.content,
+        this.toolCallingPlan,
+      )
+      if (!emittedToolCall && completionProof.complete) {
+        if (!completionProof.content.trim()) {
+          recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+          return
+        }
+        this.content = completionProof.content
         if (buffersManagedCandidate) {
-          managedBranchFrames = stripManagedWorkflowMarkerFromSseFrames(managedBranchFrames)
+          managedBranchFrames = replaceManagedWorkflowContentInSseFrames(
+            managedBranchFrames,
+            completionProof.content,
+          )
           managedBranchBytes = managedBranchFrames.reduce(
             (total, frame) => total + Buffer.byteLength(frame),
             0,
@@ -5470,16 +5583,48 @@ export class QwenAiStreamHandler {
 
         if (finishNativeToolCalls()) return
 
+        if (this.toolCallingPlan?.shouldParseResponse) {
+          const managedParse = getToolProtocol(this.toolCallingPlan.protocol).parse(answerText, {
+            tools: this.toolCallingPlan.tools,
+            protocol: this.toolCallingPlan.protocol,
+            allowPartial: true,
+          })
+          const managedValidationFailure = getToolStreamValidationFailure({
+            plan: this.toolCallingPlan,
+            emittedToolCall: (managedParse.toolCalls?.length ?? 0) > 0,
+            pendingToolProtocol: (managedParse.rawMatches?.length ?? 0) > 0,
+          })
+          if (managedValidationFailure) {
+            logQwenAiManagedParseFailure(
+              'non_stream',
+              this.toolCallingPlan,
+              managedParse,
+              answerText,
+            )
+            recoverFromSemanticEmpty(createQwenAiToolValidationError(managedValidationFailure))
+            return
+          }
+        }
+
         if (isDanglingManagedToolAnswer(answerText, this.toolCallingPlan)) {
           recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
           return
         }
 
-        if (hasManagedWorkflowCompletionMarker(answerText)) {
-          choice.message.content = stripManagedWorkflowCompletionMarker(answerText)
+        const completionProof = parseManagedWorkflowCompletionProof(
+          answerText,
+          this.toolCallingPlan,
+        )
+        if (completionProof.complete) {
+          if (!completionProof.content.trim()) {
+            recoverFromSemanticEmpty(createQwenAiSemanticIncompleteError())
+            return
+          }
+          choice.message.content = completionProof.content
         }
 
-        if (!answerText.trim() && finalReasoning.trim()) {
+        const visibleAnswerText = choice.message.content || ''
+        if (!visibleAnswerText.trim() && finalReasoning.trim()) {
           if (options.allowReasoningOnlyOutput) {
             choice.message.content = finalReasoning
             console.info('[QwenAI] Accepted non-stream reasoning-only output for context compaction', JSON.stringify({
@@ -5492,7 +5637,7 @@ export class QwenAiStreamHandler {
           }
         }
 
-        if (!answerText.trim() && !finalReasoning.trim()) {
+        if (!visibleAnswerText.trim() && !finalReasoning.trim()) {
           rejectOnce(createQwenAiStreamFailure(
             'Qwen AI returned an empty response stream without answer or reasoning content',
             'qwen_ai_empty_stream',

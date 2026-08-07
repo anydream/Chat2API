@@ -6,7 +6,7 @@ const timeoutMs = Number(process.env.CHAT2API_LIVE_TIMEOUT_MS || 900000)
 // By default, use the same end-to-end budget as the real client. A caller can
 // still impose a separate header target when measuring first-response latency.
 const headerMaxMs = Number(process.env.CHAT2API_LIVE_HEADER_MAX_MS || timeoutMs)
-const model = process.env.CHAT2API_LIVE_MODEL || 'Qwen3.8-Max-Preview'
+const model = String(process.env.CHAT2API_LIVE_MODEL || '').trim()
 const baseUrl = process.env.CHAT2API_LIVE_BASE_URL
   || (protocol === 'anthropic' ? 'http://127.0.0.1:4000/v1' : 'http://127.0.0.1:8080/v1')
 const apiKey = process.env.CHAT2API_LIVE_API_KEY
@@ -19,6 +19,7 @@ const sourceMarkers = Array.from(
 assert.ok(Number.isSafeInteger(sourceChars) && sourceChars > 0, 'CHAT2API_LIVE_CHARS must be positive')
 assert.ok(Number.isSafeInteger(timeoutMs) && timeoutMs > 0, 'CHAT2API_LIVE_TIMEOUT_MS must be positive')
 assert.ok(Number.isSafeInteger(headerMaxMs) && headerMaxMs > 0, 'CHAT2API_LIVE_HEADER_MAX_MS must be positive')
+assert.ok(model, 'CHAT2API_LIVE_MODEL must be set to the client-selected model')
 assert.ok(protocol === 'openai' || protocol === 'anthropic', 'protocol must be openai or anthropic')
 
 const compactInstruction = [

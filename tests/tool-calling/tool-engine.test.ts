@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ToolCallingEngine } from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
+import { MANAGED_TOOL_PROMPT_MESSAGE_NAME } from '../../src/main/proxy/toolCalling/managedPromptMetadata.ts'
 import type { ChatCompletionRequest } from '../../src/main/proxy/types.ts'
 import type { Provider } from '../../src/main/store/types.ts'
 
@@ -14,6 +15,13 @@ const provider = {
   enabled: true,
   createdAt: 0,
   updatedAt: 0,
+} as Provider
+
+const qwenAiProvider = {
+  ...provider,
+  id: 'qwen-ai',
+  name: 'Qwen AI',
+  apiEndpoint: 'https://chat.qwen.ai',
 } as Provider
 
 const tools = [
@@ -107,6 +115,27 @@ test('OpenAI tools plus DeepSeek choose managed prompt', () => {
   assert.match(result.messages[0].content as string, /<\|CHAT2API\|parameter name="content">/)
   assert.match(result.messages[0].content as string, /<\|CHAT2API\|invoke name="default_api:todowrite">/)
   assert.match(result.messages[0].content as string, /\[\{"content":"\.\.\.content\.\.\.","status":"\.\.\.status\.\.\.","priority":"\.\.\.priority\.\.\."\}\]/)
+})
+
+test('matched profile key selects Qwen Hermes for a custom provider instance', () => {
+  const customProvider = {
+    ...qwenAiProvider,
+    id: 'custom-qwen-instance',
+    type: 'custom',
+  } as Provider
+  const result = new ToolCallingEngine().transformRequest({
+    request: request({ model: 'configured-client-model' }),
+    provider: customProvider,
+    providerProfileKey: 'qwen-ai',
+    actualModel: 'configured-provider-model',
+  })
+
+  assert.equal(result.plan.protocol, 'qwen_hermes')
+  assert.equal(result.plan.providerId, 'custom-qwen-instance')
+  assert.equal(result.plan.diagnostics.providerId, 'custom-qwen-instance')
+  assert.match(String(result.messages[0].content), /<tools>/)
+  assert.match(String(result.messages[0].content), /chat2api_workflow_complete/)
+  assert.doesNotMatch(String(result.messages[0].content), /<\|CHAT2API\|tool_calls>/)
 })
 
 test('explicit Cherry Studio MCP adapter uses managed prompt and preserves tool names', () => {
@@ -876,4 +905,40 @@ test('non-stream parsing removes malformed managed XML without fabricating optio
   assert.equal(result.choices[0].message.tool_calls, undefined)
   assert.equal(result.choices[0].message.content, 'before')
   assert.equal(result.choices[0].finish_reason, 'stop')
+})
+
+test('non-stream Qwen Hermes rejects a malformed auto tool block as structured 422', () => {
+  const engine = new ToolCallingEngine()
+  const transformed = engine.transformRequest({
+    request: request({
+      messages: [
+        { role: 'system', content: 'client system context' },
+        { role: 'user', content: 'read /tmp/a' },
+      ],
+    }),
+    provider: qwenAiProvider,
+    actualModel: 'qwen3.8-max',
+  })
+  assert.equal(transformed.messages[0].content, 'client system context')
+  assert.equal(transformed.messages[1].name, MANAGED_TOOL_PROMPT_MESSAGE_NAME)
+  assert.match(String(transformed.messages[1].content), /<tools>/)
+  const result: any = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/a"}',
+      },
+      finish_reason: 'stop',
+    }],
+  }
+
+  assert.throws(
+    () => engine.applyNonStreamResponse(result, transformed.plan),
+    (error: Error & { status?: number, code?: string, retryable?: boolean }) => (
+      error.status === 422
+      && error.code === 'malformed_tool_call'
+      && error.retryable === false
+    ),
+  )
+  assert.equal(result.choices[0].message.tool_calls, undefined)
 })

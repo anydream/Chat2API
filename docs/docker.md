@@ -173,6 +173,13 @@ CHAT2API_LOG_LEVEL=info
 CHAT2API_LOAD_BALANCE_STRATEGY=round-robin
 CHAT2API_STORAGE_ENCRYPTION_KEY=
 CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
+# Repair JWT-only Qwen AI accounts by obtaining the Web session cookie.
+CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED=true
+CHAT2API_QWEN_AI_SESSION_REPAIR_INTERVAL_MS=25000
+CHAT2API_QWEN_AI_SESSION_REPAIR_RESCAN_MS=60000
+CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS=180000
+CHAT2API_QWEN_AI_SESSION_REPAIR_FAILURE_RETRY_MS=300000
+CHAT2API_QWEN_AI_SESSION_REPAIR_CREDENTIAL_RETRY_MS=21600000
 # Optional guarded throughput profile for a larger Qwen AI account pool.
 # These environment values override persisted governor settings.
 CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED=true
@@ -182,9 +189,15 @@ CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS=30000
 QWEN_AI_REQUEST_TIMEOUT_MS=540000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
+QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS=2000
+QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
 QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
-CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=
+CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
+CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
+CHAT2API_QWEN_AI_RETRY_COUNT=1
+CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
+CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
 CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
@@ -198,6 +211,16 @@ CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 
 Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
 
+For Qwen AI, `active` means the stored JWT passed account validation. It does
+not by itself mean that the account has the `token=...` cookie required by the
+Qwen Web chat endpoints. The background session repair service signs in with a
+stored email and password, persists the returned JWT and `Set-Cookie` values,
+and then marks the account's Web session as ready in the Qwen governor panel.
+Repairs run one account at a time. HTTP 403 or 429 pauses the entire repair
+sweep for `CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS`; other failures and
+credential failures use their separate retry intervals. Set
+`CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED=false` to disable this service.
+
 The Qwen AI queue timeout applies only while waiting for a governor slot. The
 cumulative request deadline starts at route entry and is preserved across
 account failover, queue waits, retries, compaction stages, file upload and
@@ -210,6 +233,13 @@ additional post-admission response limit is disabled when
 `QWEN_AI_RESPONSE_TIMEOUT_MS=0`; the cumulative request deadline remains in
 force. Set a positive value to impose a shorter response-only cap. A stream
 with no meaningful progress still fails after 180 seconds by default.
+Document parsing has its own per-account stage limit. When parsing remains
+unfinished for `QWEN_AI_FILE_PARSE_TIMEOUT_MS`, Chat2API reports
+`504/qwen_ai_file_parse_timeout` internally and continues the same request on
+another eligible account without marking the previous account faulty. The
+polling cadence is controlled by `QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS`. If the
+cumulative request deadline expires first, `qwen_ai_request_timeout` remains
+terminal and does not trigger account failover.
 When using the bundled LiteLLM Compose service, its generic outer
 `REQUEST_TIMEOUT` defaults to `900` seconds (via `LITELLM_REQUEST_TIMEOUT`).
 The bundled LiteLLM configuration maps
@@ -251,19 +281,29 @@ each request it is also clamped to the remaining `QWEN_AI_REQUEST_TIMEOUT_MS`
  `504/qwen_ai_workflow_recovery_timeout`. If the cumulative request deadline
  expires first, it returns `504/qwen_ai_request_timeout`. Neither penalizes the
  account.
-Qwen receives the OpenAI message history as one provider prompt. Chat2API
-forwards the complete rendered transcript without applying a proxy-side size
-limit or compacting messages, tool arguments, or tool results.
+Before the first Qwen completion POST, Chat2API measures the serialized UTF-8
+JSON body. `CHAT2API_QWEN_AI_REQUEST_MAX_BYTES` defaults to `92160` bytes as a
+document-offload target, not a local client request limit (`0` disables
+automatic offload). An oversized request first moves archived history and
+complete managed tool documentation to Qwen documents while retaining the
+active task and tool exchange inline. If that hybrid layout is still above the
+target, the complete managed conversation moves to the transcript document and
+only compact tool control remains inline. The original client messages,
+completed tool results, and validation schemas are preserved. A body that still
+exceeds the target after this reduction is submitted to Qwen instead of being
+rejected locally with HTTP 413.
+`CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS` controls each compact
+inline tool description while the complete description remains in the tool
+reference attachment; `0` omits inline descriptions.
 When a managed-tool response reaches a semantic terminal without a tool call,
-Chat2API starts a new user-turn continuation in the same Qwen chat instead of
+Chat2API can start one corrective user turn in the same Qwen chat instead of
 replaying that completed response branch or the original transcript. A fresh
-chat replay is reserved for an undeclared provider-native tool call. By default,
-`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` is blank: genuine Qwen
-progress remains authoritative within the absolute workflow recovery deadline;
-the shared no-progress budget separately bounds stalled admission and empty
-retry loops. Set a positive integer only to impose a deployment-specific turn
-cap, or `0` to disable semantic recovery. The new turn is parented to Qwen's
-latest `response_id` and does not resend the original messages or files.
+chat replay is reserved for an undeclared provider-native tool call. The
+`CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS` default is `1`; `0` disables
+semantic recovery and positive values are bounded by the absolute workflow
+recovery deadline.
+The new turn is parented to Qwen's latest `response_id` and does not resend the
+original messages or files.
 If Qwen is still finalizing the parent response, its continuation endpoint
 returns HTTP 200 JSON with `code=CHAT_IN_PROGRESS` instead of an SSE stream.
 Chat2API waits with exponential backoff and retries the exact same continuation

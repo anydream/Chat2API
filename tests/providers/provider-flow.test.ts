@@ -323,14 +323,14 @@ test('domestic Qwen models match the web chat model ids captured from HAR', () =
   assert.deepEqual(en.qwen.models, expectedMappings)
 })
 
-test('Qwen AI defaults keep only the filtered current web model set', () => {
+test('Qwen AI defaults prefer the configured stable model while retaining explicit compatibility mappings', () => {
   const expectedModels = [
-    'Qwen3.8-Max-Preview',
+    'Qwen3.8-Max',
     'Qwen3.7-Plus',
     'Qwen3.7-Max',
-    'Qwen3.6-Plus',
   ]
   const expectedMappings = {
+    'Qwen3.8-Max': 'qwen3.8-max',
     'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
     'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',
@@ -360,7 +360,8 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
   }
 
   const qwenAiAdapterSource = readFileSync(join(root, 'src/main/proxy/adapters/qwen-ai.ts'), 'utf8')
-  assert.match(qwenAiAdapterSource, /'qwen3\.8':\s*'qwen3\.8-max-preview'/)
+  assert.match(qwenAiAdapterSource, /'qwen3\.8':\s*'qwen3\.8-max'/)
+  assert.match(qwenAiAdapterSource, /'qwen3\.8-max-preview':\s*'qwen3\.8-max-preview'/)
   assert.match(qwenAiAdapterSource, /qwen:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /qwen3:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /'qwen3\.7':\s*'qwen3\.7-max'/)

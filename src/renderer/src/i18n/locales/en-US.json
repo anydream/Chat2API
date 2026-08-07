@@ -545,6 +545,14 @@
       "globalRiskThreshold": "Global circuit threshold",
       "accountStatus": "Account cooldown status",
       "accountStatusDesc": "Shows queued requests, rate-limit waits, risk cooldowns, and load-balancer circuit state for Qwen AI accounts.",
+      "webSession": "Web session",
+      "webSessionStates": {
+        "ready": "Ready",
+        "pending": "Pending repair",
+        "repairing": "Repairing",
+        "backoff": "Retry backoff",
+        "unrepairable": "Missing login"
+      },
       "queue": "Queue",
       "activeShort": "Active",
       "nextAvailable": "Next available",

@@ -522,10 +522,16 @@ def _chat2api_skip_anthropic_field(content_type: Any, field_name: str) -> bool:
     )
 
 
-def _chat2api_text_token_upper_bound(value: str) -> int:
-    """Return an allocation-free upper bound for byte-level BPE tokens."""
-    bytes_per_character = 1 if value.isascii() else 4
-    return len(value) * bytes_per_character
+def _chat2api_text_token_estimate(value: str, start: int = 0) -> int:
+    """Match Chat2API's Qwen transcript estimate without allocating a copy."""
+    character_count = max(0, len(value) - start)
+    if value.isascii():
+        return (character_count + 2) // 3
+
+    ascii_characters = sum(
+        1 for index in range(start, len(value)) if ord(value[index]) <= 0x7F
+    )
+    return (ascii_characters + 2) // 3 + character_count - ascii_characters
 
 
 def _chat2api_new_count_state() -> dict[str, Any]:
@@ -555,7 +561,7 @@ def _chat2api_count_text_bounded(
     available = _CHAT2API_ANTHROPIC_MAX_TOKENIZED_CHARS - state["text_chars"]
     if available <= 0:
         state["truncated"] = True
-        state["fallback_tokens"] += _chat2api_text_token_upper_bound(value)
+        state["fallback_tokens"] += _chat2api_text_token_estimate(value)
         return 0
 
     if len(value) <= _CHAT2API_ANTHROPIC_TOKENIZER_CHUNK_CHARS and len(value) <= available:
@@ -564,16 +570,14 @@ def _chat2api_count_text_bounded(
             return count_function(value)
         except Exception:
             state["truncated"] = True
-            state["fallback_tokens"] += _chat2api_text_token_upper_bound(value)
+            state["fallback_tokens"] += _chat2api_text_token_estimate(value)
             return 0
 
     text = value[:available]
     state["text_chars"] += len(text)
     if len(text) != len(value):
         state["truncated"] = True
-        remaining_characters = len(value) - len(text)
-        bytes_per_character = 1 if value.isascii() else 4
-        state["fallback_tokens"] += remaining_characters * bytes_per_character
+        state["fallback_tokens"] += _chat2api_text_token_estimate(value, start=len(text))
 
     tokens = 0
     for offset in range(0, len(text), _CHAT2API_ANTHROPIC_TOKENIZER_CHUNK_CHARS):
@@ -582,11 +586,9 @@ def _chat2api_count_text_bounded(
             tokens += count_function(chunk)
         except Exception:
             state["truncated"] = True
-            # One token per possible UTF-8 byte is conservative without
-            # allocating an encoded copy of the request text.
-            tokens += _chat2api_text_token_upper_bound(chunk)
+            tokens += _chat2api_text_token_estimate(chunk)
             remaining = text[offset + len(chunk) :]
-            state["fallback_tokens"] += _chat2api_text_token_upper_bound(remaining)
+            state["fallback_tokens"] += _chat2api_text_token_estimate(remaining)
             break
     return tokens
 
@@ -621,7 +623,7 @@ def _chat2api_add_fallback_value(value: Any, state: dict[str, Any]) -> None:
             continue
 
         if isinstance(current, str):
-            state["fallback_tokens"] += max(1, _chat2api_text_token_upper_bound(current))
+            state["fallback_tokens"] += max(1, _chat2api_text_token_estimate(current))
             continue
         if current is None:
             state["fallback_tokens"] += 1
@@ -655,7 +657,7 @@ def _chat2api_add_fallback_value(value: Any, state: dict[str, Any]) -> None:
                 if appended >= available:
                     _chat2api_exhaust_fallback_inspection(state)
                     return
-                state["fallback_tokens"] += _chat2api_text_token_upper_bound(nested_field)
+                state["fallback_tokens"] += _chat2api_text_token_estimate(nested_field)
                 pending.append((nested_value, nested_field, content_type))
                 appended += 1
             continue
@@ -731,7 +733,7 @@ def _chat2api_count_anthropic_document_source(
             # small bounded identifier contribution in addition to the generic
             # unresolved-document allowance above.
             if isinstance(nested_value, str):
-                tokens += min(_chat2api_text_token_upper_bound(nested_value), 4_096)
+                tokens += min(_chat2api_text_token_estimate(nested_value), 4_096)
         else:
             tokens += _chat2api_count_anthropic_value_inner(
                 nested_value,

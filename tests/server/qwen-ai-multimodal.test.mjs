@@ -60,9 +60,10 @@ test('Qwen AI OSS uploads use multipart upload for web-sized video files', () =>
 test('Qwen AI document upload waits for parse completion with a bounded timeout', () => {
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
 
-  assert.match(source, /const PARSE_POLL_TIMEOUT_MS = 120000/)
+  assert.match(source, /QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS',\s*2000/)
+  assert.match(source, /QWEN_AI_FILE_PARSE_TIMEOUT_MS',\s*120000/)
   assert.match(source, /while \(Date\.now\(\) < pollingDeadlineAt\)/)
-  assert.match(source, /Qwen AI file parse timed out after/)
+  assert.match(source, /createQwenAiFileParseTimeoutError\(parseTimeoutMs, lastStatus\)/)
   assert.doesNotMatch(source, /const PARSE_POLL_ATTEMPTS = 5/)
 })
 
@@ -107,7 +108,7 @@ test('Qwen AI multimodal helper preserves full tool-call transcript instead of o
   const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai-files.ts', 'utf8')
 
   assert.match(source, /function buildQwenAiTranscript\(messages: ChatMessage\[\]\)/)
-  assert.match(source, /getProviderToolProfile\('qwen'\)/)
+  assert.match(source, /getProviderToolProfile\('qwen-ai'\)/)
   assert.match(source, /msg\.role === 'assistant'/)
   assert.match(source, /msg\.tool_calls\?\.length/)
   assert.match(source, /formatAssistantToolCalls\(transcriptCalls\)/)
@@ -117,7 +118,7 @@ test('Qwen AI multimodal helper preserves full tool-call transcript instead of o
   assert.match(source, /msg\.role === 'tool'/)
   assert.match(source, /formatToolResult\(\{/)
   assert.match(source, /isError,/)
-  assert.match(source, /Use this result to decide the next step\./)
+  assert.doesNotMatch(source, /Use this result to decide the next step\./)
   assert.doesNotMatch(source, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(source, /renderCompletedToolState|Authoritative completed tool ledger|Do not repeat an already successful operation/)
   assert.match(source, /fileParts\.push\(\.\.\.messageFileParts\)/)
@@ -272,9 +273,21 @@ test('Qwen AI adapter sends prepared multimodal files instead of a fixed empty l
 
   assert.match(source, /QwenAiFileUploader/)
   assert.match(source, /prepareQwenAiMultimodalMessage/)
-  assert.match(source, /const qwenFiles = preparedUserMessage\.files/)
-  assert.match(chatCompletionSource, /files:\s*qwenFiles/)
+  assert.match(chatCompletionSource, /files:\s*preparedUserMessage\.files/)
   assert.doesNotMatch(chatCompletionSource, /files:\s*\[\]/)
+})
+
+test('Qwen AI adapter measures and sends the same serialized UTF-8 request body', () => {
+  const source = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
+  const chatCompletionSource = source.slice(
+    source.indexOf('async chatCompletion('),
+    source.indexOf('async resumeChatCompletion('),
+  )
+
+  assert.match(chatCompletionSource, /serializedPayload = JSON\.stringify\(payload\)/)
+  assert.match(chatCompletionSource, /Buffer\.byteLength\(serializedPayload, 'utf8'\)/)
+  assert.match(chatCompletionSource, /postWithRefreshRetry\(url, serializedPayload,/)
+  assert.match(chatCompletionSource, /'Content-Length': String\(payloadBytes\)/)
 })
 
 test('Qwen AI adapter request timeout is configurable for long-context document runs', () => {
@@ -302,6 +315,11 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(source, /CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS:-120000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:\s*\$\{CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000\}/)
   assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-540000\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:\s*\$\{CHAT2API_QWEN_AI_REQUEST_MAX_BYTES:-92160\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:\s*\$\{CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS:-240\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_RETRY_COUNT:-1\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:\s*\$\{CHAT2API_QWEN_AI_BUSY_RETRY_COUNT:-1\}/)
+  assert.match(source, /CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:\s*\$\{CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS:-1\}/)
   const transcriptEnvironmentNames = [
     'MAX_BYTES',
     'REQUEST_RESERVE_BYTES',
@@ -316,10 +334,17 @@ test('Docker Compose exposes Qwen timeout overrides under their runtime names', 
   assert.match(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{QWEN_AI_REQUEST_TIMEOUT_MS:-540000\}/)
   assert.match(source, /QWEN_AI_RESPONSE_TIMEOUT_MS:\s*\$\{QWEN_AI_RESPONSE_TIMEOUT_MS:-0\}/)
   assert.match(source, /QWEN_AI_STREAM_IDLE_TIMEOUT_MS:\s*\$\{QWEN_AI_STREAM_IDLE_TIMEOUT_MS:-180000\}/)
+  assert.match(source, /QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS:\s*\$\{QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS:-2000\}/)
+  assert.match(source, /QWEN_AI_FILE_PARSE_TIMEOUT_MS:\s*\$\{QWEN_AI_FILE_PARSE_TIMEOUT_MS:-120000\}/)
   assert.doesNotMatch(source, /QWEN_AI_REQUEST_TIMEOUT_MS:\s*\$\{CHAT2API_QWEN_AI_REQUEST_TIMEOUT_MS/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000/)
   assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_RETRY_COUNT=1/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1/)
+  assert.match(dockerfile, /ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1/)
   assert.match(dockerfile, /ENV QWEN_AI_REQUEST_TIMEOUT_MS=540000/)
   assert.match(dockerfile, /ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0/)
   assert.match(governorSource, /numberFromEnv\('CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS',\s*120 \* 1000\)/)
@@ -439,7 +464,7 @@ test('Qwen AI non-stream responses reject empty upstream output instead of retur
 
   assert.match(source, /let sawAnswerFinish = false/)
   assert.match(source, /let sawUpstreamCompletion = false/)
-  assert.match(source, /if \(!answerText\.trim\(\) && !finalReasoning\.trim\(\)\)/)
+  assert.match(source, /if \(!visibleAnswerText\.trim\(\) && !finalReasoning\.trim\(\)\)/)
   assert.match(source, /rejectOnce\(createQwenAiStreamFailure\([\s\S]*'Qwen AI returned an empty response stream without answer or reasoning content',[\s\S]*'qwen_ai_empty_stream'/)
   assert.match(source, /if \(!sawUpstreamCompletion\) \{[\s\S]*rejectOnce\(createQwenAiStreamFailure\('Qwen AI response stream closed before an upstream completion signal'\)\)/)
 })

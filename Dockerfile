@@ -37,6 +37,14 @@ ENV CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS=0
 # Keep the adaptive pacing floor aligned with the validated multi-account
 # deployment; upstream 429/risk responses still control account cooldowns.
 ENV CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
+# Repair active Qwen AI accounts that have a JWT but no Web session cookie.
+# Sign-ins are serialized and globally paused when Qwen returns risk control.
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_ENABLED=true
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_INTERVAL_MS=25000
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_RESCAN_MS=60000
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_RISK_COOLDOWN_MS=180000
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_FAILURE_RETRY_MS=300000
+ENV CHAT2API_QWEN_AI_SESSION_REPAIR_CREDENTIAL_RETRY_MS=21600000
 # Docker deployments allow long active generations within the cumulative
 # request deadline while separately bounding streams that stop producing data.
 # Queue admission has its own timer but still shares the route deadline.
@@ -47,6 +55,16 @@ ENV CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS=1
 # Managed answers and tool arguments remain private until terminal validation.
 # Genuine Qwen reasoning is forwarded live while account failover stays active.
 ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
+# Start document offload before a large Qwen Web request reaches its model context.
+# This is a transport target, not a local client request limit; zero disables it.
+ENV CHAT2API_QWEN_AI_REQUEST_MAX_BYTES=92160
+# Bound inline Hermes routing summaries while complete tool documentation stays
+# in the account-scoped reference attachment. Zero omits inline descriptions.
+ENV CHAT2API_QWEN_AI_HERMES_ROUTING_SUMMARY_MAX_CODE_POINTS=240
+# Managed-branch and upstream-busy recovery counts are deployment controls.
+# Their request deadlines remain authoritative; zero disables each path.
+ENV CHAT2API_QWEN_AI_RETRY_COUNT=1
+ENV CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
 # A transport reset can continue the same Qwen response without resubmitting
 # the prompt. Deployments can tune or disable this bounded recovery budget.
 ENV CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS=3
@@ -54,6 +72,8 @@ ENV CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS=1000
 # Response-id resumes and managed workflow continuations share this
 # no-progress budget; it pauses while a replacement stream is active.
 ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
+# Default to one same-chat semantic correction; the deployment controls the count.
+ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 # Semantic continuation branches also share an absolute wall-clock deadline.
 ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
 # Busy-chat admission is bounded separately from the long generation timeout.
@@ -68,6 +88,10 @@ ENV QWEN_AI_REQUEST_TIMEOUT_MS=540000
 # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline still bounds the full request.
 ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0
 ENV QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
+# Bound each account's document parse stage independently so a stalled parse
+# can move to another account while the cumulative request deadline remains.
+ENV QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS=2000
+ENV QWEN_AI_FILE_PARSE_TIMEOUT_MS=120000
 ENV QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS=240000
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force

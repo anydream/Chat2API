@@ -9,11 +9,12 @@ const tools = [
 ]
 
 function plan(protocol: ToolCallingPlan['protocol'] = 'managed_xml'): ToolCallingPlan {
+  const qwenHermes = protocol === 'qwen_hermes'
   return {
     mode: 'managed',
     protocol,
     clientAdapterId: 'standard-openai-tools',
-    providerId: 'deepseek',
+    providerId: qwenHermes ? 'qwen-ai' : 'deepseek',
     tools,
     shouldInjectPrompt: true,
     shouldParseResponse: true,
@@ -23,9 +24,9 @@ function plan(protocol: ToolCallingPlan['protocol'] = 'managed_xml'): ToolCallin
     failedToolResultPending: false,
     diagnostics: {
       clientAdapterId: 'standard-openai-tools',
-      providerId: 'deepseek',
-      model: 'deepseek-chat',
-      actualModel: 'deepseek-chat',
+      providerId: qwenHermes ? 'qwen-ai' : 'deepseek',
+      model: qwenHermes ? 'qwen3' : 'deepseek-chat',
+      actualModel: qwenHermes ? 'qwen3' : 'deepseek-chat',
       toolSource: 'openai',
       mode: 'managed',
       protocol,
@@ -503,4 +504,154 @@ test('large accumulated content can recover a final tool call without fabricatin
   assert.deepEqual(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments), {
     filePath: '/tmp/recovered-large-context.txt',
   })
+})
+
+test('Qwen Hermes marker split across chunks is buffered and emitted on stream flush', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+
+  assert.deepEqual(parser.push('<tool_', baseChunk), [])
+  assert.deepEqual(
+    parser.push('call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/a"}}</tool_call>', baseChunk),
+    [],
+  )
+
+  const chunks = parser.flush(baseChunk)
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.tool_calls[0].function.name, 'default_api:read_file')
+  assert.deepEqual(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments), {
+    filePath: '/tmp/a',
+  })
+})
+
+test('Qwen Hermes stream preserves adjacent parallel calls across input chunks', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+
+  assert.deepEqual(
+    parser.push('<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/a"}}</tool_call>', baseChunk),
+    [],
+  )
+  assert.deepEqual(
+    parser.push('\n<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/b"}}</tool_call>', baseChunk),
+    [],
+  )
+
+  const chunks = parser.flush(baseChunk)
+  const toolChunks = chunks.filter((chunk) => chunk.choices[0].delta.tool_calls)
+  assert.equal(toolChunks.length, 2)
+  assert.deepEqual(
+    toolChunks.map((chunk) => JSON.parse(chunk.choices[0].delta.tool_calls[0].function.arguments).filePath),
+    ['/tmp/a', '/tmp/b'],
+  )
+})
+
+test('Qwen Hermes stream recovers open-only XML calls split across chunks on flush', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+
+  assert.deepEqual(
+    parser.push(
+      '<tool_call>\n<function=default_api:read_file>\n<parameter=filePath>/tmp/a</parameter>\n</function>\n<tool_',
+      baseChunk,
+    ),
+    [],
+  )
+  assert.deepEqual(
+    parser.push(
+      'call>\n<function=default_api:read_file>\n<parameter=filePath>/tmp/b</parameter>\n</function>\n',
+      baseChunk,
+    ),
+    [],
+  )
+
+  const chunks = parser.flush(baseChunk)
+  const toolChunks = chunks.filter(chunk => chunk.choices[0].delta.tool_calls)
+  assert.deepEqual(
+    toolChunks.map(chunk => JSON.parse(chunk.choices[0].delta.tool_calls[0].function.arguments).filePath),
+    ['/tmp/a', '/tmp/b'],
+  )
+})
+
+test('Qwen Hermes stream rejects a trailing open-only delimiter after a complete XML call', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  parser.push(
+    '<tool_call><function=default_api:read_file><parameter=filePath>/tmp/a</parameter></function><tool_call>',
+    baseChunk,
+  )
+
+  assert.deepEqual(parser.flush(baseChunk), [])
+  assert.equal(parser.hasEmittedToolCall(), false)
+  assert.equal(parser.hasPendingToolProtocol(), true)
+})
+
+test('Qwen Hermes stream recovers complete JSON with a missing end tag only on flush', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  assert.deepEqual(
+    parser.push('<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/partial"}}', baseChunk),
+    [],
+  )
+
+  const chunks = parser.flush(baseChunk)
+  assert.equal(chunks.length, 1)
+  assert.equal(
+    JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments).filePath,
+    '/tmp/partial',
+  )
+})
+
+test('Qwen Hermes stream drops truncated JSON instead of inventing arguments', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  assert.deepEqual(
+    parser.push('<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/a', baseChunk),
+    [],
+  )
+
+  assert.deepEqual(parser.flush(baseChunk), [])
+  assert.equal(parser.hasPendingToolProtocol(), true)
+})
+
+test('Qwen Hermes stream rejects an entire mixed valid and invalid batch', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  const batch = [
+    '<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"/tmp/a"}}</tool_call>',
+    '<tool_call>{"name":"undeclared_tool","arguments":{}}</tool_call>',
+  ].join('\n')
+
+  assert.deepEqual(parser.push(batch, baseChunk), [])
+  assert.deepEqual(parser.flush(baseChunk), [])
+  assert.equal(parser.hasEmittedToolCall(), false)
+  assert.equal(parser.hasPendingToolProtocol(), true)
+})
+
+test('Qwen Hermes guard preserves managed-result marker text inside tool arguments', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  const literal = '<|CHAT2API|tool_result tool_call_id="fixture">value</|CHAT2API|tool_result>'
+  const block = `<tool_call>${JSON.stringify({
+    name: 'default_api:read_file',
+    arguments: { filePath: literal },
+  })}</tool_call>`
+
+  assert.deepEqual(parser.push(block, baseChunk), [])
+  const chunks = parser.flush(baseChunk)
+  assert.equal(parser.hasDetectedWrapperLeak(), false)
+  assert.equal(JSON.parse(chunks[0].choices[0].delta.tool_calls[0].function.arguments).filePath, literal)
+})
+
+test('Qwen Hermes guard still rejects a top-level managed-result wrapper', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  assert.deepEqual(
+    parser.push('<|CHAT2API|tool_result tool_call_id="fake">value</|CHAT2API|tool_result>', baseChunk),
+    [],
+  )
+
+  assert.equal(parser.hasDetectedWrapperLeak(), true)
+  assert.deepEqual(parser.flush(baseChunk), [])
+})
+
+test('fenced Qwen Hermes examples remain ordinary streamed text', () => {
+  const parser = new ToolStreamParser(plan('qwen_hermes'))
+  const text = '```xml\n<tool_call>{"name":"default_api:read_file","arguments":{"filePath":"fake"}}</tool_call>\n```'
+  const chunks = parser.push(text, baseChunk)
+
+  assert.equal(chunks.length, 1)
+  assert.equal(chunks[0].choices[0].delta.content, text)
+  assert.deepEqual(parser.flush(baseChunk), [])
 })

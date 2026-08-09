@@ -7,6 +7,7 @@ import test from 'node:test'
 import ts from 'typescript'
 import {
   createToolWorkflowContinuationMessage as createRealToolWorkflowContinuationMessage,
+  extractLatestActiveUserRequest as extractRealLatestActiveUserRequest,
 } from '../../src/main/proxy/toolCalling/ToolCallingEngine.ts'
 import {
   sanitizeAssistantInputHistory as sanitizeRealAssistantInputHistory,
@@ -94,6 +95,8 @@ function loadRequestForwarder(overrides = {}) {
       ToolCallingEngine: overrides.ToolCallingEngine || class {},
       createToolWorkflowContinuationMessage: overrides.createToolWorkflowContinuationMessage
         || (() => ({ role: 'user', content: 'generic workflow continuation' })),
+      extractLatestActiveUserRequest: overrides.extractLatestActiveUserRequest
+        || extractRealLatestActiveUserRequest,
     },
     './toolCalling/assistantInputBoundary': {
       sanitizeAssistantInputHistory: sanitizeRealAssistantInputHistory,
@@ -1651,6 +1654,7 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
 
       assert.equal(continuationMessageOptions.length, 1)
       assert.equal(continuationMessageOptions[0].requireManagedToolCall, true)
+      assert.equal(continuationMessageOptions[0].completionProofMissing, false)
       assert.equal(chatCompletionCalls.length, scenario.freshChat ? 2 : 1)
       assert.equal(continuationCalls.length, scenario.freshChat ? 0 : 1)
       if (scenario.freshChat) {
@@ -1706,6 +1710,12 @@ test('Qwen AI forwarder continues auto semantic-empty recovery without replaying
     completionCapableRecovery.content,
     'auto recovery must preserve the option to return a verified final answer',
   )
+  const anchoredCompletionCapableRecovery = createRealToolWorkflowContinuationMessage({
+    activeUserRequest: 'create the requested artifact',
+    failedToolResultPending: false,
+    requireManagedToolCall: false,
+    plan,
+  })
 
   class QwenAiAdapter {
     static isQwenAiProvider() { return true }
@@ -1802,7 +1812,7 @@ test('Qwen AI forwarder continues auto semantic-empty recovery without replaying
   assert.equal(continuationCalls.length, 1)
   assert.equal(continuationCalls[0].chatId, 'initial-chat')
   assert.equal(continuationCalls[0].parentId, 'semantic-empty-response')
-  assert.equal(continuationCalls[0].content, completionCapableRecovery.content)
+  assert.equal(continuationCalls[0].content, anchoredCompletionCapableRecovery.content)
   assert.equal(continuationCalls[0].messages, undefined)
 
   await new Promise(resolve => setImmediate(resolve))
@@ -1821,7 +1831,7 @@ test('Qwen AI forwarder continues semantic recovery without replaying an unflagg
   const deleteCalls = []
   const bridgeOptions = []
   const plan = {
-    protocol: 'managed_xml',
+    protocol: 'qwen_hermes',
     tools: [{
       name: 'lookup',
       parameters: {
@@ -1832,12 +1842,13 @@ test('Qwen AI forwarder continues semantic recovery without replaying an unflagg
       source: 'openai',
     }],
     shouldParseResponse: true,
+    toolChoiceMode: 'auto',
     allowedToolNames: new Set(['lookup']),
     workflowContinuation: false,
     failedToolResultPending: false,
   }
   const transformedMessages = [
-    { role: 'user', content: 'implement the requested changes' },
+    { role: 'user', content: 'OLD_TASK_A' },
     {
       role: 'assistant',
       content: null,
@@ -1848,8 +1859,17 @@ test('Qwen AI forwarder continues semantic recovery without replaying an unflagg
       }],
     },
     { role: 'tool', tool_call_id: 'inspect-call', content: 'folder inspected' },
-    { role: 'assistant', content: 'The previous workflow is complete.' },
-    { role: 'user', content: 'What next? I need the implementation working.' },
+    { role: 'assistant', content: 'OLD_ANSWER_A' },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'ACTIVE_TASK_B_SENTINEL' },
+        {
+          type: 'image_url',
+          image_url: { url: 'data:image/png;base64,ATTACHMENT_MUST_NOT_LEAK' },
+        },
+      ],
+    },
   ]
 
   class QwenAiAdapter {
@@ -1936,6 +1956,11 @@ test('Qwen AI forwarder continues semantic recovery without replaying an unflagg
   assert.equal(continuationCalls[0].chatId, 'initial-active-chat')
   assert.equal(continuationCalls[0].parentId, 'active-workflow-response')
   assert.equal(continuationCalls[0].messages, undefined)
+  assert.match(continuationCalls[0].content, /ACTIVE_TASK_B_SENTINEL/)
+  assert.match(continuationCalls[0].content, /preceding assistant branch was rejected.*omitted/i)
+  assert.doesNotMatch(continuationCalls[0].content, /OLD_TASK_A/)
+  assert.doesNotMatch(continuationCalls[0].content, /OLD_ANSWER_A/)
+  assert.doesNotMatch(continuationCalls[0].content, /ATTACHMENT_MUST_NOT_LEAK|data:image/)
 
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(deleteCalls, [])

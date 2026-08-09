@@ -33,8 +33,9 @@ import { createQwenHermesDocumentPrompt } from './protocols/qwenHermes.ts'
 const TOOL_CALLING_SHAPE_DIAGNOSTICS_ENV = 'CHAT2API_TOOL_CALLING_SHAPE_DIAGNOSTICS'
 
 const MANAGED_WORKFLOW_COMPLETION_PROMPT = [
-  'If no further tool operation is needed and the user request is fully complete, end the final answer with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + '.',
-  'Do not emit the completion marker in a progress update or alongside a tool call.',
+  'A final answer is protocol-valid only when it ends with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + '.',
+  'Append this transport marker after the final answer even when the active user requests exact output or no extra prose; the proxy removes it before delivery.',
+  'Never emit the completion marker in a progress update or alongside a tool call.',
 ].join(' ')
 
 /**
@@ -51,12 +52,25 @@ export const TOOL_WORKFLOW_CONTINUATION_PROMPT = [
   'Return a final answer only after all requested operations are complete and verified by tool results.',
 ].join(' ')
 
+const ACTIVE_USER_REQUEST_CONTINUATION_PROMPT = [
+  'The active user request for this recovery turn is the following JSON-encoded string:',
+  'Continue this request as authoritative; earlier user requests and assistant answers are context only.',
+]
+
 const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
   'A previous tool result reported failure, so that operation is not complete.',
   'Retry it with an appropriate declared tool or use another declared tool to complete and verify the operation.',
 ].join(' ')
 
+const MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT = [
+  'The preceding assistant branch was rejected because its final answer omitted the required managed-workflow completion marker.',
+  'If the active request is complete, reissue the complete final answer and end it with the exact marker ' + MANAGED_WORKFLOW_COMPLETE_MARKER + ' as the final characters; do not return the marker alone.',
+  'If work remains, continue with the next appropriate declared tool instead of returning a final answer.',
+].join(' ')
+
 export function createToolWorkflowContinuationMessage(options: {
+  activeUserRequest?: string
+  completionProofMissing?: boolean
   failedToolResultPending?: boolean
   requireManagedToolCall?: boolean
   plan?: Pick<
@@ -75,16 +89,50 @@ export function createToolWorkflowContinuationMessage(options: {
   const completionPrompt = options.plan && requiresManagedWorkflowCompletionMarker(options.plan)
     ? MANAGED_WORKFLOW_COMPLETION_PROMPT
     : undefined
+  const activeUserRequestPrompt = options.activeUserRequest?.trim()
+    ? [
+        ACTIVE_USER_REQUEST_CONTINUATION_PROMPT[0],
+        JSON.stringify(options.activeUserRequest),
+        ACTIVE_USER_REQUEST_CONTINUATION_PROMPT[1],
+      ].join('\n')
+    : undefined
 
   return {
     role: 'user',
     content: [
       TOOL_WORKFLOW_CONTINUATION_PROMPT,
+      activeUserRequestPrompt,
+      options.completionProofMissing ? MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT : undefined,
       options.failedToolResultPending ? FAILED_TOOL_RESULT_CONTINUATION_PROMPT : undefined,
       recoveryPrompt,
       completionPrompt,
     ].filter((part): part is string => Boolean(part)).join('\n\n'),
   }
+}
+
+/** Select the latest client user turn without mistaking tool results for a new task. */
+export function extractLatestActiveUserRequest(messages: ChatMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message.role !== 'user') continue
+
+    if (typeof message.content === 'string') {
+      if (isToolResultMessage(message)) continue
+      return message.content.trim() ? message.content : undefined
+    }
+    if (!Array.isArray(message.content)) {
+      if (isToolResultMessage(message)) continue
+      return undefined
+    }
+
+    const text = message.content
+      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+      .map(part => part.text as string)
+      .join('\n')
+    if (text.trim()) return text
+    if (!isToolResultMessage(message)) return undefined
+  }
+  return undefined
 }
 
 export class ToolCallingEngine {

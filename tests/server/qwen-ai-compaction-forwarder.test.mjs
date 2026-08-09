@@ -276,6 +276,7 @@ function loadRequestForwarder(overrides = {}) {
     './toolCalling/ToolCallingEngine': {
       ToolCallingEngine: MockToolCallingEngine,
       createToolWorkflowContinuationMessage: () => ({ role: 'user', content: 'continue' }),
+      extractLatestActiveUserRequest: () => undefined,
     },
     './toolCalling/assistantInputBoundary': {
       sanitizeAssistantInputHistory: sanitizeRealAssistantInputHistory,

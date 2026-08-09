@@ -39,8 +39,11 @@ import { ZaiAdapter, ZaiStreamHandler } from './adapters/zai'
 import { MiniMaxAdapter, MiniMaxStreamHandler } from './adapters/minimax'
 import { PerplexityAdapter } from './adapters/perplexity'
 import { PerplexityStreamHandler } from './adapters/perplexity-stream'
-import { ToolCallingEngine } from './toolCalling/ToolCallingEngine'
-import { createToolWorkflowContinuationMessage } from './toolCalling/ToolCallingEngine'
+import {
+  createToolWorkflowContinuationMessage,
+  extractLatestActiveUserRequest,
+  ToolCallingEngine,
+} from './toolCalling/ToolCallingEngine'
 import type { ToolCallingTransformResult } from './toolCalling/types'
 import { sanitizeAssistantInputHistory } from './toolCalling/assistantInputBoundary'
 import {
@@ -3148,6 +3151,9 @@ export class RequestForwarder {
                   || recoveryCode === 'malformed_tool_call'
                   || recoveryCode === 'missing_tool_call'
                 const workflowContinuationMessage = createToolWorkflowContinuationMessage({
+                  activeUserRequest: extractLatestActiveUserRequest(providerRequest.messages),
+                  completionProofMissing: recoveryCode === 'qwen_ai_semantic_incomplete'
+                    && !requireManagedToolCall,
                   failedToolResultPending: transformed.plan.failedToolResultPending,
                   requireManagedToolCall,
                   plan: transformed.plan,

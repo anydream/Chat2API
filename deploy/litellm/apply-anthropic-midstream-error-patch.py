@@ -1114,6 +1114,49 @@ ANTHROPIC_ADAPTER_TOOL_ERROR_FORWARD_PATCH = '''            if len(tool_message_
 '''
 
 ANTHROPIC_RESPONSES_TOOL_ERROR_MARKER = 'tool_result_item["is_error"] = is_error'
+ANTHROPIC_RESPONSES_TOOL_CONTENT_MARKER = (
+    "Preserve structured Anthropic tool-result images"
+)
+ANTHROPIC_RESPONSES_TOOL_CONTENT_ANCHOR = '''                            elif isinstance(inner, list):
+                                parts = [
+                                    c.get("text", "") for c in inner if isinstance(c, dict) and c.get("type") == "text"
+                                ]
+                                output_text = "\\n".join(parts)
+'''
+ANTHROPIC_RESPONSES_TOOL_CONTENT_PATCH = '''                            elif isinstance(inner, list):
+                                # Preserve structured Anthropic tool-result images so clients such
+                                # as Claude Code can return screenshots through Responses.
+                                structured_output: List[Dict[str, Any]] = []
+                                text_parts: List[str] = []
+                                has_image = False
+                                for content_part in inner:
+                                    if isinstance(content_part, str):
+                                        text_value = content_part
+                                    elif isinstance(content_part, dict) and content_part.get("type") == "text":
+                                        raw_text = content_part.get("text", "")
+                                        text_value = raw_text if isinstance(raw_text, str) else str(raw_text)
+                                    else:
+                                        text_value = None
+
+                                    if text_value is not None:
+                                        text_parts.append(text_value)
+                                        structured_output.append(
+                                            {"type": "input_text", "text": text_value}
+                                        )
+                                        continue
+
+                                    if isinstance(content_part, dict) and content_part.get("type") == "image":
+                                        image_url = self._translate_anthropic_image_source_to_url(
+                                            cast(dict, content_part.get("source", {}))
+                                        )
+                                        if image_url:
+                                            has_image = True
+                                            structured_output.append(
+                                                {"type": "input_image", "image_url": image_url}
+                                            )
+
+                                output_text = structured_output if has_image else "\\n".join(text_parts)
+'''
 ANTHROPIC_RESPONSES_TOOL_ERROR_ANCHOR = '''                            # tool_result is a top-level item, not inside the message
                             input_items.append(
                                 {
@@ -1461,13 +1504,14 @@ def patch_anthropic_adapter_source(source: str) -> str:
 
 
 def patch_anthropic_responses_transformation_source(source: str) -> str:
-    if ANTHROPIC_RESPONSES_ASSISTANT_ORDER_MARKER in source:
-        raise RuntimeError(
-            "LiteLLM already contains the Anthropic Responses assistant-order patch; "
-            "review the base image before removing this build patch."
-        )
-
     patched = source
+    if ANTHROPIC_RESPONSES_TOOL_CONTENT_MARKER not in patched:
+        patched = replace_exact(
+            patched,
+            ANTHROPIC_RESPONSES_TOOL_CONTENT_ANCHOR,
+            ANTHROPIC_RESPONSES_TOOL_CONTENT_PATCH,
+            "Anthropic Responses structured tool-result content anchor",
+        )
     if ANTHROPIC_RESPONSES_TOOL_ERROR_MARKER not in patched:
         patched = replace_exact(
             patched,
@@ -1475,12 +1519,18 @@ def patch_anthropic_responses_transformation_source(source: str) -> str:
             ANTHROPIC_RESPONSES_TOOL_ERROR_PATCH,
             "Anthropic Responses tool-result error anchor",
         )
-    patched = replace_exact(
-        patched,
-        ANTHROPIC_RESPONSES_ASSISTANT_ORDER_ANCHOR,
-        ANTHROPIC_RESPONSES_ASSISTANT_ORDER_PATCH,
-        "Anthropic Responses assistant content ordering anchor",
-    )
+    if ANTHROPIC_RESPONSES_ASSISTANT_ORDER_MARKER not in patched:
+        patched = replace_exact(
+            patched,
+            ANTHROPIC_RESPONSES_ASSISTANT_ORDER_ANCHOR,
+            ANTHROPIC_RESPONSES_ASSISTANT_ORDER_PATCH,
+            "Anthropic Responses assistant content ordering anchor",
+        )
+    elif patched == source:
+        raise RuntimeError(
+            "LiteLLM already contains the Anthropic Responses patches; "
+            "review the base image before removing this build patch."
+        )
     compile(patched, str(ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH), "exec")
     return patched
 

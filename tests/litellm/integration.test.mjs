@@ -117,6 +117,7 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /\["is_error"\] = tool_result_error_by_id/)
   assert.match(patcher, /ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH/)
   assert.match(patcher, /tool_result_item\["is_error"\] = is_error/)
+  assert.match(patcher, /Preserve structured Anthropic tool-result images/)
   assert.match(patcher, /ANTHROPIC_RESPONSES_ASSISTANT_ORDER_MARKER/)
   assert.match(patcher, /Flush buffered assistant text before the top-level tool call/)
   assert.match(patcher, /TOKEN_COUNTER_MODULE_PATH/)
@@ -1636,6 +1637,97 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
         assert.equal(toolMessage.is_error, isError)
       }
     }
+  })
+
+  await t.test('preserves image content inside Anthropic tool_result through Responses', async () => {
+    const toolUseId = 'call_offline_read_screenshot'
+    const imageUrl = `data:image/png;base64,${ONE_PIXEL_PNG_BASE64}`
+    const ingressCallsBefore = chat2ApiIngress.calls.length
+    const mockCallsBefore = mock.calls.length
+    const result = await requestJson(`${liteLlmBaseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: anthropicHeaders(),
+      body: JSON.stringify(anthropicRequest({
+        messages: [
+          { role: 'user', content: 'Inspect the screenshot with the available tool.' },
+          {
+            role: 'assistant',
+            content: [{
+              type: 'tool_use',
+              id: toolUseId,
+              name: 'Read',
+              input: { file_path: 'screenshot.png' },
+            }],
+          },
+          {
+            role: 'user',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              is_error: false,
+              content: [
+                { type: 'text', text: 'Screenshot captured.' },
+                {
+                  type: 'image',
+                  source: {
+                    type: 'base64',
+                    media_type: 'image/png',
+                    data: ONE_PIXEL_PNG_BASE64,
+                  },
+                },
+              ],
+            }],
+          },
+        ],
+        tools: [{
+          name: 'Read',
+          description: 'Read a local file.',
+          input_schema: {
+            type: 'object',
+            properties: { file_path: { type: 'string' } },
+            required: ['file_path'],
+          },
+        }],
+      })),
+    })
+
+    assert.equal(result.response.status, 200, result.text)
+    const ingressCalls = chat2ApiIngress.calls
+      .slice(ingressCallsBefore)
+      .filter((candidate) => candidate.url === '/v1/responses')
+    assert.equal(ingressCalls.length, 1, JSON.stringify(chat2ApiIngress.calls.slice(ingressCallsBefore)))
+    const functionOutput = ingressCalls[0].body.input.find((item) => (
+      item.type === 'function_call_output' && item.call_id === toolUseId
+    ))
+    assert.deepEqual(functionOutput, {
+      type: 'function_call_output',
+      call_id: toolUseId,
+      output: [
+        { type: 'input_text', text: 'Screenshot captured.' },
+        { type: 'input_image', image_url: imageUrl },
+      ],
+      is_error: false,
+    })
+
+    const upstreamCall = mock.calls.slice(mockCallsBefore).at(-1)
+    assert.ok(upstreamCall, JSON.stringify(mock.calls.slice(mockCallsBefore)))
+    const toolMessageIndex = upstreamCall.body.messages.findIndex((message) => (
+      message.role === 'tool' && message.tool_call_id === toolUseId
+    ))
+    const imageMessageIndex = upstreamCall.body.messages.findIndex((message) => (
+      message.role === 'user'
+      && Array.isArray(message.content)
+      && message.content.some((part) => part?.type === 'image_url')
+    ))
+    assert.ok(toolMessageIndex >= 0, JSON.stringify(upstreamCall.body.messages))
+    assert.ok(imageMessageIndex > toolMessageIndex, JSON.stringify(upstreamCall.body.messages))
+    const toolMessage = upstreamCall.body.messages[toolMessageIndex]
+    assert.equal(toolMessage.content, 'Screenshot captured.')
+    assert.equal(toolMessage.is_error, false)
+    assert.equal(JSON.stringify(toolMessage).includes(ONE_PIXEL_PNG_BASE64), false)
+    const imageMessage = upstreamCall.body.messages[imageMessageIndex]
+    const imagePart = imageMessage.content.find((part) => part?.type === 'image_url')
+    assert.equal(imagePart?.image_url?.url, imageUrl)
   })
 
   await t.test('counts Anthropic text, system, and tools locally without an upstream probe', async () => {

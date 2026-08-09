@@ -278,6 +278,47 @@ test('large view_image output is kept out of ordinary tool text', () => {
   assert.equal((imageMessage?.content as any[])[1].image_url.url, largeImage)
 })
 
+test('standard function output preserves text and image attachments', () => {
+  const imageUrl = `data:image/png;base64,${ONE_PIXEL_PNG}`
+  const { chatRequest } = responsesRequestToChatCompletion({
+    model: 'test',
+    input: [
+      {
+        type: 'function_call',
+        call_id: 'call_read_image',
+        name: 'Read',
+        arguments: JSON.stringify({ file_path: 'screenshot.png' }),
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_read_image',
+        output: [
+          { type: 'input_text', text: 'Screenshot captured.' },
+          { type: 'input_image', image_url: imageUrl },
+        ],
+        is_error: false,
+      },
+    ],
+  })
+
+  assert.deepEqual(chatRequest.messages.map(message => message.role), [
+    'assistant',
+    'tool',
+    'user',
+  ])
+  assert.equal(chatRequest.messages[1].tool_call_id, 'call_read_image')
+  assert.equal(chatRequest.messages[1].content, 'Screenshot captured.')
+  assert.equal(chatRequest.messages[1].is_error, false)
+  assert.equal(JSON.stringify(chatRequest.messages[1]).includes(ONE_PIXEL_PNG), false)
+  assert.deepEqual(chatRequest.messages[2].content, [
+    { type: 'text', text: 'Tool output attachment follows.' },
+    {
+      type: 'image_url',
+      image_url: { url: imageUrl, detail: undefined },
+    },
+  ])
+})
+
 test('custom tool calls restore on non-stream output and previous-response history', async () => {
   const rawPatch = '*** Begin Patch\n*** End Patch'
   const request: ResponseCreateRequest = {

@@ -23,11 +23,17 @@ export const qwenAiConfig: BuiltinProviderConfig = {
   },
   supportedModels: [
     'Qwen3.8-Max',
+    'Qwen3.8-Max_Fast',
+    'Qwen3.8-Max_Auto',
+    'Qwen3.8-Max_Thinking',
     'Qwen3.7-Plus',
     'Qwen3.7-Max',
   ],
   modelMappings: {
     'Qwen3.8-Max': 'qwen3.8-max',
+    'Qwen3.8-Max_Fast': 'qwen3.8-max',
+    'Qwen3.8-Max_Auto': 'qwen3.8-max',
+    'Qwen3.8-Max_Thinking': 'qwen3.8-max',
     'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
     'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',

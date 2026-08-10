@@ -57,6 +57,10 @@ import {
   type NativeToolCallState,
 } from './qwen-ai-native-tools'
 import { createQwenAiFeatureConfig } from './qwen-ai-feature-config'
+import {
+  normalizeQwenAiModelModeName,
+  resolveQwenAiModelMode,
+} from '../../providers/qwen-ai-model-mode'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 300000)
@@ -2542,31 +2546,36 @@ export function findModelCapability(
   const normalizeCapabilityKey = (value: string): string => value
     .replace(/(?:-(?:web-search|thinking|think|search|fast|r1))+$/i, '')
     .toLowerCase()
+  const normalizeQwenCapabilityKey = (value: string): string => normalizeCapabilityKey(
+    normalizeQwenAiModelModeName(value),
+  )
 
   const candidates = new Set<string>([
     requestedModel,
     modelId,
+    normalizeQwenAiModelModeName(requestedModel),
+    normalizeQwenAiModelModeName(modelId),
     requestedModel.replace(/(?:-(?:web-search|thinking|think|search|fast|r1))+$/i, ''),
     modelId.replace(/(?:-(?:web-search|thinking|think|search|fast|r1))+$/i, ''),
   ])
   for (const [displayName, mappedId] of Object.entries(provider.modelMappings || {})) {
     if (
-      normalizeCapabilityKey(mappedId) === normalizeCapabilityKey(modelId)
-      || normalizeCapabilityKey(displayName) === normalizeCapabilityKey(requestedModel)
+      normalizeQwenCapabilityKey(mappedId) === normalizeQwenCapabilityKey(modelId)
+      || normalizeQwenCapabilityKey(displayName) === normalizeQwenCapabilityKey(requestedModel)
     ) {
       candidates.add(displayName)
       candidates.add(mappedId)
     }
   }
 
-  const normalizedCandidates = new Set([...candidates].map(normalizeCapabilityKey))
+  const normalizedCandidates = new Set([...candidates].map(normalizeQwenCapabilityKey))
   for (const candidate of candidates) {
     if (Object.prototype.hasOwnProperty.call(capabilities, candidate)) {
       return capabilities[candidate]
     }
   }
   for (const [key, capability] of Object.entries(capabilities).reverse()) {
-    if (normalizedCandidates.has(normalizeCapabilityKey(key))) {
+    if (normalizedCandidates.has(normalizeQwenCapabilityKey(key))) {
       return capability
     }
   }
@@ -2575,11 +2584,45 @@ export function findModelCapability(
 }
 
 /**
- * Resolve the feature flag without allowing a client option to request an
- * unsupported fast mode. Qwen's `think_skip.enable=false` means the model
- * requires a reasoning phase, so that provider capability takes precedence
- * over suffixes and translated client parameters.
+ * Resolve an old generic suffix only when it was not one of the deterministic
+ * Qwen3.8-Max aliases. This preserves existing `-thinking`/`-fast` clients.
  */
+function resolveLegacyQwenThinkingMode(modelName: string): boolean | undefined {
+  const modelLower = modelName.toLowerCase()
+  if (modelLower.endsWith('-thinking')) return true
+  if (modelLower.endsWith('-fast')) return false
+  if (modelLower.includes('think') || modelLower.includes('r1')) return true
+  return undefined
+}
+
+export function resolveQwenAiFeatureMode(
+  requestedModel: string,
+  requestedThinking: boolean | undefined,
+  capability: ProviderModelCapability | undefined,
+): { thinkingEnabled: boolean; autoThinking: boolean } {
+  const modelMode = resolveQwenAiModelMode(requestedModel)
+  if (modelMode.thinkingEnabled !== undefined) {
+    return {
+      thinkingEnabled: modelMode.thinkingEnabled,
+      autoThinking: modelMode.autoThinking ?? modelMode.thinkingEnabled,
+    }
+  }
+
+  const legacyThinking = resolveLegacyQwenThinkingMode(requestedModel)
+  const thinkingEnabled = resolveQwenThinkingEnabled(
+    requestedThinking,
+    legacyThinking,
+    capability,
+  )
+
+  return {
+    thinkingEnabled,
+    // Keep prior behavior for other Qwen models while Qwen3.8-Max aliases
+    // deliberately control this flag independently.
+    autoThinking: thinkingEnabled,
+  }
+}
+
 export function resolveQwenThinkingEnabled(
   requested: boolean | undefined,
   forced: boolean | undefined,
@@ -3071,19 +3114,8 @@ export class QwenAiAdapter {
   }
 
   mapModel(openaiModel: string): string {
-    let model = openaiModel
-    let forceThinking: boolean | undefined
-    
-    if (model.endsWith('-thinking')) {
-      forceThinking = true
-      model = model.slice(0, -9)
-    } else if (model.endsWith('-fast')) {
-      forceThinking = false
-      model = model.slice(0, -5)
-    }
-    
-    ;(this as any)._forceThinking = forceThinking
-    
+    const model = normalizeQwenAiModelModeName(openaiModel)
+      .replace(/-(?:thinking|fast)$/i, '')
     const lowerModel = model.toLowerCase()
     
     if (this.provider.modelMappings) {
@@ -3245,23 +3277,8 @@ export class QwenAiAdapter {
       const imageGeneration = resolveQwenAiImageGenerationOptions(request.image_generation)
       const chatType = imageGeneration?.chatType ?? 't2t'
 
-      // Get forced thinking mode setting from originalModel (preserves user's intent before mapping)
-      // If originalModel exists, use it for thinking detection; otherwise fall back to request.model
+      // Use originalModel so aliases survive load-balancer mapping.
       const modelForThinking = request.originalModel || request.model
-      const modelLower = modelForThinking.toLowerCase()
-      let forceThinking: boolean | undefined
-      if (modelForThinking.endsWith('-thinking')) {
-        forceThinking = true
-      } else if (modelForThinking.endsWith('-fast')) {
-        forceThinking = false
-      } else if (modelLower.includes('think') || modelLower.includes('r1')) {
-        // Auto-enable thinking based on model name keywords (e.g. "Qwen3.6-Plus-AI-Think-Search")
-        forceThinking = true
-        console.log('[QwenAI] Thinking mode enabled (from model name keyword)')
-      } else {
-        // Use the forceThinking from mapModel if no originalModel-specific detection
-        forceThinking = (this as any)._forceThinking
-      }
 
       scope.throwIfStopped()
       chatId = await scope.wait(
@@ -3305,14 +3322,16 @@ export class QwenAiAdapter {
       // The live model capability is authoritative when the upstream model does
       // not support skipping its reasoning phase.
       const modelCapability = findModelCapability(this.provider, modelForThinking, modelId)
-      const shouldEnableThinking = resolveQwenThinkingEnabled(
+      const featureMode = resolveQwenAiFeatureMode(
+        modelForThinking,
         request.enable_thinking,
-        forceThinking,
         modelCapability,
       )
+      const shouldEnableThinking = featureMode.thinkingEnabled
 
       const featureConfig = createQwenAiFeatureConfig({
         thinkingEnabled: shouldEnableThinking,
+        autoThinking: featureMode.autoThinking,
         thinkingBudget: request.thinking_budget,
       })
 
@@ -3542,26 +3561,16 @@ export class QwenAiAdapter {
 
     const modelId = this.mapModel(request.model)
     const modelForThinking = request.originalModel || request.model
-    const modelLower = modelForThinking.toLowerCase()
-    let forceThinking: boolean | undefined
-    if (modelForThinking.endsWith('-thinking')) {
-      forceThinking = true
-    } else if (modelForThinking.endsWith('-fast')) {
-      forceThinking = false
-    } else if (modelLower.includes('think') || modelLower.includes('r1')) {
-      forceThinking = true
-    } else {
-      forceThinking = (this as any)._forceThinking
-    }
-
     const modelCapability = findModelCapability(this.provider, modelForThinking, modelId)
-    const shouldEnableThinking = resolveQwenThinkingEnabled(
+    const featureMode = resolveQwenAiFeatureMode(
+      modelForThinking,
       request.enable_thinking,
-      forceThinking,
       modelCapability,
     )
+    const shouldEnableThinking = featureMode.thinkingEnabled
     const featureConfig = createQwenAiFeatureConfig({
       thinkingEnabled: shouldEnableThinking,
+      autoThinking: featureMode.autoThinking,
       thinkingBudget: request.thinking_budget,
     })
 

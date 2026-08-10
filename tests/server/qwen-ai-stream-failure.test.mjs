@@ -18,6 +18,10 @@ import {
 } from '../../src/main/proxy/toolCalling/protocols/shared.ts'
 import { createQwenAiFeatureConfig as realCreateQwenAiFeatureConfig } from '../../src/main/proxy/adapters/qwen-ai-feature-config.ts'
 import {
+  normalizeQwenAiModelModeName as realNormalizeQwenAiModelModeName,
+  resolveQwenAiModelMode as realResolveQwenAiModelMode,
+} from '../../src/main/providers/qwen-ai-model-mode.ts'
+import {
   hasManagedWorkflowCompletionMarker as realHasManagedWorkflowCompletionMarker,
   parseManagedWorkflowCompletionProof as realParseManagedWorkflowCompletionProof,
   requiresManagedWorkflowCompletionMarker as realRequiresManagedWorkflowCompletionMarker,
@@ -130,6 +134,11 @@ function loadQwenAiStreamHandler(overrides = {}) {
     },
     './qwen-ai-feature-config': {
       createQwenAiFeatureConfig: overrides.createQwenAiFeatureConfig || realCreateQwenAiFeatureConfig,
+    },
+    '../../providers/qwen-ai-model-mode': {
+      normalizeQwenAiModelModeName: overrides.normalizeQwenAiModelModeName
+        || realNormalizeQwenAiModelModeName,
+      resolveQwenAiModelMode: overrides.resolveQwenAiModelMode || realResolveQwenAiModelMode,
     },
   }
   const testRequire = specifier => {
@@ -4868,13 +4877,123 @@ test('Qwen AI managed tools preserve the configured model and requested thinking
   assert.equal(postedPayload.model, 'qwen3.8-max')
   assert.deepEqual(postedPayload.messages[0].models, ['qwen3.8-max'])
   assert.equal(featureConfig.thinking_enabled, true)
-  assert.equal(featureConfig.auto_thinking, true)
+  assert.equal(featureConfig.auto_thinking, false)
   assert.equal('thinking_mode' in featureConfig, false)
   assert.equal(featureConfig.thinking_format, 'summary')
   assert.equal('thinking_budget' in featureConfig, false)
   assert.equal('function_calling' in featureConfig, false)
   assert.equal('plugins_enabled' in featureConfig, false)
   responseStream.destroy()
+})
+
+test('Qwen AI mode aliases send deterministic independent thinking switches', async () => {
+  const cases = [
+    {
+      name: 'default Thinking',
+      model: 'Qwen3.8-Max',
+      thinkingEnabled: true,
+      autoThinking: false,
+    },
+    {
+      name: 'Fast overrides a client thinking request and a non-skippable capability',
+      model: 'Qwen3.8-Max_Fast',
+      enableThinking: true,
+      modelCapabilities: { 'qwen3.8-max': { thinkingSkippable: false } },
+      thinkingEnabled: false,
+      autoThinking: false,
+    },
+    {
+      name: 'Auto overrides a client fast request',
+      model: 'Qwen3.8-Max_Auto',
+      enableThinking: false,
+      thinkingEnabled: true,
+      autoThinking: true,
+    },
+    {
+      name: 'Thinking overrides a client fast request',
+      model: 'Qwen3.8-Max_Thinking',
+      enableThinking: false,
+      thinkingEnabled: true,
+      autoThinking: false,
+    },
+    {
+      name: 'raw TeT AtT flags',
+      model: 'Qwen3.8-Max_TeT_AtT',
+      enableThinking: false,
+      thinkingEnabled: true,
+      autoThinking: true,
+    },
+    {
+      name: 'raw TeF AtT flags',
+      model: 'Qwen3.8-Max_TeF_AtT',
+      enableThinking: true,
+      thinkingEnabled: false,
+      autoThinking: true,
+    },
+    {
+      name: 'raw TeT AtF flags',
+      model: 'Qwen3.8-Max_TeT_AtF',
+      enableThinking: false,
+      thinkingEnabled: true,
+      autoThinking: false,
+    },
+    {
+      name: 'raw TeF AtF flags',
+      model: 'Qwen3.8-Max_TeF_AtF',
+      enableThinking: true,
+      thinkingEnabled: false,
+      autoThinking: false,
+    },
+  ]
+
+  for (const mode of cases) {
+    let createdModel
+    let postedPayload
+    const responseStream = new PassThrough()
+    responseStream.on('error', () => {})
+    const { QwenAiAdapter } = loadQwenAiStreamHandler({
+      prepareQwenAiMultimodalMessage: async () => ({ content: 'mode fixture', files: [] }),
+    })
+    const adapter = new QwenAiAdapter(
+      {
+        id: 'qwen-ai',
+        apiEndpoint: 'https://chat.qwen.ai',
+        ...(mode.modelCapabilities ? { modelCapabilities: mode.modelCapabilities } : {}),
+      },
+      { id: 'account-1', credentials: { token: 'test-token' } },
+    )
+    adapter.refreshTokenIfNeeded = async () => {}
+    adapter.createChat = async (model) => {
+      createdModel = model
+      return `mode-alias-${mode.name}`
+    }
+    adapter.postWithRefreshRetry = async (_url, payload) => {
+      postedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload
+      return {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        data: responseStream,
+      }
+    }
+    adapter.assertChatCompletionStreamResponse = async () => {}
+
+    try {
+      await adapter.chatCompletion({
+        model: mode.model,
+        messages: [{ role: 'user', content: 'mode fixture' }],
+        ...(mode.enableThinking === undefined ? {} : { enable_thinking: mode.enableThinking }),
+      })
+
+      const featureConfig = postedPayload.messages[0].feature_config
+      assert.equal(createdModel, 'qwen3.8-max', mode.name)
+      assert.equal(postedPayload.model, 'qwen3.8-max', mode.name)
+      assert.deepEqual(postedPayload.messages[0].models, ['qwen3.8-max'], mode.name)
+      assert.equal(featureConfig.thinking_enabled, mode.thinkingEnabled, mode.name)
+      assert.equal(featureConfig.auto_thinking, mode.autoThinking, mode.name)
+    } finally {
+      responseStream.destroy()
+    }
+  }
 })
 
 test('Qwen AI provider model mappings override compatibility aliases', () => {
@@ -5231,6 +5350,41 @@ test('Qwen AI workflow continuation posts only a new parented user turn', async 
   assert.equal('thinking_mode' in message.feature_config, false)
   assert.equal(message.feature_config.thinking_format, 'summary')
   assert.equal(payload.messages.some(item => item.content === 'original request'), false)
+})
+
+test('Qwen AI workflow continuation lets an explicit Fast alias override client thinking', async () => {
+  const { QwenAiAdapter } = loadQwenAiStreamHandler()
+  const adapter = new QwenAiAdapter(
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    { id: 'account-1', credentials: { token: 'test-token' } },
+  )
+  const responseStream = new PassThrough()
+  let postedPayload
+  adapter.refreshTokenIfNeeded = async () => {}
+  adapter.assertChatCompletionStreamResponse = async () => {}
+  adapter.postWithRefreshRetry = async (_url, payload) => {
+    postedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload
+    return { status: 200, headers: { 'content-type': 'text/event-stream' }, data: responseStream }
+  }
+
+  try {
+    await adapter.continueChatCompletion({
+      chatId: 'chat-fast',
+      parentId: 'assistant-fast',
+      model: 'Qwen3.8-Max_Fast',
+      originalModel: 'Qwen3.8-Max_Fast',
+      content: 'continue in Fast mode',
+      enable_thinking: true,
+    })
+
+    const message = postedPayload.messages[0]
+    assert.equal(postedPayload.model, 'qwen3.8-max')
+    assert.deepEqual(message.models, ['qwen3.8-max'])
+    assert.equal(message.feature_config.thinking_enabled, false)
+    assert.equal(message.feature_config.auto_thinking, false)
+  } finally {
+    responseStream.destroy()
+  }
 })
 
 test('Qwen AI retries a rejected workflow continuation with the same payload', async () => {

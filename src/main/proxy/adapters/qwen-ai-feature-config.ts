@@ -1,5 +1,6 @@
 export interface QwenAiFeatureConfigOptions {
   thinkingEnabled: boolean
+  autoThinking: boolean
   thinkingBudget?: number
 }
 
@@ -11,7 +12,7 @@ export function createQwenAiFeatureConfig(
     thinking_enabled: options.thinkingEnabled,
     output_schema: 'phase',
     research_mode: 'normal',
-    auto_thinking: options.thinkingEnabled,
+    auto_thinking: options.autoThinking,
     auto_search: false,
   }
 

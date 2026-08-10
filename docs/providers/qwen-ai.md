@@ -10,13 +10,27 @@
 
 ## 默认模型
 
-内置默认模型使用当前 Qwen AI 官方模型清单。`Qwen3.8-Max` 会映射到 `qwen3.8-max`；Preview 模型仅在客户端明确选择对应名称时使用。
+内置默认模型使用当前 Qwen AI 官方模型清单。`Qwen3.8-Max` 会映射到 `qwen3.8-max`，默认使用 Thinking 模式：`thinking_enabled: true`、`auto_thinking: false`；Preview 模型仅在客户端明确选择对应名称时使用。
 
 | 显示名称 | 实际模型 ID |
 | --- | --- |
 | Qwen3.8-Max | qwen3.8-max |
+| Qwen3.8-Max_Fast | qwen3.8-max |
+| Qwen3.8-Max_Auto | qwen3.8-max |
+| Qwen3.8-Max_Thinking | qwen3.8-max |
 | Qwen3.7-Plus | qwen3.7-plus |
 | Qwen3.7-Max | qwen3.7-max |
+
+`Qwen3.8-Max` 模式名称会优先于客户端传入的 `reasoning_effort` / `enable_thinking`：
+
+| 模型名 | thinking_enabled | auto_thinking |
+| --- | --- | --- |
+| Qwen3.8-Max | true | false |
+| Qwen3.8-Max_Fast | false | false |
+| Qwen3.8-Max_Auto | true | true |
+| Qwen3.8-Max_Thinking | true | false |
+
+也支持原始控制形式 `Qwen3.8-Max_TeT_AtT`。`Te` 后的 `T` / `F` 控制 `thinking_enabled`，`At` 后的 `T` / `F` 控制 `auto_thinking`，例如 `Qwen3.8-Max_TeF_AtT` 会发送 `false / true`。旧的 `-fast` 和 `-thinking` 后缀仍可使用。
 
 ## 其他官网模型
 

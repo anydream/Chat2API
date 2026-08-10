@@ -9,6 +9,10 @@ import {
   ManagedToolResultGuard as RealManagedToolResultGuard,
   stripManagedToolResultWrappers as realStripManagedToolResultWrappers,
 } from '../../src/main/proxy/toolCalling/managedToolResultGuard.ts'
+import {
+  normalizeQwenAiModelModeName as realNormalizeQwenAiModelModeName,
+  resolveQwenAiModelMode as realResolveQwenAiModelMode,
+} from '../../src/main/providers/qwen-ai-model-mode.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z3xkAAAAASUVORK5CYII='
@@ -94,17 +98,21 @@ function loadQwenAiModule() {
       normalizeNativeFunctionCallDelta: () => [],
     },
     './qwen-ai-feature-config': {
-      createQwenAiFeatureConfig: ({ thinkingEnabled, thinkingBudget }) => ({
+      createQwenAiFeatureConfig: ({ thinkingEnabled, autoThinking, thinkingBudget }) => ({
         thinking_enabled: thinkingEnabled,
         output_schema: 'phase',
         research_mode: 'normal',
-        auto_thinking: thinkingEnabled,
+        auto_thinking: autoThinking,
         auto_search: false,
         ...(thinkingEnabled ? {
           thinking_format: 'summary',
           ...(thinkingBudget ? { thinking_budget: thinkingBudget } : {}),
         } : {}),
       }),
+    },
+    '../../providers/qwen-ai-model-mode': {
+      normalizeQwenAiModelModeName: realNormalizeQwenAiModelModeName,
+      resolveQwenAiModelMode: realResolveQwenAiModelMode,
     },
   }
   const testRequire = specifier => {

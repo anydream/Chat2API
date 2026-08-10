@@ -1,3 +1,5 @@
+import { normalizeQwenAiModelModeName } from '../../providers/qwen-ai-model-mode.ts'
+
 export interface DeepSeekChatOptionInput {
   model: string
   web_search?: boolean
@@ -40,7 +42,7 @@ export interface KimiModelOptions {
 }
 
 export function normalizeProviderModelForMatch(model: string): string {
-  const baseModel = model.replace(
+  const baseModel = normalizeQwenAiModelModeName(model).replace(
     /(?:\[1m\]|-(?:web-search|thinking|think|search|fast|r1))+$/i,
     '',
   )

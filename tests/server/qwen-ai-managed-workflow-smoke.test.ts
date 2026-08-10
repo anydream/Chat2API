@@ -60,6 +60,7 @@ test('Qwen managed workflow smoke: tool call, tool result, final answer', async 
   assert.match(String(firstTurn.messages[0].content), /chat2api_workflow_complete/)
   assert.deepEqual(createQwenAiFeatureConfig({
     thinkingEnabled: false,
+    autoThinking: false,
     thinkingBudget: 8192,
   }), {
     thinking_enabled: false,
@@ -127,6 +128,24 @@ test('Qwen managed workflow smoke: tool call, tool result, final answer', async 
     stripManagedWorkflowCompletionMarker(finalContent, finalTurn.plan),
     'The title is Chat2API.',
   )
+})
+
+test('Qwen feature config keeps thinking and auto-thinking as independent switches', () => {
+  for (const { thinkingEnabled, autoThinking } of [
+    { thinkingEnabled: false, autoThinking: false },
+    { thinkingEnabled: true, autoThinking: false },
+    { thinkingEnabled: true, autoThinking: true },
+    { thinkingEnabled: false, autoThinking: true },
+  ]) {
+    const featureConfig = createQwenAiFeatureConfig({
+      thinkingEnabled,
+      autoThinking,
+    })
+
+    assert.equal(featureConfig.thinking_enabled, thinkingEnabled)
+    assert.equal(featureConfig.auto_thinking, autoThinking)
+    assert.equal('thinking_format' in featureConfig, thinkingEnabled)
+  }
 })
 
 test('custom Qwen provider instance keeps Hermes prompt and serialized tool history aligned', async () => {

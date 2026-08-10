@@ -8,6 +8,7 @@ import { ProviderChecker } from '../providers/checker'
 import { CustomProviderManager } from '../providers/custom'
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
 import { mergeProviderModelCapabilities, parseProviderModelsResponse } from '../providers/modelSync'
+import { withQwenAiModelModeAliases } from '../providers/qwen-ai-model-mode'
 import { oauthManager } from '../oauth/manager'
 import { ProxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
@@ -448,7 +449,10 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
         }
       }
 
-      const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
+      const parsedModels = parseProviderModelsResponse(response.data)
+      const { supportedModels, modelMappings, modelCapabilities } = providerId === 'qwen-ai'
+        ? withQwenAiModelModeAliases(parsedModels)
+        : parsedModels
 
       if (supportedModels.length === 0) {
         return {

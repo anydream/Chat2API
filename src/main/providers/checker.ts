@@ -1,6 +1,7 @@
 import axios, { AxiosError } from 'axios'
 import { getBuiltinProvider } from './builtin'
 import { parseProviderModelsResponse } from './modelSync'
+import { withQwenAiModelModeAliases } from './qwen-ai-model-mode'
 import type { Provider, ProviderCheckResult, Account, ProviderModelCapability } from '../../shared/types'
 import type { BuiltinProviderConfig } from '../store/types'
 
@@ -914,7 +915,10 @@ export class ProviderChecker {
         throw new Error(`Failed to fetch models: HTTP ${response.status}`)
       }
 
-      const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
+      const parsedModels = parseProviderModelsResponse(response.data)
+      const { supportedModels, modelMappings, modelCapabilities } = providerId === 'qwen-ai'
+        ? withQwenAiModelModeAliases(parsedModels)
+        : parsedModels
 
       return { supportedModels, modelMappings, modelCapabilities }
     } catch (error) {

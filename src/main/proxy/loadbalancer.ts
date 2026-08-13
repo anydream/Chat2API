@@ -15,6 +15,11 @@ const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
 export interface AccountSelectionConstraints {
   /** Keep one failover chain inside accounts with an established Qwen web session. */
   qwenAiWebSessionTier?: 'complete'
+  /**
+   * A retained Qwen chat is valid only for its creating account. Let the
+   * governor queue that account instead of silently selecting another one.
+   */
+  allowQueuedQwenAiPreferredAccount?: boolean
 }
 
 type AccountFailureState = {
@@ -193,6 +198,7 @@ export class LoadBalancer {
         && !this.isAccountInFailure(preferredAccountId)
         && (
           !this.isQwenAiProvider(preferred.provider)
+          || constraints.allowQueuedQwenAiPreferredAccount === true
           || qwenAiRequestGovernor.isAccountImmediatelyAvailable(preferredAccountId)
         )
       ) {

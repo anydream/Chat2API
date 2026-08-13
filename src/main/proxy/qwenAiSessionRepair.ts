@@ -112,6 +112,13 @@ export class QwenAiSessionRepairService {
   }
 
   getAccountStatus(account: Account, now = Date.now()): QwenAiSessionRepairAccountStatus {
+    // Persisted inactive/error accounts are intentionally excluded from the
+    // repair queue. Treat them as unrepairable here as well so the management
+    // view does not report a retryable pending session for a disabled account.
+    if (account.status !== 'active') {
+      return { state: 'unrepairable', ready: false, repairable: false }
+    }
+
     if (isQwenAiWebSessionReady(account)) {
       return { state: 'ready', ready: true, repairable: true }
     }

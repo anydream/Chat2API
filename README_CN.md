@@ -53,7 +53,7 @@ Chat2API 是一个跨平台桌面应用和无 Electron 服务端。它将基于 
 
 ### 下载桌面版本
 
-有可用发行版时，请从 [GitHub Releases](https://github.com/pyf-feifei/Chat2API/releases) 下载：
+有可用发行版时，请从 [GitHub Releases](https://github.com/xiaoY233/Chat2API/releases) 下载。源码镜像位于 [pyf-feifei/Chat2API](https://github.com/pyf-feifei/Chat2API)：
 
 | 平台 | 安装包 |
 | --- | --- |
@@ -64,7 +64,7 @@ Chat2API 是一个跨平台桌面应用和无 Electron 服务端。它将基于 
 
 ### 从源码运行
 
-环境要求：Node.js 18+、npm 和 Git。
+环境要求：Node.js 18+、npm 和 Git。Docker 镜像使用 Node.js 22。
 
 ```bash
 git clone https://github.com/pyf-feifei/Chat2API.git

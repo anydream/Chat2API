@@ -205,8 +205,13 @@ CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
+CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0
 CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
+# During an image update, stop accepting new requests and drain active HTTP/SSE
+# streams for this long before the process exits. Keep this at or below the
+# Compose stop_grace_period (default 10m).
+CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS=540000
 ```
 
 Set `CHAT2API_STORAGE_ENCRYPTION_KEY` if you want server-side credential encryption. If it is omitted, credentials are stored in the mounted data directory without the extra runtime encryption layer.
@@ -311,14 +316,23 @@ payload until `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS` is spent
 (default `300000` ms). This admission budget is capped by
 `QWEN_AI_REQUEST_TIMEOUT_MS`; once a generation is accepted, the same
 cumulative request deadline remains in force. Leave
-`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` unset/blank for deadline mode;
-set a positive value only when the deployment needs an explicit attempt cap, or
-set it to `0` to fail immediately. `CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`
+Bound Claude tool-result continuations use the dedicated
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0` setting and fail fast
+into same-account full-history replay instead of waiting through a long
+busy-chat window. The generic
+`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS` remains blank by default,
+which preserves deadline mode for ordinary semantic workflow continuations.
+Set it to a positive value when explicit polling is desired.
+`CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS`
 (default `1000` ms) sets the initial delay. Each retry uses only the remaining
 admission budget, and an exhausted busy result briefly cools the account without
 invalidating its credentials. The response is recognized by the provider code
 only, so an ordinary JSON error remains a non-stream `502`, and cancellation
 stops the wait without another request.
+Retained Responses tool-result continuations use
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS` (default `0`) and
+therefore hand `CHAT_IN_PROGRESS` to the same-account full-transcript replay
+path immediately. Increase it only when the upstream chat settles quickly.
 Qwen's early-error preflight keeps the HTTP status mutable until the first
 client-visible SSE frame or a terminal failure. This lets a provider rejection
 that arrives before output retain its HTTP status across protocol bridges.
@@ -331,6 +345,21 @@ until terminal validation completes, allowing malformed and provider-only tool
 calls to recover before bytes reach the client. Set it to `false` only when
 lower first-byte latency is more important than transparent branch recovery.
 `CHAT2API_QWEN_AI_VALIDATED_STREAM_MAX_BYTES` bounds that validation buffer.
+
+The persisted `qwenAiSessionMode` setting controls managed tool-result turns.
+`tool-call-binding` is the default: a completed first turn binds its Qwen
+account, chat ID, and parent ID to the complete client-visible tool-call ID
+batch, and a trailing tool-result batch continues only that chat. `legacy`
+starts a fresh Qwen chat from the complete client history on every turn. Both
+modes remain selectable in the Qwen governor panel.
+
+Cross-account replay is restricted to authentication failures (`401/403`) and
+capacity-classified `429` responses. `CHAT_IN_PROGRESS`, stale chat/session
+`404/409`, continuation or parent `400`, and ordinary `5xx` responses do not
+penalize or rotate the account. If a response resume returns `The request is
+ended!`, Chat2API abandons that response ID and replays the complete request
+once in a fresh chat on the same credential; a second ended result is returned
+as an explicit `502`.
 
 ## Upstream Update Flow
 

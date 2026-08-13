@@ -300,6 +300,11 @@ prompt a second time. `CHAT2API_QWEN_AI_STREAM_RESUME_ATTEMPTS` defaults to `3`
 and `CHAT2API_QWEN_AI_STREAM_RESUME_DELAY_MS` to `1000` ms; set attempts to `0`
 to disable this bounded recovery. These are generic deployment controls and do
 not depend on a Claude session, project directory, model name, or prompt.
+If Qwen declares that response ID permanently closed with `The request is
+ended!`, Chat2API stops issuing resume GETs and replays the complete request
+once in a fresh chat on the same credential. The replay does not add a workflow
+correction prompt, does not penalize the account, and a second ended result is
+returned as an explicit `502`.
 Response-id resumes and managed-tool continuations share the cumulative
  `CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS` (default `180000` ms). It covers only
  no-progress recovery work and pauses while a replacement stream is active, so
@@ -350,10 +355,18 @@ defaults to `1000` ms and controls the initial delay. Each retry uses the
 remaining admission budget, and an exhausted busy result briefly cools the account
 without treating its credentials as invalid. Other JSON errors are not retried,
 and a client disconnect cancels the wait.
+Responses tool-result continuations have a separate
+`CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS` setting (default `0`).
+With the default, a busy retained chat immediately falls back to a complete
+transcript replay on the same account instead of holding the Claude request in
+exponential backoff.
 The queue limit is applied per governor admission attempt, while every attempt
 and account failover in one logical request shares the route-level cumulative
 deadline. A client abort during a later attempt is still a genuine `499`, not
 a queue timeout or request deadline.
+Cross-account replay is limited to `401`, `403`, and capacity-classified `429`.
+`CHAT_IN_PROGRESS`, chat/session `404/409`, parent or continuation `400`, and
+ordinary `5xx` failures remain account-neutral and do not rotate credentials.
 Override these environment values for deployments with different latency
 budgets.
 

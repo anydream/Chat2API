@@ -84,6 +84,17 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
  */
 export type Theme = 'light' | 'dark' | 'system'
 
+/** Qwen AI tool-result conversation handling strategy. */
+export type QwenAiSessionMode = 'legacy' | 'tool-call-binding'
+
+export const DEFAULT_QWEN_AI_SESSION_MODE: QwenAiSessionMode = 'tool-call-binding'
+
+export function normalizeQwenAiSessionMode(value: unknown): QwenAiSessionMode {
+  return value === 'legacy' || value === 'tool-call-binding'
+    ? value
+    : DEFAULT_QWEN_AI_SESSION_MODE
+}
+
 export interface QwenAiGovernorConfig {
   autoTuneEnabled: boolean
   autoTuneMaxConcurrent: number
@@ -271,6 +282,8 @@ export interface AppConfig {
   toolPromptConfig?: LegacyToolPromptConfig
   /** Qwen AI request governor configuration */
   qwenAiGovernorConfig: QwenAiGovernorConfig
+  /** Qwen AI tool-result conversation handling strategy */
+  qwenAiSessionMode: QwenAiSessionMode
   /** Management API configuration */
   managementApi: ManagementApiConfig
   /** Context management configuration */
@@ -990,6 +1003,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   toolCallingConfig: DEFAULT_TOOL_CALLING_CONFIG,
   toolPromptConfig: undefined,
   qwenAiGovernorConfig: DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
+  qwenAiSessionMode: DEFAULT_QWEN_AI_SESSION_MODE,
   managementApi: DEFAULT_MANAGEMENT_API_CONFIG,
   contextManagement: DEFAULT_CONTEXT_MANAGEMENT_CONFIG,
 }

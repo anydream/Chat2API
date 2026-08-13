@@ -277,6 +277,7 @@ test('Qwen AI refresh falls back to legacy signin only when v2 is unsupported', 
 
 test('Qwen AI refresh maps credential rejection to account failover metadata without a second login', async () => {
   const calls = []
+  let persisted
   const { QwenAiTokenRefresher } = loadTokenRefreshModule({
     post: async (url) => {
       calls.push(url)
@@ -285,6 +286,10 @@ test('Qwen AI refresh maps credential rejection to account failover metadata wit
         data: { data: { details: 'password rejected; token=secret-value' } },
         headers: {},
       }
+    },
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
     },
   })
   const account = qwenAccount({
@@ -307,10 +312,16 @@ test('Qwen AI refresh maps credential rejection to account failover metadata wit
     },
   )
   assert.deepEqual(calls, ['https://chat.qwen.ai/api/v2/auths/signin'])
+  assert.equal(persisted, undefined, 'ordinary credential rejection remains request-scoped')
 })
 
 test('Qwen AI refresh treats a successful HTTP response without a token as an account failure', async () => {
+  let persisted
   const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
+    },
     post: async () => ({
       status: 200,
       data: { data: { details: 'account is not registered' } },
@@ -333,10 +344,46 @@ test('Qwen AI refresh treats a successful HTTP response without a token as an ac
       && error.retryScope === 'next-account'
       && /not registered/.test(error.message),
   )
+  assert.equal(persisted.status, 'inactive')
+  assert.match(persisted.errorMessage, /not registered/)
+})
+
+test('Qwen AI refresh persists an explicit Chinese unregistered-account response', async () => {
+  let persisted
+  const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
+    },
+    post: async () => ({
+      status: 401,
+      data: { data: { details: '\u60a8\u63d0\u4f9b\u7684\u5e10\u6237\u672a\u6ce8\u518c\u3002\u8bf7\u5148\u6ce8\u518c\uff01' } },
+      headers: {},
+    }),
+  })
+  const account = qwenAccount({
+    token: jwtExpiringAt(Date.now() + 24 * 60 * 60 * 1000),
+    cookies: 'cnaui=auxiliary-cookie',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+
+  await assert.rejects(
+    new QwenAiTokenRefresher().refreshIfNeeded(account),
+    error => error.status === 401
+      && error.accountFault === true
+      && error.retryScope === 'next-account',
+  )
+  assert.equal(persisted.status, 'inactive')
 })
 
 test('Qwen AI refresh treats a WAF challenge as account-neutral and stops account sweeping', async () => {
+  let persisted
   const { QwenAiTokenRefresher } = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      persisted = updates
+      return null
+    },
     post: async () => ({
       status: 403,
       data: '<meta name="aliyun_waf_aa"> FAIL_SYS_USER_VALIDATE challenge',
@@ -358,6 +405,7 @@ test('Qwen AI refresh treats a WAF challenge as account-neutral and stops accoun
       && error.accountFault === false
       && error.retryScope === undefined,
   )
+  assert.equal(persisted, undefined)
 })
 
 test('Qwen AI refresh distinguishes upstream failure and cancellation', async () => {
@@ -366,16 +414,22 @@ test('Qwen AI refresh distinguishes upstream failure and cancellation', async ()
     email: 'fixture@example.test',
     password: 'fixture-password',
   }
+  let upstreamPersisted
   const upstream = loadTokenRefreshModule({
+    updateAccount: (_id, updates) => {
+      upstreamPersisted = updates
+      return null
+    },
     post: async () => ({ status: 503, data: { message: 'temporarily unavailable' }, headers: {} }),
   })
   await assert.rejects(
     new upstream.QwenAiTokenRefresher().refreshIfNeeded(qwenAccount(credentials)),
     error => error.status === 502
       && error.retryable === true
-      && error.accountFault === true
-      && error.retryScope === 'next-account',
+      && error.accountFault === false
+      && error.retryScope === undefined,
   )
+  assert.equal(upstreamPersisted, undefined)
 
   const controller = new AbortController()
   controller.abort()

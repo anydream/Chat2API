@@ -17,6 +17,11 @@ import {
   calculateQwenAiRequestReadyAt,
   parseQwenAiRetryAfterMs,
 } from './qwenAiGovernorPolicy'
+import { isQwenAiAccountFault as classifyQwenAiAccountFault } from './qwenAiAccountPolicy'
+
+function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
+  return classifyQwenAiAccountFault(value)
+}
 
 export type QwenAiRequestClass = 'normal' | 'context_compaction'
 
@@ -741,8 +746,7 @@ export class QwenAiRequestGovernor {
           item.resolve(this.createCancelledResult('Client disconnected while Qwen AI request was active.'))
           return
         }
-        const accountFault = (error as { accountFault?: unknown } | undefined)?.accountFault
-        if (accountFault !== false) {
+        if (isQwenAiAccountFault(error as { accountFault?: unknown } | undefined)) {
           this.openCooldown(item.accountId, this.getConfig().failureCooldownMs, 'exception')
         }
         this.completeGlobalRecoveryProbe(item, false)
@@ -837,7 +841,10 @@ export class QwenAiRequestGovernor {
       return result
     }
 
-    if (isQwenRiskControl(result.error, result.status, result.errorCode)) {
+    if (
+      isQwenAiAccountFault(result)
+      && isQwenRiskControl(result.error, result.status, result.errorCode)
+    ) {
       const config = this.getConfig()
       const current = this.accountCooldowns.get(accountId)
       const failures = (current?.failures || 0) + 1
@@ -853,23 +860,28 @@ export class QwenAiRequestGovernor {
       return result
     }
 
-    if (result.status === 429 || (result.status !== undefined && result.status >= 500)) {
+    // Provider availability/transit failures are not credential evidence. A
+    // transient 5xx or ordinary rate limit must stay account-neutral so one
+    // flaky upstream response cannot drain the entire account pool and turn
+    // the next request into `no_available_account`. Capacity 429 is the
+    // deliberate exception: Qwen reports that the account cannot accept the
+    // generation, so the forwarder may fail over to another account.
+    const capacity429 = isQwenAiAccountFault(result)
+      && result.status === 429
+      && result.errorCode === 'qwen_ai_capacity_limit'
+    if (capacity429) {
       const config = this.getConfig()
-      const retryAfterMs = result.status === 429
-        ? parseQwenAiRetryAfterMs(result.headers)
-        : undefined
+      const retryAfterMs = parseQwenAiRetryAfterMs(result.headers)
       const maxCooldownMs = Math.max(config.failureCooldownMs, config.maxRiskCooldownMs)
       const cooldownMs = Math.min(
         maxCooldownMs,
         Math.max(config.failureCooldownMs, retryAfterMs ?? 0),
       )
-      const reason = result.status === 429 && retryAfterMs !== undefined
+      const reason = retryAfterMs !== undefined
         ? `http_429_retry_after_${Math.ceil(cooldownMs / 1000)}s`
-        : `http_${result.status}`
+        : 'qwen_ai_capacity_limit'
       this.openCooldown(accountId, cooldownMs, reason)
-      if (result.status === 429) {
-        return withRetryAfterHeader(result, cooldownMs)
-      }
+      return withRetryAfterHeader(result, cooldownMs)
     }
 
     return result

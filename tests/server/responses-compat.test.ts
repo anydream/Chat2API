@@ -699,6 +699,26 @@ test('streaming upstream errors fail exactly once and never report completion', 
   assert.equal(failed.response.error.code, 'synthetic_error')
 })
 
+test('lifecycle callback failures cannot remove Responses terminal events', async () => {
+  const completed = await collectResponseEvents([
+    'data: {"choices":[{"delta":{"content":"complete"},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n',
+  ], undefined, {
+    onComplete: () => { throw new Error('synthetic completion callback failure') },
+  })
+  assert.equal(completed.filter((event) => event.type === 'response.completed').length, 1)
+  assert.equal(completed.some((event) => event.type === 'response.failed'), false)
+
+  const failed = await collectResponseEvents([
+    'data: {"error":{"message":"synthetic upstream failure","code":"synthetic_error"}}\n\n',
+    'data: [DONE]\n\n',
+  ], undefined, {
+    onFailure: () => { throw new Error('synthetic failure callback failure') },
+  })
+  assert.equal(failed.filter((event) => event.type === 'response.failed').length, 1)
+  assert.equal(failed.some((event) => event.type === 'response.completed'), false)
+})
+
 test('length and content filtering produce official incomplete terminal responses', async () => {
   for (const [finishReason, expectedReason] of [
     ['length', 'max_output_tokens'],

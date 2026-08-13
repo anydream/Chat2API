@@ -80,6 +80,7 @@ function loadRequestForwarder(overrides = {}) {
       findQwenAiModelCapability: overrides.findQwenAiModelCapability || (() => undefined),
       isQwenAiUpstreamBusyMessage: value => /qwen_ai_upstream_busy/i.test(String(value || '')),
       qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
+      qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
     },
     './adapters/zai': {
       ZaiAdapter: adapterWithMatcher('isZaiProvider'),
@@ -2365,4 +2366,308 @@ test('Qwen AI forwarding returns a structured failure before the first visible s
   assert.equal(result.retryable, false)
   assert.equal(result.stream, undefined)
   assert.deepEqual(deleteCalls, ['temporary-chat-capacity'])
+})
+
+function qwenResponsesBridgeContext(overrides = {}) {
+  const binding = {
+    providerId: 'qwen-ai',
+    accountId: 'account-pinned',
+    requestedModel: 'Qwen3.8-Max_Auto',
+    actualModel: 'qwen3.8-max',
+    chatId: 'chat-pinned',
+    parentId: 'response-pinned',
+    requestFingerprint: 'bridge-fingerprint',
+    toolProtocol: 'managed_xml',
+  }
+  return {
+    signal: new AbortController().signal,
+    qwenAiSessionBridge: {
+      requestFingerprint: binding.requestFingerprint,
+      continuation: {
+        binding,
+        inputMessages: [{
+          role: 'tool',
+          tool_call_id: 'call_read',
+          content: '{"name":"chat2api"}',
+        }],
+      },
+    },
+    ...overrides,
+  }
+}
+
+function qwenResponsesBridgePlan() {
+  return {
+    protocol: 'managed_xml',
+    tools: [],
+    shouldParseResponse: true,
+    allowedToolNames: new Set(['read_file']),
+    toolChoiceMode: 'auto',
+    workflowContinuation: true,
+    failedToolResultPending: false,
+  }
+}
+
+function qwenResponsesBridgeRequest() {
+  return {
+    model: 'Qwen3.8-Max_Auto',
+    stream: true,
+    tools: [{ type: 'function', function: { name: 'read_file', parameters: {} } }],
+    tool_choice: 'auto',
+    enable_thinking: true,
+    messages: [
+      { role: 'system', content: 'Original system instructions.' },
+      { role: 'user', content: 'Read package.json.' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_read',
+          type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"package.json"}' },
+        }],
+      },
+      { role: 'tool', tool_call_id: 'call_read', content: '{"name":"chat2api"}' },
+    ],
+  }
+}
+
+test('Qwen Responses bridge continues the pinned chat with only the tool-result delta', async () => {
+  const output = new PassThrough()
+  const continuationCalls = []
+  const freshChatCalls = []
+  let handlerChatId = ''
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async chatCompletion(request) {
+      freshChatCalls.push(request)
+      return {
+        response: { status: 200, headers: {}, data: new PassThrough() },
+        chatId: 'unexpected-fresh-chat',
+        parentId: null,
+      }
+    }
+
+    async continueChatCompletion(request) {
+      continuationCalls.push(request)
+      return { status: 200, headers: {}, data: new PassThrough() }
+    }
+
+    async deleteChat() { return true }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId(chatId) { handlerChatId = chatId }
+    getChatId() { return handlerChatId }
+    getResponseId() { return 'response-next' }
+    isComplete() { return false }
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: qwenResponsesBridgePlan(),
+  })
+
+  const resultPromise = forwarder.forwardQwenAi(
+    qwenResponsesBridgeRequest(),
+    { id: 'account-pinned' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'qwen3.8-max',
+    Date.now(),
+    qwenResponsesBridgeContext(),
+  )
+  output.write('data: {"choices":[{"delta":{"content":"continued"}}]}\n\n')
+  const result = await resultPromise
+
+  assert.equal(result.success, true)
+  assert.equal(freshChatCalls.length, 0)
+  assert.equal(continuationCalls.length, 1)
+  assert.equal(continuationCalls[0].chatId, 'chat-pinned')
+  assert.equal(continuationCalls[0].parentId, 'response-pinned')
+  assert.equal(continuationCalls[0].messages.length, 2)
+  assert.deepEqual(continuationCalls[0].messages[0], {
+    role: 'tool',
+    tool_call_id: 'call_read',
+    content: '{"name":"chat2api"}',
+  })
+  assert.doesNotMatch(JSON.stringify(continuationCalls[0].messages), /Original system instructions|Read package\.json/)
+  assert.equal(continuationCalls[0].managedToolWorkflowContinuation, true)
+  assert.equal(result.qwenAiSessionState?.getChatId(), 'chat-pinned')
+  assert.equal(result.qwenAiSessionState?.getParentId(), 'response-next')
+
+  output.destroy()
+})
+
+test('Qwen Responses bridge replays full history on the same account after stale chat state', async () => {
+  const output = new PassThrough()
+  const continuationCalls = []
+  const freshChatCalls = []
+  const deletedChats = []
+  let handlerChatId = ''
+
+  class QwenAiAdapter {
+    static isQwenAiProvider() { return true }
+
+    async continueChatCompletion(request) {
+      continuationCalls.push(request)
+      throw Object.assign(new Error('Qwen chat parent is no longer available'), { status: 404 })
+    }
+
+    async chatCompletion(request) {
+      freshChatCalls.push(request)
+      return {
+        response: { status: 200, headers: {}, data: new PassThrough() },
+        chatId: 'chat-replayed',
+        parentId: null,
+      }
+    }
+
+    async deleteChat(chatId) {
+      deletedChats.push(chatId)
+      return true
+    }
+  }
+
+  class QwenAiStreamHandler {
+    setChatId(chatId) { handlerChatId = chatId }
+    getChatId() { return handlerChatId }
+    getResponseId() { return 'response-replayed' }
+    isComplete() { return false }
+    async handleStream() { return output }
+  }
+
+  const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+  const forwarder = new RequestForwarder()
+  forwarder.transformRequestForPromptToolUse = request => ({
+    messages: request.messages,
+    plan: qwenResponsesBridgePlan(),
+  })
+
+  const request = qwenResponsesBridgeRequest()
+  const resultPromise = forwarder.forwardQwenAi(
+    request,
+    { id: 'account-pinned' },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'qwen3.8-max',
+    Date.now(),
+    qwenResponsesBridgeContext(),
+  )
+  output.write('data: {"choices":[{"delta":{"content":"replayed"}}]}\n\n')
+  const result = await resultPromise
+
+  assert.equal(result.success, true)
+  assert.equal(continuationCalls.length, 1)
+  assert.equal(freshChatCalls.length, 1)
+  assert.deepEqual(freshChatCalls[0].messages, request.messages)
+  assert.deepEqual(deletedChats, ['chat-pinned'])
+  assert.equal(result.providerSessionId, 'chat-replayed')
+  assert.equal(result.qwenAiSessionState?.getChatId(), 'chat-replayed')
+  assert.equal(result.qwenAiSessionState?.getParentId(), 'response-replayed')
+
+  output.destroy()
+})
+
+test('Qwen Responses bridge keeps CHAT_IN_PROGRESS account-neutral but forwards account faults', async (t) => {
+  const scenarios = [
+    {
+      name: 'busy chat',
+      error: Object.assign(new Error('chat is still in progress'), {
+        status: 429,
+        code: 'CHAT_IN_PROGRESS',
+        accountFault: false,
+        retryable: true,
+      }),
+      expectedAccountFault: false,
+      expectedRetryScope: undefined,
+    },
+    {
+      name: 'credential 401',
+      error: Object.assign(new Error('token expired'), {
+        status: 401,
+        code: 'qwen_ai_auth_failed',
+        accountFault: true,
+        retryScope: 'next-account',
+      }),
+      expectedAccountFault: true,
+      expectedRetryScope: 'next-account',
+    },
+    {
+      name: 'risk-control 403',
+      error: Object.assign(new Error('risk control'), {
+        status: 403,
+        code: 'qwen_ai_risk_control',
+        accountFault: true,
+        retryScope: 'next-account',
+      }),
+      expectedAccountFault: true,
+      expectedRetryScope: 'next-account',
+    },
+    {
+      name: 'capacity 429',
+      error: Object.assign(new Error('capacity limit'), {
+        status: 429,
+        code: 'qwen_ai_capacity_limit',
+        accountFault: true,
+        retryScope: 'next-account',
+      }),
+      expectedAccountFault: true,
+      expectedRetryScope: 'next-account',
+    },
+  ]
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const freshChatCalls = []
+      const deletedChats = []
+      class QwenAiAdapter {
+        static isQwenAiProvider() { return true }
+        async continueChatCompletion() { throw scenario.error }
+        async chatCompletion(request) {
+          freshChatCalls.push(request)
+          if (scenario.name === 'busy chat') throw scenario.error
+          throw new Error('a non-stale continuation must not replay on the same account')
+        }
+        async deleteChat(chatId) {
+          deletedChats.push(chatId)
+          return true
+        }
+      }
+      class QwenAiStreamHandler {}
+
+      const RequestForwarder = loadRequestForwarder({ QwenAiAdapter, QwenAiStreamHandler })
+      const forwarder = new RequestForwarder()
+      forwarder.transformRequestForPromptToolUse = request => ({
+        messages: request.messages,
+        plan: qwenResponsesBridgePlan(),
+      })
+
+      const result = await forwarder.forwardQwenAi(
+        qwenResponsesBridgeRequest(),
+        { id: 'account-pinned' },
+        { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+        'qwen3.8-max',
+        Date.now(),
+        qwenResponsesBridgeContext(),
+      )
+
+      assert.equal(result.success, false)
+      assert.equal(result.status, scenario.error.status)
+      assert.equal(result.errorCode, scenario.error.code)
+      assert.equal(result.accountFault, scenario.expectedAccountFault)
+      assert.equal(result.retryScope, scenario.expectedRetryScope)
+      if (scenario.name === 'busy chat') {
+        assert.equal(freshChatCalls.length, 1)
+        assert.deepEqual(freshChatCalls[0].messages, qwenResponsesBridgeRequest().messages)
+        assert.deepEqual(deletedChats, ['chat-pinned'])
+      } else {
+        assert.equal(freshChatCalls.length, 0)
+        assert.deepEqual(deletedChats, [])
+      }
+    })
+  }
 })

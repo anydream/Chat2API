@@ -143,6 +143,21 @@ test('server startup refreshes dynamic model catalogues before accepting traffic
   assert.ok(startAt > syncAt)
 })
 
+test('server shutdown is idempotent and drains HTTP streams before destroying sessions', () => {
+  const serverSource = fs.readFileSync('src/main/proxy/server.ts', 'utf8')
+  const entrySource = fs.readFileSync('src/server/index.ts', 'utf8')
+  const composeSource = fs.readFileSync('docker-compose.yml', 'utf8')
+  assert.match(serverSource, /private draining = false/)
+  assert.match(serverSource, /private activeResponses = new Set/)
+  assert.match(serverSource, /server\.closeIdleConnections\?\./)
+  assert.match(serverSource, /server\.closeAllConnections\?\./)
+  assert.match(serverSource, /waitForActiveResponses\(drainTimeoutMs\)/)
+  assert.ok(serverSource.indexOf('waitForActiveResponses') < serverSource.indexOf('sessionManager.destroy()'))
+  assert.match(entrySource, /shutdownPromise \?\?= shutdown\(signal\)/)
+  assert.match(composeSource, /stop_grace_period:\s*\$\{CHAT2API_STOP_GRACE_PERIOD:-10m\}/)
+  assert.match(composeSource, /CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:\s*\$\{CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:-540000\}/)
+})
+
 test('dynamic catalogue startup preserves persisted models until refresh succeeds', () => {
   const storeSource = fs.readFileSync('src/main/store/store.ts', 'utf8')
 

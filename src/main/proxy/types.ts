@@ -3,6 +3,11 @@
  * Defines core data structures for proxy service
  */
 
+import type {
+  QwenAiSessionBridge,
+  QwenAiSessionState,
+} from './qwenAiSessionBridge'
+
 /**
  * OpenAI Message Format
  */
@@ -293,8 +298,11 @@ export interface ProxyContext {
    * can remain private until terminal validation and account failover finish.
    */
   deferManagedStreamCommit?: boolean
-  /** Forward only genuine Qwen reasoning while the managed answer stays private. */
-  onQwenAiProgressFrame?: (frame: string) => void
+  /**
+   * Responses API state that lets Qwen continue a completed managed-tool
+   * exchange without replaying the whole client transcript.
+   */
+  qwenAiSessionBridge?: QwenAiSessionBridge
 }
 
 /**
@@ -327,6 +335,10 @@ export interface ForwardResult {
   effectiveProviderId?: string
   /** Actual provider model used for the client-visible result. */
   effectiveActualModel?: string
+  /** Live Qwen chat/parent state to persist after the response completes. */
+  qwenAiSessionState?: QwenAiSessionState
+  /** Client-visible tool call IDs emitted by a completed Qwen managed turn. */
+  qwenAiToolCallIds?: string[]
 }
 
 /**

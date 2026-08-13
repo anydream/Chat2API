@@ -6,6 +6,9 @@ services:
     image: chat2api:server
     container_name: chat2api
     restart: unless-stopped
+    # Match the server's default 9-minute request budget plus a small margin;
+    # override for deployments with a different shutdown drain policy.
+    stop_grace_period: ${CHAT2API_STOP_GRACE_PERIOD:-10m}
     ports:
       - "8080:8080"
     environment:
@@ -37,8 +40,9 @@ services:
       # Simultaneous recovery candidates; this does not cap total account
       # rotation for a compaction request.
       CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE: ${CHAT2API_QWEN_AI_COMPACTION_FAILOVER_WAVE_SIZE:-2}
-      # Ordinary pre-output 401/403/429/5xx failures also traverse the active
-      # Qwen pool. A positive value can impose a deployment-specific cap.
+      # Only pre-output 401/403 and capacity-classified 429 failures traverse
+      # the active Qwen pool. Ordinary 5xx and chat/session errors stay on the
+      # current account. A positive value can impose a deployment-specific cap.
       CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS: ${CHAT2API_QWEN_AI_MAX_ACCOUNT_FAILOVERS:-0}
       # Active accounts need the Qwen Web token cookie before they can enter
       # the request pool. Repair incomplete sessions serially to limit sign-in load.
@@ -88,9 +92,13 @@ services:
       # payload; it never creates another user turn or switches accounts.
       # Busy-chat admission has its own wall-clock budget; it must not inherit
       # the much longer generation timeout. Set 0 to disable busy-chat retry.
+      # Leave the generic retry-count override blank for deadline mode used by
+      # ordinary semantic workflow continuations. Bound Responses tool-result
+      # turns use the dedicated override below.
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS-}
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS:-1000}
       CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS: ${CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS:-300000}
+      CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS: ${CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS:-0}
       # Explicit governor values take precedence over settings persisted in
       # /data. Leave them unset to keep the stored profile.
       CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED: ${CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED-}
@@ -115,6 +123,7 @@ services:
       # Emit protocol-neutral SSE comments while a downstream stream is quiet.
       # Zero disables keep-alives for deployments that manage them elsewhere.
       CHAT2API_SSE_KEEPALIVE_INTERVAL_MS: ${CHAT2API_SSE_KEEPALIVE_INTERVAL_MS:-15000}
+      CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS: ${CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS:-540000}
       # ali-oss refreshes temporary upload credentials during long multipart uploads.
       QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS: ${QWEN_AI_OSS_STS_REFRESH_INTERVAL_MS:-240000}
       # Used only when managed stream validation is explicitly enabled.

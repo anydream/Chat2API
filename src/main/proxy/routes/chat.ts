@@ -39,6 +39,26 @@ import { isClientCancellationError, sanitizeForwardedErrorHeaders } from '../uti
 import { SseKeepAliveStream } from '../utils/sseKeepAlive'
 import { classifyChatRequest } from '../requestIntent'
 import { createAssistantOutputBoundaryStream } from '../toolCalling/assistantOutputBoundary'
+import {
+  createQwenAiSessionRequestFingerprint,
+  resolveQwenAiSessionBinding,
+  type QwenAiSessionBinding,
+  type QwenAiSessionBridge,
+  type QwenAiSessionState,
+} from '../qwenAiSessionBridge'
+import {
+  getTrailingQwenAiToolResultBatch,
+  qwenAiToolCallSessionStore,
+  type QwenAiToolCallSessionClaim,
+} from '../qwenAiToolCallSessionStore'
+import {
+  isQwenAiAccountFault as classifyQwenAiAccountFault,
+  qwenAiAccountRetryScope,
+} from '../qwenAiAccountPolicy'
+
+function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
+  return classifyQwenAiAccountFault(value)
+}
 
 const router = new Router({ prefix: '/v1/chat' })
 
@@ -150,6 +170,11 @@ function streamFailureRetryable(error: Error | undefined): boolean | undefined {
   return typeof retryable === 'boolean' ? retryable : undefined
 }
 
+function streamFailureRetryScope(error: Error | undefined): 'next-account' | undefined {
+  const retryScope = (error as (Error & { retryScope?: unknown }) | undefined)?.retryScope
+  return retryScope === 'next-account' ? retryScope : undefined
+}
+
 function isUpstreamProtocolStreamError(error: Error | undefined): boolean {
   return streamFailureStringField(error, 'type') === 'upstream_protocol_error'
 }
@@ -163,6 +188,36 @@ function requestFailureLogLevel(status: number | undefined): 'debug' | 'warn' | 
   if (status === 499) return 'debug'
   if (status === 429) return 'warn'
   return 'error'
+}
+
+function hasUsableQwenAiSessionBinding(
+  binding: QwenAiSessionBinding | undefined,
+  requestFingerprint: string | undefined,
+  requestModel: string,
+): binding is QwenAiSessionBinding {
+  return Boolean(
+    binding
+    && requestFingerprint
+    && binding.requestFingerprint === requestFingerprint
+    && binding.requestedModel === requestModel
+    && binding.providerId.trim()
+    && binding.accountId.trim()
+    && binding.actualModel.trim()
+    && binding.chatId.trim()
+    && binding.parentId.trim(),
+  )
+}
+
+function isQwenAiSessionStaleErrorCode(errorCode: unknown): boolean {
+  return String(errorCode || '').trim().toLowerCase() === 'qwen_ai_session_stale'
+}
+
+function isQwenAiContinuationRejectedErrorCode(errorCode: unknown): boolean {
+  return String(errorCode || '').trim().toLowerCase() === 'qwen_ai_continuation_rejected'
+}
+
+function isQwenAiChatInProgressErrorCode(errorCode: unknown): boolean {
+  return String(errorCode || '').trim().toUpperCase() === 'CHAT_IN_PROGRESS'
 }
 
 interface EffectiveSelectionHint {
@@ -288,17 +343,129 @@ router.post('/completions', async (ctx: Context) => {
   }))
 
   const config = storeManager.getConfig()
-  const preferredProviderId = modelMapper.getPreferredProvider(request.model)
-  const preferredAccountId = modelMapper.getPreferredAccount(request.model)
+  const qwenAiToolCallSessionEnabled = config.qwenAiSessionMode !== 'legacy'
+  const managedToolChatRequest = qwenAiToolCallSessionEnabled
+    && requestIntent.intent !== 'context_compaction'
+    && Boolean(request.tools?.length)
+    && request.tool_choice !== 'none'
+  const qwenAiRequestFingerprint = managedToolChatRequest
+    ? createQwenAiSessionRequestFingerprint(request)
+    : undefined
+  const qwenAiToolResultBatch = managedToolChatRequest
+    ? getTrailingQwenAiToolResultBatch(request.messages)
+    : undefined
+  const qwenAiToolCallClaimResult = qwenAiToolResultBatch
+    ? qwenAiToolCallSessionStore.claim(qwenAiToolResultBatch.toolCallIds)
+    : { status: 'missing' as const }
+  if (qwenAiToolCallClaimResult.status === 'busy') {
+    ctx.set('Retry-After', String(Math.max(1, Math.ceil(qwenAiToolCallClaimResult.retryAfterMs / 1000))))
+    ctx.status = 429
+    ctx.body = {
+      error: {
+        message: 'The Qwen tool-call continuation is already in progress.',
+        type: 'api_error',
+        param: null,
+        code: 'CHAT_IN_PROGRESS',
+      },
+    }
+    return
+  }
+  const cachedQwenAiSessionBinding = qwenAiToolCallClaimResult.status === 'claimed'
+    ? qwenAiToolCallClaimResult.binding
+    : undefined
+  const qwenAiToolCallClaim: QwenAiToolCallSessionClaim | undefined =
+    qwenAiToolCallClaimResult.status === 'claimed'
+      ? qwenAiToolCallClaimResult.claim
+      : undefined
+  let qwenAiToolCallClaimFinalized = false
+  const finalizeQwenAiToolCallClaim = (
+    disposition: 'consume' | 'release',
+    reason: string,
+  ) => {
+    if (!qwenAiToolCallClaim || qwenAiToolCallClaimFinalized) return
+    qwenAiToolCallClaimFinalized = true
+    const applied = disposition === 'consume'
+      ? qwenAiToolCallSessionStore.consume(qwenAiToolCallClaim)
+      : qwenAiToolCallSessionStore.release(qwenAiToolCallClaim)
+    storeManager.addLog('debug', `${disposition === 'consume' ? 'Consumed' : 'Released'} Qwen tool-call session claim`, {
+      requestId,
+      providerId: cachedQwenAiSessionBinding?.providerId,
+      accountId: cachedQwenAiSessionBinding?.accountId,
+      model: request.model,
+      data: { reason, applied },
+    })
+  }
+  const consumeQwenAiToolCallClaim = (reason: string) => {
+    finalizeQwenAiToolCallClaim('consume', reason)
+  }
+  const releaseQwenAiToolCallClaim = (reason: string) => {
+    finalizeQwenAiToolCallClaim('release', reason)
+  }
+  const finalizeFailedQwenAiToolCallClaim = (
+    errorCode: unknown,
+    accountFault: boolean | undefined,
+    retryScope: 'next-account' | undefined,
+    reason: string,
+  ) => {
+    if (isQwenAiChatInProgressErrorCode(errorCode)) {
+      releaseQwenAiToolCallClaim(`${reason}_chat_in_progress`)
+      return
+    }
+    if (
+      isQwenAiSessionStaleErrorCode(errorCode)
+      || isQwenAiContinuationRejectedErrorCode(errorCode)
+      || (accountFault === true && retryScope === 'next-account')
+    ) {
+      consumeQwenAiToolCallClaim(reason)
+      return
+    }
+    releaseQwenAiToolCallClaim(reason)
+  }
+  let qwenAiContinuationBinding: QwenAiSessionBinding | undefined
+  if (cachedQwenAiSessionBinding) {
+    const bindingAccount = storeManager.getAccountById(cachedQwenAiSessionBinding.accountId)
+    const bindingProvider = storeManager.getProviderById(cachedQwenAiSessionBinding.providerId)
+    const bindingOwnershipMatches = bindingAccount?.providerId === bindingProvider?.id
+      && bindingProvider !== undefined
+      && QwenAiAdapter.isQwenAiProvider(bindingProvider)
+    if (
+      bindingOwnershipMatches
+      && hasUsableQwenAiSessionBinding(
+        cachedQwenAiSessionBinding,
+        qwenAiRequestFingerprint,
+        request.model,
+      )
+    ) {
+      qwenAiContinuationBinding = cachedQwenAiSessionBinding
+      console.info('[Chat] Qwen tool-call continuation candidate', JSON.stringify({
+        requestId,
+        providerId: cachedQwenAiSessionBinding.providerId,
+        accountId: cachedQwenAiSessionBinding.accountId,
+        toolResultCount: qwenAiToolResultBatch?.toolCallIds.length || 0,
+      }))
+    } else {
+      consumeQwenAiToolCallClaim('continuation_incompatible')
+    }
+  }
+
+  const mappedPreferredProviderId = modelMapper.getPreferredProvider(request.model)
+  const mappedPreferredAccountId = modelMapper.getPreferredAccount(request.model)
+  const preferredProviderId = qwenAiContinuationBinding?.providerId ?? mappedPreferredProviderId
+  const preferredAccountId = qwenAiContinuationBinding?.accountId ?? mappedPreferredAccountId
 
   const initialSelection = loadBalancer.selectAccount(
     request.model,
     config.loadBalanceStrategy,
     preferredProviderId,
-    preferredAccountId
+    preferredAccountId,
+    new Set<string>(),
+    qwenAiContinuationBinding
+      ? { allowQueuedQwenAiPreferredAccount: true }
+      : undefined,
   )
 
   if (!initialSelection) {
+    releaseQwenAiToolCallClaim('no_available_account')
     ctx.status = 503
     ctx.body = {
       error: {
@@ -311,25 +478,93 @@ router.post('/completions', async (ctx: Context) => {
     return
   }
 
+  if (
+    qwenAiContinuationBinding
+    && initialSelection.provider.id === qwenAiContinuationBinding.providerId
+    && initialSelection.account.id === qwenAiContinuationBinding.accountId
+    && initialSelection.actualModel !== qwenAiContinuationBinding.actualModel
+  ) {
+    consumeQwenAiToolCallClaim('actual_model_changed')
+    qwenAiContinuationBinding = undefined
+  }
+
+  const qwenAiSessionBridgeForSelection = (
+    selection: AccountSelection,
+  ): QwenAiSessionBridge | undefined => {
+    if (
+      !managedToolChatRequest
+      || !qwenAiRequestFingerprint
+      || !QwenAiAdapter.isQwenAiProvider(selection.provider)
+    ) {
+      return undefined
+    }
+
+    const useContinuation = Boolean(
+      qwenAiContinuationBinding
+      && selection.provider.id === qwenAiContinuationBinding.providerId
+      && selection.account.id === qwenAiContinuationBinding.accountId
+      && selection.actualModel === qwenAiContinuationBinding.actualModel,
+    )
+    return {
+      requestFingerprint: qwenAiRequestFingerprint,
+      ...(useContinuation && qwenAiToolResultBatch ? {
+        continuation: {
+          binding: qwenAiContinuationBinding!,
+          inputMessages: qwenAiToolResultBatch.messages,
+        },
+      } : {}),
+    }
+  }
+
   const clientSignal = createClientAbortSignal(ctx)
   const createProxyContext = (
     selection: AccountSelection,
     deferManagedStreamCommit = false,
-    onQwenAiProgressFrame?: (frame: string) => void,
-  ): ProxyContext => ({
-    requestId,
-    providerId: selection.provider.id,
-    accountId: selection.account.id,
-    model: request.model,
-    actualModel: selection.actualModel,
-    startTime,
-    isStream: request.stream || false,
-    clientIP,
-    signal: clientSignal,
-    requestIntent: requestIntent.intent,
-    ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
-    ...(onQwenAiProgressFrame ? { onQwenAiProgressFrame } : {}),
-  })
+  ): ProxyContext => {
+    const qwenAiSessionBridge = qwenAiSessionBridgeForSelection(selection)
+    return {
+      requestId,
+      providerId: selection.provider.id,
+      accountId: selection.account.id,
+      model: request.model,
+      actualModel: selection.actualModel,
+      startTime,
+      isStream: request.stream || false,
+      clientIP,
+      signal: clientSignal,
+      requestIntent: requestIntent.intent,
+      ...(deferManagedStreamCommit ? { deferManagedStreamCommit: true } : {}),
+      ...(qwenAiSessionBridge ? { qwenAiSessionBridge } : {}),
+    }
+  }
+  const registerQwenAiToolCallSessionBinding = (
+    toolCallIds: readonly string[] | undefined,
+    qwenAiSessionState: QwenAiSessionState | undefined,
+  ) => {
+    if (!managedToolChatRequest || !toolCallIds?.length) return
+    const binding = resolveQwenAiSessionBinding(qwenAiSessionState)
+    if (!binding) return
+    if (!qwenAiToolCallSessionStore.set(toolCallIds, binding)) {
+      storeManager.addLog('warn', 'Qwen tool-call session binding exceeded bounded cache limits', {
+        requestId,
+        providerId: binding.providerId,
+        accountId: binding.accountId,
+        model: request.model,
+      })
+      return
+    }
+    storeManager.addLog('debug', 'Stored Qwen tool-call session binding', {
+      requestId,
+      providerId: binding.providerId,
+      accountId: binding.accountId,
+      model: request.model,
+      data: {
+        toolCallCount: toolCallIds.length,
+        chatId: binding.chatId,
+        parentId: binding.parentId,
+      },
+    })
+  }
   let { account, provider, actualModel } = initialSelection
   let context = createProxyContext(initialSelection)
   proxyStatusManager.recordRequestStart(request.model, provider.id, account.id)
@@ -337,8 +572,15 @@ router.post('/completions', async (ctx: Context) => {
   const initialProviderIsQwenAi = QwenAiAdapter.isQwenAiProvider(initialSelection.provider)
   const failoverSelectionConstraints = initialProviderIsQwenAi
     && loadBalancer.hasCompleteQwenAiWebSession(initialSelection)
-    ? { qwenAiWebSessionTier: 'complete' as const }
-    : undefined
+    ? {
+        qwenAiWebSessionTier: 'complete' as const,
+        ...(qwenAiContinuationBinding
+          ? { allowQueuedQwenAiPreferredAccount: true }
+          : {}),
+      }
+    : qwenAiContinuationBinding
+      ? { allowQueuedQwenAiPreferredAccount: true }
+      : undefined
   const activeAccountCount = initialProviderIsQwenAi
     ? storeManager.getAccountsByProviderId(initialSelection.provider.id)
       .filter(candidate => candidate.status === 'active')
@@ -352,10 +594,6 @@ router.post('/completions', async (ctx: Context) => {
   })
   const deferManagedStreamCommit = initialProviderIsQwenAi
     && shouldDeferQwenAiManagedStreamCommit(request)
-  const qwenAiProgressStream = deferManagedStreamCommit ? new PassThrough() : undefined
-  const onQwenAiProgressFrame = qwenAiProgressStream
-    ? (frame: string) => { qwenAiProgressStream.write(frame) }
-    : undefined
 
   const runWithAccountFailover = () => forwardWithAccountFailover({
     initialSelection,
@@ -365,7 +603,6 @@ router.post('/completions', async (ctx: Context) => {
       const attemptContext = createProxyContext(
         selection,
         deferManagedStreamCommit,
-        onQwenAiProgressFrame,
       )
       return requestForwarder.forwardChatCompletion(
         request,
@@ -393,8 +630,21 @@ router.post('/completions', async (ctx: Context) => {
           accountFault: result.accountFault,
         })
       }
-      if (result.accountFault !== false) {
+      if (
+        !QwenAiAdapter.isQwenAiProvider(selection.provider)
+          ? result.accountFault !== false
+          : isQwenAiAccountFault(result)
+      ) {
         loadBalancer.markAccountFailed(selection.account.id)
+      }
+      if (
+        qwenAiContinuationBinding
+        && selection.provider.id === qwenAiContinuationBinding.providerId
+        && selection.account.id === qwenAiContinuationBinding.accountId
+        && result.accountFault === true
+        && result.retryScope === 'next-account'
+      ) {
+        consumeQwenAiToolCallClaim('account_failover')
       }
       storeManager.addLog('warn', 'Retrying request with another account after upstream failure', {
         requestId,
@@ -422,7 +672,6 @@ router.post('/completions', async (ctx: Context) => {
             stream: createDeferredQwenAiFailoverStream(
               failoverPromise,
               clientSignal,
-              qwenAiProgressStream,
             ),
             skipTransform: true,
           },
@@ -443,9 +692,25 @@ router.post('/completions', async (ctx: Context) => {
     const latency = Date.now() - startTime
 
     if (!result.success) {
+      finalizeFailedQwenAiToolCallClaim(
+        result.errorCode,
+        result.accountFault,
+        result.retryScope,
+        isQwenAiSessionStaleErrorCode(result.errorCode)
+          ? 'session_stale'
+          : isQwenAiContinuationRejectedErrorCode(result.errorCode)
+            ? 'continuation_rejected'
+            : result.accountFault === true && result.retryScope === 'next-account'
+              ? 'account_failover_exhausted'
+              : 'request_failed',
+      )
       proxyStatusManager.recordRequestFailure(latency)
 
-      if (result.accountFault !== false) {
+      if (
+        !QwenAiAdapter.isQwenAiProvider(provider)
+          ? result.accountFault !== false
+          : isQwenAiAccountFault(result)
+      ) {
         if (isQwenAiRiskControl(
           provider.id,
           result.status,
@@ -637,6 +902,23 @@ router.post('/completions', async (ctx: Context) => {
       const qwenAiStream = QwenAiAdapter.isQwenAiProvider(provider)
         ? sourceStream as QwenAiOutputStream
         : undefined
+      const persistCompletedQwenAiToolCallBinding = () => {
+        if (qwenAiStream?.qwenAiFailure) return
+        consumeQwenAiToolCallClaim('continuation_consumed')
+        if (!qwenAiStream) return
+        registerQwenAiToolCallSessionBinding(
+          qwenAiStream.qwenAiToolCallIds,
+          qwenAiStream.qwenAiSessionState,
+        )
+      }
+      const finalizeFailedQwenAiToolCallBinding = (error: Error | undefined) => {
+        finalizeFailedQwenAiToolCallClaim(
+          streamFailureCode(error),
+          streamFailureAccountFault(error),
+          streamFailureRetryScope(error),
+          'terminal_stream_failure',
+        )
+      }
       const getDeferredStreamSelection = (): AccountSelection => resolveEffectiveSelection(
         { account, provider, actualModel },
         {
@@ -705,7 +987,14 @@ router.post('/completions', async (ctx: Context) => {
           }, requestIntent.intent)
         }
         proxyStatusManager.recordRequestFailure(completionLatency)
-        if (failureStatus !== 499 && streamFailureAccountFault(error) !== false) {
+        const shouldPenalizeStreamAccount = failureStatus !== 499 && (
+          !qwenAiFailure
+            ? streamFailureAccountFault(error) !== false
+            : isQwenAiAccountFault({
+                accountFault: streamFailureAccountFault(error),
+              })
+        )
+        if (shouldPenalizeStreamAccount) {
           if (qwenAiFailure && isQwenAiRiskControl(
             completionProvider.id,
             failureStatus,
@@ -759,9 +1048,11 @@ router.post('/completions', async (ctx: Context) => {
 
       if (qwenAiStream) {
         qwenAiStream.once(QWEN_AI_STREAM_FAILURE_EVENT, (error: Error) => {
+          finalizeFailedQwenAiToolCallBinding(error)
           recordDeferredStreamOutcome(false, error)
         })
         if (qwenAiStream.qwenAiFailure) {
+          finalizeFailedQwenAiToolCallBinding(qwenAiStream.qwenAiFailure)
           recordDeferredStreamOutcome(false, qwenAiStream.qwenAiFailure)
         }
       }
@@ -769,6 +1060,7 @@ router.post('/completions', async (ctx: Context) => {
       const handleOutputStreamError = (err: Error) => {
         if (outputStreamEnded) return
         outputStreamEnded = true
+        finalizeFailedQwenAiToolCallBinding(err)
         const clientCancelled = context.signal?.aborted || isClientCancellationError(err)
         if (clientCancelled) {
           console.log('[Chat] Stream cancelled:', err.message)
@@ -868,6 +1160,7 @@ router.post('/completions', async (ctx: Context) => {
           outputStreamEnded = true
           const qwenAiFailure = qwenAiStream?.qwenAiFailure
           recordDeferredStreamOutcome(!qwenAiFailure, qwenAiFailure)
+          persistCompletedQwenAiToolCallBinding()
           // Update log with collected response
           if (logEntryId) {
             storeManager.updateRequestLog(logEntryId, {
@@ -906,6 +1199,7 @@ router.post('/completions', async (ctx: Context) => {
         guardedStream.once('end', () => {
           if (outputStreamEnded) return
           outputStreamEnded = true
+          persistCompletedQwenAiToolCallBinding()
           // Update log with collected response
           if (logEntryId) {
             storeManager.updateRequestLog(logEntryId, {
@@ -919,6 +1213,12 @@ router.post('/completions', async (ctx: Context) => {
       ctx.body = wrapperStream
     } else {
       ctx.set('Content-Type', 'application/json')
+
+      consumeQwenAiToolCallClaim('continuation_consumed')
+      registerQwenAiToolCallSessionBinding(
+        result.qwenAiToolCallIds,
+        result.qwenAiSessionState,
+      )
 
       if (result.body) {
         // Check if we need to transform to Anthropic format
@@ -951,6 +1251,13 @@ router.post('/completions', async (ctx: Context) => {
       }
     }
   } catch (error) {
+    const caughtError = error instanceof Error ? error : undefined
+    finalizeFailedQwenAiToolCallClaim(
+      streamFailureCode(caughtError),
+      streamFailureAccountFault(caughtError),
+      streamFailureRetryScope(caughtError),
+      'request_exception',
+    )
     const latency = Date.now() - startTime
     proxyStatusManager.recordRequestFailure(latency)
 

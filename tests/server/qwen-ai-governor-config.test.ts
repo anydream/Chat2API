@@ -5,9 +5,11 @@ import ts from 'typescript'
 
 import {
   DEFAULT_QWEN_AI_GOVERNOR_CONFIG,
+  DEFAULT_QWEN_AI_SESSION_MODE,
   MAX_QWEN_AI_CONCURRENCY,
   normalizeQwenAiConcurrency,
   normalizeQwenAiGovernorConfig,
+  normalizeQwenAiSessionMode,
 } from '../../src/main/store/types.ts'
 
 type ConfigManagerShape = {
@@ -47,6 +49,14 @@ test('Qwen governor exposes a bounded concurrency ceiling and fast new-install d
   assert.equal(DEFAULT_QWEN_AI_GOVERNOR_CONFIG.autoTuneMaxConcurrent, 100)
   assert.equal(DEFAULT_QWEN_AI_GOVERNOR_CONFIG.autoTuneMinGlobalIntervalMs, 1000)
   assert.equal(DEFAULT_QWEN_AI_GOVERNOR_CONFIG.maxConcurrent, 1)
+})
+
+test('Qwen tool session mode defaults to binding and preserves both supported modes', () => {
+  assert.equal(DEFAULT_QWEN_AI_SESSION_MODE, 'tool-call-binding')
+  assert.equal(normalizeQwenAiSessionMode(undefined), 'tool-call-binding')
+  assert.equal(normalizeQwenAiSessionMode('legacy'), 'legacy')
+  assert.equal(normalizeQwenAiSessionMode('tool-call-binding'), 'tool-call-binding')
+  assert.equal(normalizeQwenAiSessionMode('invalid'), 'tool-call-binding')
 })
 
 test('Qwen concurrency normalization preserves valid persisted values and clamps unsafe ones', () => {
@@ -132,6 +142,18 @@ test('Qwen governor API validation rejects concurrency above the safety ceiling'
     'qwenAiGovernorConfig.autoTuneMaxConcurrent must be between 1-100',
     'qwenAiGovernorConfig.maxConcurrent must be between 1-100',
   ])
+})
+
+test('Qwen tool session mode validation rejects unknown values', () => {
+  const ConfigManager = loadConfigManagerForValidation()
+  const valid = ConfigManager.validate({ qwenAiSessionMode: 'legacy' })
+  const invalid = ConfigManager.validate({ qwenAiSessionMode: 'unknown' })
+
+  assert.deepEqual(valid, { valid: true, errors: [] })
+  assert.deepEqual(invalid, {
+    valid: false,
+    errors: ['qwenAiSessionMode must be one of: legacy, tool-call-binding'],
+  })
 })
 
 test('Qwen queue admission defaults stay at 120 seconds across Docker and source', () => {

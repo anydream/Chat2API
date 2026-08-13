@@ -6,7 +6,8 @@
 import Koa, { type Context, type Next } from 'koa'
 import Router from '@koa/router'
 import bodyParser from 'koa-bodyparser'
-import { Server as HttpServer } from 'http'
+import { Server as HttpServer, type ServerResponse } from 'http'
+import type { Socket } from 'net'
 import routes from './routes'
 import managementRoutes from './routes/management'
 import { proxyStatusManager } from './status'
@@ -18,6 +19,18 @@ import { mountWebAdminAssets } from '../../server/admin/assets'
 const SLOW_REQUEST_THRESHOLD_MS = 1500
 const BROWSER_IMPORT_MAX_CONTENT_LENGTH = 128 * 1024
 const BROWSER_IMPORT_PATH = '/v0/management/browser-import/complete'
+const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS = 540_000
+const SHUTDOWN_FORCE_CLOSE_WAIT_MS = 5_000
+
+export function shutdownDrainTimeoutMsFromEnv(): number {
+  const raw = process.env.CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS
+  if (raw === undefined || raw.trim() === '') return DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS
+
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MS
+}
 
 /**
  * Proxy Server Class
@@ -28,6 +41,11 @@ export class ProxyServer {
   private server: HttpServer | null = null
   private port: number = 8080
   private host: string = '127.0.0.1'
+  private draining = false
+  private stopPromise: Promise<boolean> | null = null
+  private activeResponses = new Set<ServerResponse>()
+  private openSockets = new Set<Socket>()
+  private drainWaiters = new Set<() => void>()
 
   constructor() {
     this.app = new Koa()
@@ -42,6 +60,30 @@ export class ProxyServer {
    * Setup middleware
    */
   private setupMiddleware(): void {
+    // Do this before routing so an existing keep-alive connection cannot
+    // start another generation after SIGTERM has begun graceful draining.
+    this.app.use(async (ctx, next) => {
+      if (this.draining) {
+        if (ctx.path === '/health') {
+          await next()
+          return
+        }
+        ctx.set('Connection', 'close')
+        ctx.status = 503
+        ctx.body = {
+          error: {
+            message: 'Server is shutting down and is not accepting new requests.',
+            type: 'service_unavailable_error',
+            code: 'server_shutting_down',
+          },
+        }
+        return
+      }
+
+      this.trackResponse(ctx.res)
+      await next()
+    })
+
     this.app.use(async (ctx, next) => {
       ctx.set('Access-Control-Allow-Origin', '*')
       ctx.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
@@ -297,8 +339,9 @@ export class ProxyServer {
       const status = proxyStatusManager.getRunningStatus()
       const statistics = proxyStatusManager.getStatistics()
 
+      if (this.draining) ctx.status = 503
       ctx.body = {
-        status: status.isRunning ? 'running' : 'stopped',
+        status: this.draining ? 'draining' : status.isRunning ? 'running' : 'stopped',
         uptime: status.uptime,
         statistics: {
           totalRequests: statistics.totalRequests,
@@ -397,6 +440,8 @@ export class ProxyServer {
       return false
     }
 
+    this.draining = false
+    this.stopPromise = null
     this.port = port || proxyStatusManager.getPort()
     this.host = host || proxyStatusManager.getHost()
     
@@ -426,6 +471,11 @@ export class ProxyServer {
           resolve(false)
         })
 
+        this.server.on('connection', (socket: Socket) => {
+          this.openSockets.add(socket)
+          socket.once('close', () => this.openSockets.delete(socket))
+        })
+
         this.server.on('close', () => {
           qwenAiSessionRepairService.stop()
           this.server = null
@@ -441,29 +491,121 @@ export class ProxyServer {
    * Stop server
    */
   async stop(): Promise<boolean> {
-    if (!this.server) {
-      return false
-    }
-    
-    qwenAiSessionRepairService.stop()
-    sessionManager.destroy()
+    if (this.stopPromise) return this.stopPromise
+    if (!this.server) return false
 
-    return new Promise((resolve) => {
-      this.server!.close((err) => {
-        if (err) {
-          storeManager.addLog('error', `Failed to stop server: ${err.message}`)
+    this.stopPromise = this.stopGracefully(this.server)
+    return this.stopPromise
+  }
+
+  private async stopGracefully(server: HttpServer): Promise<boolean> {
+    this.draining = true
+    qwenAiSessionRepairService.stop()
+    storeManager.addLog('info', 'Proxy server is draining active HTTP streams before shutdown', {
+      data: {
+        activeResponses: this.activeResponses.size,
+        drainTimeoutMs: shutdownDrainTimeoutMsFromEnv(),
+      },
+    })
+
+    const closed = new Promise<boolean>((resolve) => {
+      server.close((error) => {
+        if (error) {
+          storeManager.addLog('error', `Failed to stop server: ${error.message}`)
           resolve(false)
           return
         }
-
-        this.server = null
-        proxyStatusManager.stop()
-
-        storeManager.addLog('info', 'Proxy server stopped')
-
         resolve(true)
       })
     })
+    // Node keeps a long-lived SSE response open but can retire idle
+    // keep-alive sockets immediately once it has stopped listening.
+    server.closeIdleConnections?.()
+
+    const drainTimeoutMs = shutdownDrainTimeoutMsFromEnv()
+    const drained = await this.waitForActiveResponses(drainTimeoutMs)
+    if (!drained) {
+      storeManager.addLog('warn', 'Proxy shutdown drain deadline reached; closing remaining HTTP connections', {
+        data: {
+          activeResponses: this.activeResponses.size,
+          openSockets: this.openSockets.size,
+          drainTimeoutMs,
+        },
+      })
+      this.forceCloseOpenConnections(server)
+    }
+
+    const stopped = await this.waitForServerClose(closed, SHUTDOWN_FORCE_CLOSE_WAIT_MS)
+    if (!stopped) {
+      storeManager.addLog('error', 'Proxy server did not close after the shutdown drain deadline')
+    }
+
+    // Session state can still be needed by a live stream's completion hook.
+    // Dispose it only after the server stopped accepting and draining requests.
+    sessionManager.destroy()
+    this.activeResponses.clear()
+    this.openSockets.clear()
+    this.drainWaiters.clear()
+    if (this.server === server) this.server = null
+    proxyStatusManager.stop()
+
+    if (stopped) storeManager.addLog('info', 'Proxy server stopped')
+    return stopped
+  }
+
+  private trackResponse(response: ServerResponse): void {
+    if (response.writableEnded || response.destroyed) return
+    this.activeResponses.add(response)
+
+    let released = false
+    const release = () => {
+      if (released) return
+      released = true
+      response.removeListener('finish', release)
+      response.removeListener('close', release)
+      this.activeResponses.delete(response)
+      if (this.activeResponses.size === 0) {
+        for (const resolve of this.drainWaiters) resolve()
+        this.drainWaiters.clear()
+      }
+    }
+    response.once('finish', release)
+    response.once('close', release)
+  }
+
+  private waitForActiveResponses(timeoutMs: number): Promise<boolean> {
+    if (this.activeResponses.size === 0) return Promise.resolve(true)
+
+    return new Promise((resolve) => {
+      let settled = false
+      const settle = (drained: boolean) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.drainWaiters.delete(onDrained)
+        resolve(drained)
+      }
+      const onDrained = () => settle(true)
+      const timer = setTimeout(() => settle(false), timeoutMs)
+      this.drainWaiters.add(onDrained)
+    })
+  }
+
+  private forceCloseOpenConnections(server: HttpServer): void {
+    server.closeAllConnections?.()
+    for (const socket of this.openSockets) socket.destroy()
+  }
+
+  private async waitForServerClose(
+    closed: Promise<boolean>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    return Promise.race([
+      closed,
+      new Promise<boolean>((resolve) => {
+        setTimeout(() => resolve(false), timeoutMs)
+      }),
+    ])
   }
 
   /**
@@ -479,6 +621,10 @@ export class ProxyServer {
    */
   isRunning(): boolean {
     return this.server !== null && proxyStatusManager.getRunningStatus().isRunning
+  }
+
+  isDraining(): boolean {
+    return this.draining
   }
 
   /**

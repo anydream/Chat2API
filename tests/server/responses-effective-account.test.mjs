@@ -287,7 +287,9 @@ function loadResponsesRoute(createResult, options = {}) {
     '../responses/store': {
       responsesConversationStore: {
         get: () => undefined,
+        getConversation: () => undefined,
         set: () => true,
+        clearQwenAiSessionBinding: () => {},
       },
     },
     '../responses/stream': {
@@ -309,6 +311,29 @@ function loadResponsesRoute(createResult, options = {}) {
         textChars: 0,
         lastUserTextChars: 0,
       }),
+    },
+    '../qwenAiSessionBridge': {
+      createQwenAiSessionRequestFingerprint: () => 'qwen-responses-test-fingerprint',
+      resolveQwenAiSessionBinding: state => state ? {
+        providerId: state.providerId,
+        accountId: state.accountId,
+        requestedModel: state.requestedModel,
+        actualModel: state.actualModel,
+        chatId: state.getChatId(),
+        parentId: state.getParentId(),
+        requestFingerprint: state.requestFingerprint,
+      } : undefined,
+    },
+    '../qwenAiToolCallSessionStore': {
+      getTrailingQwenAiToolResultBatch: () => undefined,
+      qwenAiToolCallSessionStore: {
+        resolve: () => undefined,
+        set: () => true,
+        delete: () => {},
+      },
+    },
+    '../toolCalling/workflowHeuristics': {
+      hasTrailingMatchedToolResultBatch: () => false,
     },
   }
   const testRequire = specifier => {
@@ -437,6 +462,31 @@ test('Responses stream completion reads late effective-account metadata before u
   assert.deepEqual(calls.usage, ['account-effective'])
   assert.deepEqual(calls.cleared, ['account-effective'])
   assertEffectiveStats(calls, true)
+})
+
+test('Responses converts a source close without end into a structured failure', async () => {
+  const rawStream = new PassThrough()
+  const { handler, calls } = loadResponsesRoute(() => ({
+    success: true,
+    status: 200,
+    stream: rawStream,
+    skipTransform: true,
+  }))
+  const ctx = createContext({ model: 'claude-client-model', input: 'close without end', stream: true })
+
+  await handler(ctx)
+  ctx.body.resume()
+  const ended = once(ctx.body, 'end')
+  rawStream.destroy()
+  await ended
+
+  assert.equal(calls.stats.length, 1)
+  assert.equal(calls.stats[0][0], false)
+  assert.equal(calls.stats[0][3], 'qwen-ai-initial')
+  assert.equal(calls.stats[0][4], 'account-initial')
+  const failureLog = calls.logs.find(entry => entry.message === 'Responses request failed')
+  assert.equal(failureLog?.context.providerId, 'qwen-ai-initial')
+  assert.equal(failureLog?.context.accountId, 'account-initial')
 })
 
 test('managed Qwen Responses route returns keep-alive output before account validation completes', async () => {

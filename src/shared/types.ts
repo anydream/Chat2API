@@ -30,6 +30,8 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
 
 export type Theme = 'light' | 'dark' | 'system'
 
+export type QwenAiSessionMode = 'legacy' | 'tool-call-binding'
+
 export interface QwenAiGovernorConfig {
   autoTuneEnabled: boolean
   autoTuneMaxConcurrent: number
@@ -216,6 +218,7 @@ export interface AppConfig {
   toolCallingConfig: ToolCallingConfig
   toolPromptConfig?: LegacyToolPromptConfig
   qwenAiGovernorConfig: QwenAiGovernorConfig
+  qwenAiSessionMode: QwenAiSessionMode
   managementApi: ManagementApiConfig
   contextManagement?: unknown
   language: 'zh-CN' | 'en-US'
@@ -484,6 +487,7 @@ export interface ConfigUpdateRequest {
   toolCallingConfig?: Partial<ToolCallingConfig>
   toolPromptConfig?: LegacyToolPromptConfig
   qwenAiGovernorConfig?: Partial<QwenAiGovernorConfig>
+  qwenAiSessionMode?: QwenAiSessionMode
   managementApi?: ManagementApiConfig
 }
 

@@ -61,6 +61,7 @@ import {
   normalizeQwenAiModelModeName,
   resolveQwenAiModelMode,
 } from '../../providers/qwen-ai-model-mode'
+import type { QwenAiSessionState } from '../qwenAiSessionBridge'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 300000)
@@ -81,6 +82,10 @@ const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS = 1_000
 // timeout. Keep the default bounded while allowing deployments to tune it.
 const QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_BUDGET_MS = 120_000
 const QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS = 1_000
+// Retained Responses tool-result continuations are followed immediately by
+// a client request. A busy retained chat should be handed to the forwarder's
+// same-account full replay path instead of making Claude wait on backoff.
+const QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS = 0
 // Recovery time is shared by response-id resumes and managed workflow
 // continuations. It pauses while a replacement stream is producing output,
 // so a valid long generation is not cut off by this guard.
@@ -99,6 +104,14 @@ export type QwenAiOutputStream = PassThrough & {
   qwenAiEffectiveAccountId?: string
   qwenAiEffectiveProviderId?: string
   qwenAiEffectiveActualModel?: string
+  /**
+   * Live state for a completed Responses API Qwen turn. The forwarder owns
+   * its metadata; the stream handler publishes it after learning Qwen's real
+   * response ID.
+   */
+  qwenAiSessionState?: QwenAiSessionState
+  /** Final client-visible tool IDs, published only after a valid terminal turn. */
+  qwenAiToolCallIds?: string[]
 }
 
 const DEFAULT_HEADERS = {
@@ -135,6 +148,11 @@ type QwenAiMessage = ChatMessage
 
 type StreamHandlingOptions = {
   signal?: AbortSignal
+  /**
+   * Responses API metadata owned by the forwarder. It is copied to the
+   * output stream only after Qwen has supplied a real response ID.
+   */
+  qwenAiSessionState?: QwenAiSessionState
   /** Absolute deadline for the complete route request, including active SSE. */
   requestDeadlineAt?: number
   responseTimeoutMs?: number
@@ -145,8 +163,6 @@ type StreamHandlingOptions = {
   allowReasoningOnlyOutput?: boolean
   /** Emit accepted reasoning-only text as assistant content for summary turns. */
   reasoningOnlyAsContent?: boolean
-  /** Publish genuine reasoning outside a deferred managed-answer buffer. */
-  onProgressFrame?: (frame: string) => void
   onFailure?: (error: Error) => void
   recoverFromIdle?: QwenAiRecoveryCallback
   recoverFromSemanticEmpty?: QwenAiRecoveryCallback
@@ -171,8 +187,15 @@ type QwenAiResumableStreamOptions = {
     recoveryError?: Error,
     signal?: AbortSignal,
   ) => Promise<any>
+  /**
+   * Recreate the provider chat on the same credential and replay the complete
+   * request after Qwen declares the current response id permanently ended.
+   */
+  restartFreshChat?: (recoveryError: Error, signal?: AbortSignal) => Promise<any>
   /** Reset provider/parser state before a fresh workflow stream is attached. */
   onWorkflowContinuation?: () => void
+  /** Reset provider/parser state before a same-account fresh chat is attached. */
+  onFreshChatRestart?: () => void
   /** Return true once the adapter has emitted a terminal response. */
   isComplete?: () => boolean
   maxAttempts?: number
@@ -230,11 +253,22 @@ interface QwenAiWorkflowContinuationRequest {
   parentId: string
   model: string
   originalModel?: string
-  content: string
+  /** Legacy text-only continuation payload. */
+  content?: string
+  /**
+   * Delta OpenAI messages for a native Qwen continuation. This preserves
+   * tool-result attachments through the ordinary multimodal uploader.
+   */
+  messages?: QwenAiMessage[]
   enable_thinking?: boolean
   thinking_budget?: number
   managedToolCalling?: boolean
+  managedToolWorkflowContinuation?: boolean
+  messageTransport?: QwenAiMessageTransport
+  /** Per-call override for same-chat CHAT_IN_PROGRESS retries. */
+  chatInProgressRetryAttempts?: number
   signal?: AbortSignal
+  deadlineAt?: number
 }
 
 function positiveNumberFromEnv(name: string, fallback: number): number {
@@ -344,6 +378,21 @@ export function qwenAiChatInProgressRetryDelayMsFromEnv(): number {
     nonNegativeIntegerFromEnv(
       'CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS',
       QWEN_AI_CHAT_IN_PROGRESS_DEFAULT_RETRY_DELAY_MS,
+    ),
+  )
+}
+
+/**
+ * Retry policy for a retained Responses tool-result continuation. This is
+ * intentionally independent from semantic workflow recovery: a busy retained
+ * chat can be replaced by a same-account full replay immediately.
+ */
+export function qwenAiResponsesContinuationRetryAttemptsFromEnv(): number {
+  return Math.min(
+    QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS,
+    nonNegativeIntegerFromEnv(
+      'CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS',
+      QWEN_AI_RESPONSES_CONTINUATION_DEFAULT_RETRY_ATTEMPTS,
     ),
   )
 }
@@ -558,6 +607,8 @@ export function createQwenAiResumableStream(
   let recoveryResumeCallbacks: Array<() => void> = []
   let attempts = 0
   let workflowContinuationAttempts = 0
+  let freshChatRestartAttempts = 0
+  let transientFreshChatRecoveryEligible = false
   let settled = false
   let settledError: Error | undefined
   const configuredRecoveryBudgetMs = options.recoveryBudgetMs ?? qwenAiRecoveryBudgetMsFromEnv()
@@ -870,6 +921,11 @@ export function createQwenAiResumableStream(
     recoveryInFlight = true
     let lastError = initialError || new Error('Qwen AI response stream closed before completion')
     let semanticRecoveryEligible = isQwenAiSemanticRecoveryError(initialError)
+    let responseEndedRecoveryEligible = isQwenAiResponseEndedError(initialError)
+    transientFreshChatRecoveryEligible = isQwenAiUpstreamBusyError(initialError)
+    if (responseEndedRecoveryEligible) {
+      lastError = markQwenAiResponseEnded(normalizeQwenAiStreamFailure(lastError))
+    }
     const recoverySignal = startRecoveryBudget()
     const failRecovery = (error: Error): never => {
       recoveryInFlight = false
@@ -904,7 +960,12 @@ export function createQwenAiResumableStream(
     // response-id loop for transport/idle recovery and for callers that do
     // not provide a workflow continuation callback.
     const useWorkflowContinuation = semanticRecoveryEligible && Boolean(options.continueWorkflow)
-    while (!settled && attempts < maxAttempts && !useWorkflowContinuation) {
+    while (
+      !settled
+      && attempts < maxAttempts
+      && !useWorkflowContinuation
+      && !responseEndedRecoveryEligible
+    ) {
       ensureRecoveryBudget()
       if (checkComplete()) {
         const completionError = takeCompletionCheckError()
@@ -1001,12 +1062,101 @@ export function createQwenAiResumableStream(
         if (recoveryBudgetExpired) {
           failRecovery(effectiveRecoveryBudgetError())
         }
+        if (isQwenAiResponseEndedError(lastError)) {
+          lastError = markQwenAiResponseEnded(normalizeQwenAiStreamFailure(lastError))
+          responseEndedRecoveryEligible = true
+          break
+        }
+        if (isQwenAiUpstreamBusyError(lastError)) {
+          transientFreshChatRecoveryEligible = true
+        }
+        if (isQwenAiNextAccountFailureError(lastError)) {
+          failRecovery(normalizeQwenAiStreamFailure(lastError))
+        }
         if (!isQwenAiSemanticRecoveryError(lastError)) {
           semanticRecoveryEligible = false
         }
         if (isClientCancellationError(lastError) || options.signal?.aborted) {
           failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
         }
+      }
+    }
+
+    // Qwen returns "The request is ended!" when a response-id branch is
+    // permanently closed. Repeating the GET can never make progress. While
+    // the managed response is still private, replay the complete request once
+    // in a new chat on the same credential instead.
+    if (!settled && (responseEndedRecoveryEligible || transientFreshChatRecoveryEligible)) {
+      const endedError = responseEndedRecoveryEligible
+        ? markQwenAiResponseEnded(normalizeQwenAiStreamFailure(lastError))
+        : normalizeQwenAiStreamFailure(lastError)
+      const restartFreshChat = options.restartFreshChat
+      if (!restartFreshChat) {
+        failRecovery(endedError)
+      }
+      if (freshChatRestartAttempts >= 1) {
+        failRecovery(endedError)
+      }
+
+      freshChatRestartAttempts += 1
+      ensureRecoveryBudget()
+      try {
+        console.warn('[QwenAI] Replaying in a fresh chat on the same account after private upstream failure', JSON.stringify({
+          attempt: freshChatRestartAttempts,
+          maxAttempts: 1,
+        }))
+        const restarted = await restartFreshChat(endedError, recoverySignal)
+        const nextStream = restarted?.data ?? restarted
+
+        if (recoveryBudgetExpired) {
+          destroyReadableStream(nextStream)
+          failRecovery(effectiveRecoveryBudgetError())
+        }
+        try {
+          assertRecoveryBudget()
+        } catch (error) {
+          destroyReadableStream(nextStream)
+          failRecovery(error instanceof Error ? error : effectiveRecoveryBudgetError())
+        }
+        if (settled || options.signal?.aborted || checkComplete()) {
+          destroyReadableStream(nextStream)
+          if (!settled) {
+            const lateRestartError = takeCompletionCheckError()
+            if (lateRestartError) fail(lateRestartError)
+            else finish()
+          }
+          return false
+        }
+        if (!nextStream || typeof nextStream.on !== 'function') {
+          throw new Error('Qwen AI fresh-chat replay did not return a stream')
+        }
+
+        source = nextStream
+        sourceGeneration += 1
+        sourceHandled = false
+        sourceComplete = false
+        terminalMarkerSeen = false
+        completionScan = ''
+        attempts = 0
+        pauseRecoveryBudget()
+        recoveryInFlight = false
+        options.onFreshChatRestart?.()
+        onResume?.()
+        attachSource(nextStream, sourceGeneration)
+        return true
+      } catch (error) {
+        if (settled) {
+          if (settledError) throw settledError
+          return false
+        }
+        let restartError = error instanceof Error ? error : new Error(String(error))
+        if (isQwenAiResponseEndedError(restartError)) {
+          restartError = markQwenAiResponseEnded(normalizeQwenAiStreamFailure(restartError))
+        }
+        if (isClientCancellationError(restartError) || options.signal?.aborted) {
+          failRecovery(new Error('Qwen AI response stream aborted because the client disconnected.'))
+        }
+        failRecovery(normalizeQwenAiStreamFailure(restartError))
       }
     }
 
@@ -1157,6 +1307,7 @@ export function createQwenAiResumableStream(
     // governor can apply the appropriate account/cooldown policy.
     if (transportError.status === undefined || transportError.status >= 500) {
       transportError.accountFault = false
+      delete transportError.retryScope
     }
     return failRecovery(transportError)
   }
@@ -1741,17 +1892,52 @@ function markQwenAiNextAccountFailure(error: QwenAiUpstreamError): QwenAiUpstrea
   return error
 }
 
-function isQwenAiReplayableUpstreamStatus(status: unknown): status is number {
-  return typeof status === 'number'
-    && status >= 500
-    && status <= 599
-    && status !== 504
+function markQwenAiResponseEnded(error: QwenAiUpstreamError): QwenAiUpstreamError {
+  error.status = 502
+  error.code = 'qwen_ai_response_ended'
+  error.retryable = false
+  error.accountFault = false
+  delete error.retryScope
+  return error
 }
 
-function markQwenAiNextAccountReplay(error: QwenAiUpstreamError): QwenAiUpstreamError {
-  error.accountFault = false
-  error.retryScope = 'next-account'
-  return error
+export function isQwenAiResponseEndedError(error: unknown): boolean {
+  if (!error) return false
+  const record = typeof error === 'object' ? error as Record<string, unknown> : undefined
+  const code = typeof record?.code === 'string' ? record.code : ''
+  if (code === 'qwen_ai_response_ended') return true
+
+  const response = record?.response && typeof record.response === 'object'
+    ? record.response as Record<string, unknown>
+    : undefined
+  const values = [
+    error instanceof Error ? error.message : error,
+    record?.message,
+    record?.data,
+    response?.data,
+  ]
+  const text = values.map(value => {
+    if (typeof value === 'string') return value
+    try {
+      return value === undefined ? '' : JSON.stringify(value)
+    } catch {
+      return ''
+    }
+  }).join(' ')
+  return /(?:^|\b)the request is ended!?(?:\b|$)/i.test(text)
+}
+
+function isQwenAiNextAccountFailureError(error: unknown): boolean {
+  if (!isObjectValue(error)) return false
+  const status = typeof error.status === 'number'
+    ? error.status
+    : isObjectValue(error.response) && typeof error.response.status === 'number'
+      ? error.response.status
+      : undefined
+  const code = typeof error.code === 'string' ? error.code : ''
+  return status === 401
+    || status === 403
+    || (status === 429 && code === 'qwen_ai_capacity_limit')
 }
 
 function createQwenAiStreamFailure(
@@ -2115,6 +2301,126 @@ function replaceManagedWorkflowContentInSseFrames(
   })
 }
 
+/**
+ * Qwen occasionally emits a client-tool availability sentence as assistant
+ * text immediately before a real tool call (for example, `Tool Read does not
+ * exists.`).  Keep this narrowly scoped: callers invoke it only after the
+ * same assistant branch has produced a validated structured tool call.  A
+ * normal answer therefore retains the literal sentence unchanged.
+ */
+const QWEN_AI_TOOL_AVAILABILITY_SENTENCE = /Tool\s+[^\s]+\s+does\s+not\s+exist(?:s|\(s\))?\./gi
+
+function qwenAiToolAvailabilityNoiseRanges(content: string): Array<{ start: number, end: number }> {
+  if (!content) return []
+
+  const ranges: Array<{ start: number, end: number }> = []
+  for (const match of content.matchAll(QWEN_AI_TOOL_AVAILABILITY_SENTENCE)) {
+    const start = match.index ?? -1
+    if (start < 0) continue
+    const end = start + match[0].length
+    let removalEnd = end
+    while (removalEnd < content.length && (content[removalEnd] === ' ' || content[removalEnd] === '\t')) {
+      removalEnd += 1
+    }
+    if (content[removalEnd] === '\r') removalEnd += 1
+    if (content[removalEnd] === '\n') removalEnd += 1
+    ranges.push({ start, end: removalEnd })
+  }
+  return ranges
+}
+
+/**
+ * Apply the same filter across staged SSE content fragments.  Qwen may split
+ * the sentence over several deltas, so ranges are calculated on the joined
+ * answer text and then projected back onto each original frame.
+ */
+function stripQwenAiToolAvailabilityNoiseFromSseFrames(frames: string[]): string[] {
+  if (frames.length === 0) return frames
+  const parsedFrames: Array<{
+    frame: string
+    parsed?: any
+    segments: Array<{ path: 'delta' | 'message', choiceIndex: number, start: number, end: number }>
+  }> = []
+  let joined = ''
+  let toolCallCutoff = Number.POSITIVE_INFINITY
+
+  for (const frame of frames) {
+    const match = /^data: ([^\r\n]+)([\s\S]*)$/.exec(frame)
+    if (!match) {
+      parsedFrames.push({ frame, segments: [] })
+      continue
+    }
+    let parsed: any
+    try {
+      parsed = JSON.parse(match[1])
+    } catch {
+      parsedFrames.push({ frame, segments: [] })
+      continue
+    }
+    const segments: Array<{ path: 'delta' | 'message', choiceIndex: number, start: number, end: number }> = []
+    const choices = Array.isArray(parsed?.choices) ? parsed.choices : []
+    choices.forEach((choice: any, choiceIndex: number) => {
+      const deltaCalls = choice?.delta?.tool_calls
+      const messageCalls = choice?.message?.tool_calls
+      if (
+        (Array.isArray(deltaCalls) && deltaCalls.length > 0)
+        || (Array.isArray(messageCalls) && messageCalls.length > 0)
+      ) {
+        toolCallCutoff = Math.min(toolCallCutoff, joined.length)
+      }
+      for (const path of ['delta', 'message'] as const) {
+        const value = choice?.[path]?.content
+        if (typeof value !== 'string') continue
+        const start = joined.length
+        joined += value
+        segments.push({ path, choiceIndex, start, end: joined.length })
+      }
+    })
+    parsedFrames.push({ frame, parsed, segments })
+  }
+
+  const ranges = qwenAiToolAvailabilityNoiseRanges(joined)
+    .filter(range => range.start < toolCallCutoff)
+  if (ranges.length === 0) return frames
+
+  const project = (segment: { start: number, end: number }): string => {
+    let value = joined.slice(segment.start, segment.end)
+    for (const range of ranges) {
+      if (range.end <= segment.start) continue
+      if (range.start >= segment.end) break
+      const localStart = Math.max(0, range.start - segment.start)
+      const localEnd = Math.min(segment.end, range.end) - segment.start
+      value = value.slice(0, localStart) + value.slice(localEnd)
+    }
+    return value
+  }
+
+  return parsedFrames.map(item => {
+    if (!item.parsed || item.segments.length === 0) return item.frame
+    let parsed = item.parsed
+    for (const segment of item.segments) {
+      const choice = parsed.choices?.[segment.choiceIndex]
+      if (!choice?.[segment.path] || typeof choice[segment.path].content !== 'string') continue
+      const nextChoice = {
+        ...choice,
+        [segment.path]: {
+          ...choice[segment.path],
+          content: project(segment),
+        },
+      }
+      parsed = {
+        ...parsed,
+        choices: parsed.choices.map((candidate: any, index: number) => (
+          index === segment.choiceIndex ? nextChoice : candidate
+        )),
+      }
+    }
+    const match = /^data: ([^\r\n]+)([\s\S]*)$/.exec(item.frame)
+    if (!match) return item.frame
+    return `${item.frame.slice(0, match.index)}data: ${JSON.stringify(parsed)}${match[2]}`
+  })
+}
+
 function isQwenAiSemanticRecoveryError(error: unknown): boolean {
   const code = isObjectValue(error) && typeof error.code === 'string'
     ? error.code
@@ -2237,6 +2543,26 @@ export function isQwenAiUpstreamBusyMessage(message: string): boolean {
   const hasBusySignal = /被挤爆|挤爆|请稍后重试|服务繁忙|系统繁忙|当前服务繁忙|(?:service|server|system) busy|overload(?:ed|ing)?|try again later|鍝庡摕鍠倈琚尋鐖唡鏈嶅姟绻佸繖|绯荤粺绻佸繖/i.test(message)
   const hasChallengeSignal = /challenge|captcha|x5sec|bxpunish|baxia|punish|验证码|人机验证/i.test(message)
   return hasValidationEnvelope && hasBusySignal && !hasChallengeSignal
+}
+
+function isQwenAiUpstreamBusyError(error: unknown): boolean {
+  if (!error) return false
+  const record = isObjectValue(error) ? error : undefined
+  const code = typeof record?.code === 'string' ? record.code : ''
+  if (code === 'qwen_ai_upstream_busy') return true
+
+  const status = typeof record?.status === 'number'
+    ? record.status
+    : isObjectValue(record?.response) && typeof record.response.status === 'number'
+      ? record.response.status
+      : undefined
+  const message = error instanceof Error
+    ? error.message
+    : typeof record?.message === 'string' ? record.message : String(error)
+  return status === 503 && (
+    isQwenAiUpstreamBusyMessage(message)
+    || /(?:目前|当前).*服务.*(访问量|繁忙)|service\s+busy|overload|try again later/i.test(message)
+  )
 }
 
 function isQwenAiRiskControlMessage(message: string): boolean {
@@ -2408,13 +2734,16 @@ function createQwenAiStreamEnvelopeError(
     const isUpstreamBusy = isQwenAiUpstreamBusyMessage(message)
     const isRiskControl = isQwenAiRiskControlMessage(message)
     const isRateLimited = !isUpstreamBusy && isQwenAiRateLimitMessage(message)
+    const isResponseEnded = isQwenAiResponseEndedError(message)
     if (!message && !isUpstreamBusy && !isRiskControl && !isRateLimited) return undefined
     const error = new Error(
       `Qwen AI upstream stream rejected the request: ${redactQwenAiErrorText(message) || 'unknown error'}`,
     ) as QwenAiUpstreamError
     error.status = isUpstreamBusy ? 503 : isRiskControl ? 403 : isRateLimited ? 429 : 502
     error.retryable = false
-    if (isUpstreamBusy) {
+    if (isResponseEnded) {
+      markQwenAiResponseEnded(error)
+    } else if (isUpstreamBusy) {
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
       error.accountFault = false
@@ -2425,10 +2754,14 @@ function createQwenAiStreamEnvelopeError(
     } else if (isRateLimited) {
       error.code = 'qwen_ai_capacity_limit'
     }
-    if (isRiskControl || isRateLimited) {
+    if (isResponseEnded) {
+      // The generation is terminal. Recovery may replay it in a fresh chat on
+      // the same credential, but it must never rotate the account.
+    } else if (error.status === 401 || error.status === 403 || isRiskControl || isRateLimited) {
       markQwenAiNextAccountFailure(error)
-    } else if (isQwenAiReplayableUpstreamStatus(error.status)) {
-      markQwenAiNextAccountReplay(error)
+    } else if (error.status >= 500) {
+      error.accountFault = false
+      delete error.retryScope
     }
     return error
   }
@@ -2496,39 +2829,58 @@ function createQwenAiStreamEnvelopeError(
   const isRiskControl = !isUpstreamBusy
     && hasErrorSignal
     && isQwenAiRiskControlMessage(classificationEvidence)
-  const isRateLimited = !isUpstreamBusy && (explicitStatus === 429 || (
+  const isChatInProgress = isQwenAiChatInProgressEnvelope(record)
+  const isRateLimited = !isUpstreamBusy && !isChatInProgress && (explicitStatus === 429 || (
     hasErrorSignal
     && isQwenAiRateLimitMessage(classificationEvidence)
   ))
-  const isChatInProgress = isQwenAiChatInProgressEnvelope(record)
+  const isResponseEnded = isQwenAiResponseEndedError(classificationEvidence)
 
   if (!isUpstreamBusy && !isRiskControl && !hasErrorSignal && !isRateLimited) return undefined
 
   const message = redactQwenAiErrorText(structuredMessage || raw)
   const error = new Error(`Qwen AI upstream stream rejected the request: ${message || 'unknown error'}`) as QwenAiUpstreamError
-  error.status = isUpstreamBusy ? 503 : isRiskControl ? 403 : isRateLimited ? 429 : explicitStatus ?? 502
+  error.status = isUpstreamBusy
+    ? 503
+    : isRiskControl
+      ? 403
+      : isChatInProgress
+        ? 429
+        : isRateLimited
+          ? 429
+          : explicitStatus ?? 502
   error.retryable = envelopeMetadata.retryable ?? false
   if (envelopeMetadata.type) error.type = envelopeMetadata.type
   if (envelopeMetadata.param) error.param = envelopeMetadata.param
-  if (isUpstreamBusy) {
+  if (isResponseEnded) {
+    markQwenAiResponseEnded(error)
+  } else if (isUpstreamBusy) {
     error.code = 'qwen_ai_upstream_busy'
     error.retryable = true
     error.accountFault = false
   } else if (isRiskControl) {
     error.code = 'qwen_ai_risk_control'
+  } else if (isChatInProgress) {
+    error.code = 'CHAT_IN_PROGRESS'
+    error.retryable = true
+    error.accountFault = false
   } else if (isRateLimited) {
     error.code = 'qwen_ai_capacity_limit'
   } else if (envelopeMetadata.code) {
     error.code = envelopeMetadata.code
   }
-  if (isUpstreamBusy) {
+  if (isResponseEnded) {
+    // Same-account fresh-chat recovery owns this exact terminal response.
+  } else if (isUpstreamBusy) {
     // Provider congestion is tied to this request shape, not the credential.
-  } else if (error.status === 401 || isRiskControl || isRateLimited) {
-    markQwenAiNextAccountFailure(error)
   } else if (isChatInProgress) {
     error.accountFault = false
-  } else if (isQwenAiReplayableUpstreamStatus(error.status)) {
-    markQwenAiNextAccountReplay(error)
+    delete error.retryScope
+  } else if (error.status === 401 || error.status === 403 || isRiskControl || isRateLimited) {
+    markQwenAiNextAccountFailure(error)
+  } else if (error.status >= 500) {
+    error.accountFault = false
+    delete error.retryScope
   }
   return error
 }
@@ -2953,20 +3305,18 @@ export class QwenAiAdapter {
     reason: string,
     bodyPreview?: string,
     previewOptions: { signal?: AbortSignal; timeoutMs?: number } = {},
-  ): Promise<Error> {
+  ): Promise<QwenAiUpstreamError> {
     const contentType = String(response.headers?.['content-type'] || 'unknown')
     const body = bodyPreview ?? await this.readStreamPreview(response.data, 4096, previewOptions)
     const upstreamMessage = this.extractUpstreamErrorMessage(body)
     const detail = upstreamMessage ? `: ${upstreamMessage}` : ''
 
     let envelopeError: QwenAiUpstreamError | undefined
-    let explicitEnvelopeStatus: number | undefined
     let chatInProgress = false
     try {
       const parsedBody = JSON.parse(body)
       envelopeError = createQwenAiStreamEnvelopeError(parsedBody, body, 'error')
       if (isObjectValue(parsedBody)) {
-        explicitEnvelopeStatus = readQwenAiEnvelopeStatus(parsedBody, true)
         chatInProgress = isQwenAiChatInProgressEnvelope(parsedBody)
       }
     } catch {
@@ -2981,10 +3331,14 @@ export class QwenAiAdapter {
       envelopeError?.code === 'qwen_ai_upstream_busy'
       || isQwenAiUpstreamBusyMessage(upstreamMessage)
     )
-    const isRiskControl = !isUpstreamBusy && (envelopeError?.status === 403
+    const isRiskControl = !isUpstreamBusy && !chatInProgress && (envelopeError?.status === 403
       || this.isRiskControlMessage(upstreamMessage)
       || reason.includes('risk-control'))
+    const isResponseEnded = isQwenAiResponseEndedError(envelopeError || upstreamMessage)
     const isCapacityLimit = !isUpstreamBusy
+      && !isRiskControl
+      && !chatInProgress
+      && !isResponseEnded
       && (response.status === 429 || envelopeError?.status === 429)
     const upstreamStatus = response.status >= 400 && response.status <= 599
       ? response.status
@@ -2993,44 +3347,57 @@ export class QwenAiAdapter {
     // Preserve only retry pacing metadata. The governor uses Retry-After to
     // distinguish ordinary quota throttling without exposing upstream cookies
     // or transport headers to the client.
-    error.status = isUpstreamBusy ? 503 : isRiskControl ? 403 : isCapacityLimit ? 429 : upstreamStatus
+    error.status = isResponseEnded
+      ? 502
+      : isUpstreamBusy
+        ? 503
+        : isRiskControl
+          ? 403
+          : chatInProgress
+            ? 429
+            : isCapacityLimit
+              ? 429
+              : upstreamStatus
     error.headers = sanitizeForwardedErrorHeaders(response.headers)
     error.retryable = envelopeError?.retryable ?? false
     if (envelopeError?.type) error.type = envelopeError.type
     if (envelopeError?.param) error.param = envelopeError.param
-    if (isUpstreamBusy) {
+    if (isResponseEnded) {
+      markQwenAiResponseEnded(error)
+    } else if (isUpstreamBusy) {
       error.code = 'qwen_ai_upstream_busy'
       error.retryable = true
       error.accountFault = false
     } else if (isRiskControl) {
       error.code = 'qwen_ai_risk_control'
+    } else if (chatInProgress) {
+      error.status = 429
+      error.code = 'CHAT_IN_PROGRESS'
+      error.retryable = true
+      error.accountFault = false
+      delete error.retryScope
     } else if (isCapacityLimit) {
       error.code = 'qwen_ai_capacity_limit'
       // Capacity throttling is account-local and should fail over to another
       // healthy account instead of surfacing an API error to the client.
       error.retryable = true
       markQwenAiNextAccountFailure(error)
-    } else if (chatInProgress) {
-      error.status = 429
-      error.code = 'CHAT_IN_PROGRESS'
-      error.retryable = true
     } else if (envelopeError?.code) {
       error.code = envelopeError.code
     }
-    if (isUpstreamBusy) {
+    if (isResponseEnded) {
+      // A permanently ended response is replayed once in a fresh chat using
+      // this same adapter/account.
+    } else if (isUpstreamBusy) {
       // Keep the outer retry on this account; do not enter pool failover.
-    } else if (error.status === 401 || isRiskControl || isCapacityLimit) {
-      markQwenAiNextAccountFailure(error)
     } else if (chatInProgress) {
       error.accountFault = false
-    } else if (
-      isQwenAiReplayableUpstreamStatus(response.status)
-      || (
-        response.status < 400
-        && isQwenAiReplayableUpstreamStatus(explicitEnvelopeStatus)
-      )
-    ) {
-      markQwenAiNextAccountReplay(error)
+      delete error.retryScope
+    } else if (error.status === 401 || error.status === 403 || isRiskControl || isCapacityLimit) {
+      markQwenAiNextAccountFailure(error)
+    } else if (error.status >= 500) {
+      error.accountFault = false
+      delete error.retryScope
     }
     return error
   }
@@ -3047,6 +3414,21 @@ export class QwenAiAdapter {
       throw createQwenAiContinuationAbortError()
     }
     const contentType = String(response.headers?.['content-type'] || '').toLowerCase()
+    const classifyChatInProgress = (
+      error: QwenAiUpstreamError,
+      body?: string,
+    ): boolean => {
+      const chatInProgress = error.code === 'CHAT_IN_PROGRESS'
+        || (body !== undefined && isQwenAiChatInProgressEnvelope(parseJsonSafely(body)))
+      if (!chatInProgress) return false
+
+      error.status = 429
+      error.code = 'CHAT_IN_PROGRESS'
+      error.retryable = true
+      error.accountFault = false
+      delete error.retryScope
+      return true
+    }
 
     if (response.status >= 400) {
       const error = await this.createInvalidStreamError(
@@ -3060,6 +3442,9 @@ export class QwenAiAdapter {
       )
       if (options.signal?.aborted) {
         throw createQwenAiContinuationAbortError()
+      }
+      if (classifyChatInProgress(error) && options.allowChatInProgress) {
+        return { chatInProgress: true, error }
       }
       throw error
     }
@@ -3076,6 +3461,9 @@ export class QwenAiAdapter {
       )
       if (options.signal?.aborted) {
         throw createQwenAiContinuationAbortError()
+      }
+      if (classifyChatInProgress(error) && options.allowChatInProgress) {
+        return { chatInProgress: true, error }
       }
       throw error
     }
@@ -3094,14 +3482,8 @@ export class QwenAiAdapter {
         body,
       ) as QwenAiUpstreamError
 
-      const chatInProgress = response.status < 400
-        && isQwenAiChatInProgressEnvelope(parseJsonSafely(body))
+      const chatInProgress = classifyChatInProgress(error, body)
       if (chatInProgress) {
-        // A busy chat is provider state, not an invalid credential/account.
-        // Keep that classification even when the caller does not perform the
-        // bounded same-payload continuation wait.
-        error.accountFault = false
-        delete error.retryScope
         if (options.allowChatInProgress) {
           return { chatInProgress: true, error }
         }
@@ -3546,9 +3928,14 @@ export class QwenAiAdapter {
   ): Promise<AxiosResponse> {
     const chatId = request.chatId.trim()
     const parentId = request.parentId.trim()
-    const content = request.content.trim()
-    if (!chatId || !parentId || !content) {
-      throw new Error('Qwen AI workflow continuation requires chat ID, parent response ID, and content')
+    const continuationMessages = Array.isArray(request.messages)
+      ? request.messages
+      : []
+    const fallbackContent = typeof request.content === 'string'
+      ? request.content.trim()
+      : ''
+    if (!chatId || !parentId || (continuationMessages.length === 0 && !fallbackContent)) {
+      throw new Error('Qwen AI workflow continuation requires chat ID, parent response ID, and content or messages')
     }
 
     await this.refreshTokenIfNeeded(request.signal)
@@ -3574,6 +3961,35 @@ export class QwenAiAdapter {
       thinkingBudget: request.thinking_budget,
     })
 
+    // A Responses tool-result follow-up can contain generated files or
+    // images. Reuse the normal multimodal transport instead of flattening
+    // the delta to text and silently dropping its attachments. The legacy
+    // content field remains available for internal recovery continuations.
+    let content = fallbackContent
+    let files: any[] = []
+    if (continuationMessages.length > 0) {
+      const uploader = new QwenAiFileUploader(
+        this.axiosInstance,
+        () => this.getHeaders(chatId),
+        this.postWithRefreshRetry.bind(this),
+        { providerId: this.provider.id, accountId: this.account.id },
+      )
+      const preparedMessage = await prepareQwenAiMultimodalMessage(
+        continuationMessages,
+        uploader,
+        {
+          transport: request.messageTransport,
+          managedToolCalling: request.managedToolCalling,
+          workflowContinuation: request.managedToolWorkflowContinuation,
+          requestMaxBytes: qwenAiRequestMaxBytesFromEnv(),
+          signal: request.signal,
+          deadlineAt: request.deadlineAt,
+        },
+      )
+      content = preparedMessage.content
+      files = preparedMessage.files
+    }
+
     const fid = uuid()
     const childId = uuid()
     const ts = Math.floor(Date.now() / 1000)
@@ -3593,7 +4009,7 @@ export class QwenAiAdapter {
           role: 'user',
           content,
           user_action: 'chat',
-          files: [],
+          files,
           timestamp: ts,
           models: [modelId],
           chat_type: 't2t',
@@ -3617,7 +4033,12 @@ export class QwenAiAdapter {
       }
     }
 
-    const maxChatInProgressRetries = qwenAiChatInProgressRetryAttemptsFromEnv()
+    const maxChatInProgressRetries = request.chatInProgressRetryAttempts === undefined
+      ? qwenAiChatInProgressRetryAttemptsFromEnv()
+      : Math.min(
+          QWEN_AI_CHAT_IN_PROGRESS_MAX_CONFIGURED_ATTEMPTS,
+          Math.max(0, Math.floor(request.chatInProgressRetryAttempts)),
+        )
     const configuredRetryDelayMs = qwenAiChatInProgressRetryDelayMsFromEnv()
     // The default delay is one second. An explicit zero remains available for
     // deployments that want immediate polling; the admission budget is kept
@@ -3778,6 +4199,7 @@ export class QwenAiStreamHandler {
   private generatedImageKeys = new Set<string>()
   private generatedInlineImageEncodedBytes = 0
   private toolCallsSent: boolean = false
+  private emittedToolCallIds = new Set<string>()
   private toolStreamParser?: ToolStreamParser
   private toolCallingPlan?: ToolCallingPlan
   private nativeToolCallStates = new Map<string, NativeToolCallState>()
@@ -3978,6 +4400,7 @@ export class QwenAiStreamHandler {
     this.generatedImageKeys = new Set<string>()
     this.generatedInlineImageEncodedBytes = 0
     this.toolCallsSent = false
+    this.emittedToolCallIds = new Set<string>()
     this.nativeToolCallStates = new Map<string, NativeToolCallState>()
     this.nativeToolCallIndex = 0
     this.warnedUndeclaredNativeToolNames = new Set<string>()
@@ -4035,6 +4458,32 @@ export class QwenAiStreamHandler {
 
   setChatId(chatId: string) {
     this.chatId = chatId
+  }
+
+  getEmittedToolCallIds(): string[] {
+    return Array.from(this.emittedToolCallIds)
+  }
+
+  private recordEmittedToolCallIds(toolCalls: readonly { id?: unknown }[]): void {
+    for (const toolCall of toolCalls) {
+      const id = typeof toolCall?.id === 'string' ? toolCall.id.trim() : ''
+      if (id) this.emittedToolCallIds.add(id)
+    }
+  }
+
+  private recordEmittedToolCallIdsFromChunk(chunk: unknown): void {
+    if (!chunk || typeof chunk !== 'object') return
+    const choices = (chunk as { choices?: unknown }).choices
+    if (!Array.isArray(choices)) return
+    for (const choice of choices) {
+      if (!choice || typeof choice !== 'object') continue
+      const candidate = choice as {
+        delta?: { tool_calls?: unknown }
+        message?: { tool_calls?: unknown }
+      }
+      const toolCalls = candidate.delta?.tool_calls ?? candidate.message?.tool_calls
+      if (Array.isArray(toolCalls)) this.recordEmittedToolCallIds(toolCalls)
+    }
   }
 
   private getResponseIndex(value: unknown): string | undefined {
@@ -4169,6 +4618,8 @@ export class QwenAiStreamHandler {
       for (let i = 0; i < toolCalls.length; i++) {
         const tc = toolCalls[i]
         const tool = this.toolCallingPlan?.tools?.find(item => item.name === tc.function.name)
+        const emittedToolCallId = `${this.toolCallIdPrefix}_${i}`
+        this.recordEmittedToolCallIds([{ id: emittedToolCallId }])
         transStream.write(
           `data: ${JSON.stringify({
             id: this.responseId || this.chatId,
@@ -4179,7 +4630,7 @@ export class QwenAiStreamHandler {
               delta: {
                 tool_calls: [{
                   index: i,
-                  id: `${this.toolCallIdPrefix}_${i}`,
+                  id: emittedToolCallId,
                   type: 'function',
                   function: {
                     name: tc.function.name,
@@ -4357,6 +4808,7 @@ export class QwenAiStreamHandler {
     if (this.toolCallsSent || toolCalls.length === 0) return false
 
     this.toolCallsSent = true
+    this.recordEmittedToolCallIds(toolCalls)
 
     for (let i = 0; i < toolCalls.length; i += 1) {
       const toolCall = toolCalls[i]
@@ -4417,13 +4869,18 @@ export class QwenAiStreamHandler {
     let abortListenerAttached = false
     let idleRecoveryInFlight = false
     let semanticRecoveryInFlight = false
+    // A provider can accept the request, emit private progress, and then send
+    // an in-stream 5xx envelope. Keep that branch private while the resumable
+    // bridge attempts the same response-id on the same account.
+    let transientRecoveryInFlight = false
     let upstreamEventCount = 0
     let lastUpstreamEventAt = 0
     let lastUpstreamEventType = 'none'
     const bufferManagedBranch = options.bufferManagedBranch === true
       && this.toolCallingPlan?.shouldParseResponse === true
-    // Live mode exposes only provider-declared reasoning. Answer and tool
-    // candidates stay private until their terminal workflow state validates.
+    // Managed candidates remain private until their terminal workflow state
+    // validates. This includes reasoning: publishing it out of band would make
+    // a later capacity failover splice two different Qwen branches together.
     const stageManagedAnswer = !bufferManagedBranch
       && this.toolCallingPlan?.shouldParseResponse === true
     const buffersManagedCandidate = bufferManagedBranch || stageManagedAnswer
@@ -4431,11 +4888,11 @@ export class QwenAiStreamHandler {
     let answerFrameCommitted = false
     let managedBranchFrames: string[] = []
     let managedBranchBytes = 0
-    let publishedProgressFrameCount = 0
-    let lastPublishedProgressAt = 0
     let downstreamFrameCount = 0
     let lastDownstreamFrameAt = 0
     let parser: ReturnType<typeof createParser>
+    let sourceDestroyPending = false
+    let sourceDestroyed = false
     const responseTimeoutMs = options.responseTimeoutMs ?? QWEN_AI_RESPONSE_TIMEOUT_MS
     const requestDeadlineAt = typeof options.requestDeadlineAt === 'number'
       && Number.isFinite(options.requestDeadlineAt)
@@ -4455,9 +4912,12 @@ export class QwenAiStreamHandler {
       managedBranchBytes = 0
     }
 
-    const flushManagedBranchFrames = () => {
+    const flushManagedBranchFrames = (hasValidatedToolCall = false) => {
       if (!buffersManagedCandidate || managedBranchFrames.length === 0) return
-      for (const frame of managedBranchFrames) {
+      const frames = hasValidatedToolCall
+        ? stripQwenAiToolAvailabilityNoiseFromSseFrames(managedBranchFrames)
+        : managedBranchFrames
+      for (const frame of frames) {
         writeDownstreamFrame(frame)
       }
       visibleFrameCommitted = true
@@ -4507,6 +4967,31 @@ export class QwenAiStreamHandler {
       }
     }
 
+    // Terminal SSE bytes are written to the transformed stream before the
+    // provider socket is retired. Closing the source in the same call stack
+    // can race a downstream Responses parser and turn a valid terminal frame
+    // into a bare EOF. The writable `finish` event means all terminal bytes
+    // have been accepted by the PassThrough, even when its readable side has
+    // no consumer yet; waiting for `end` alone would leak the provider socket.
+    const destroySourceAfterOutput = (error?: Error) => {
+      if (sourceDestroyed || sourceDestroyPending) return
+      sourceDestroyPending = true
+      const destroy = () => {
+        if (sourceDestroyed) return
+        sourceDestroyed = true
+        sourceDestroyPending = false
+        transStream.removeListener('finish', destroy)
+        transStream.removeListener('close', destroy)
+        destroyReadableStream(stream, error)
+      }
+      if (transStream.writableFinished || transStream.destroyed) {
+        queueMicrotask(destroy)
+        return
+      }
+      transStream.once('finish', destroy)
+      transStream.once('close', destroy)
+    }
+
     const recordStreamFailure = (error: Error): boolean => {
       if (finalChunkSent) return false
       const description = describeErrorForLog(error)
@@ -4542,8 +5027,6 @@ export class QwenAiStreamHandler {
         responseId: this.responseId || undefined,
         sawUpstreamCompletion,
         clientAborted: upstreamError.status === 499,
-        publishedProgressFrameCount,
-        lastPublishedProgressAt,
         downstreamFrameCount,
         lastDownstreamFrameAt,
         bufferedManagedFrameCount: managedBranchFrames.length,
@@ -4585,10 +5068,10 @@ export class QwenAiStreamHandler {
       })}\n\n`)
       transStream.end('data: [DONE]\n\n')
 
-      // Queue the failure frame before destroying the source. Destroying an
+      // Queue the failure frame before retiring the source. Destroying an
       // Axios response with the same error first can race a downstream SSE
       // bridge and turn a recoverable stream error into a bare ECONNRESET.
-      destroyReadableStream(stream, upstreamError)
+      destroySourceAfterOutput(upstreamError)
     }
 
     const failIfRequestDeadlineExpired = (): boolean => {
@@ -4598,7 +5081,7 @@ export class QwenAiStreamHandler {
     }
 
     const handleIdle = async () => {
-      if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight) return
+      if (finalChunkSent || idleRecoveryInFlight || semanticRecoveryInFlight || transientRecoveryInFlight) return
       idleTimer = undefined
       const idleError = new Error(
         `Qwen AI response stream was idle for more than ${Math.ceil((options.idleTimeoutMs || QWEN_AI_STREAM_IDLE_TIMEOUT_MS) / 1000)}s.`,
@@ -4642,28 +5125,6 @@ export class QwenAiStreamHandler {
     ): boolean => {
       if (finalChunkSent) return false
       if (failIfRequestDeadlineExpired()) return false
-      if (
-        bufferManagedBranch
-        && progressVisible
-        && !answerVisible
-        && options.onProgressFrame
-      ) {
-        try {
-          options.onProgressFrame(frame)
-          publishedProgressFrameCount += 1
-          lastPublishedProgressAt = Date.now()
-          downstreamFrameCount += 1
-          lastDownstreamFrameAt = lastPublishedProgressAt
-          visibleFrameCommitted = true
-          if (publishedProgressFrameCount === 1) {
-            console.info('[QwenAI] Publishing live reasoning while managed answer validation remains deferred')
-          }
-        } catch (error) {
-          console.warn('[QwenAI] Managed reasoning progress publisher failed:', describeErrorForLog(error))
-        }
-        if (!finalChunkSent) refreshIdleTimer()
-        return true
-      }
       if (bufferManagedBranch || (stageManagedAnswer && answerVisible)) {
         const frameBytes = Buffer.byteLength(frame)
         if (managedBranchBytes + frameBytes > QWEN_AI_MANAGED_BRANCH_MAX_BYTES) {
@@ -4757,12 +5218,47 @@ export class QwenAiStreamHandler {
       })
     }
 
+    const recoverFromTransientUpstreamFailure = (error: QwenAiUpstreamError): void => {
+      if (finalChunkSent || semanticRecoveryInFlight || transientRecoveryInFlight) return
+
+      const recover = options.recoverFromIdle ?? options.recoverFromSemanticEmpty
+
+      // Once a frame has reached the client, a response-id replay would splice
+      // two generations into one SSE stream. Let the caller report the late
+      // failure instead. Private managed frames remain eligible for recovery.
+      if (visibleFrameCommitted || !recover || error.status === undefined || error.status < 500) {
+        failStream(error)
+        return
+      }
+
+      transientRecoveryInFlight = true
+      console.warn('[QwenAI] Recovering private stream after transient upstream failure:', describeErrorForLog(error))
+      const onResume = () => {
+        transientRecoveryInFlight = false
+        if (!finalChunkSent) refreshIdleTimer()
+      }
+
+      void recover(error, onResume).then(recovered => {
+        transientRecoveryInFlight = false
+        if (finalChunkSent) return
+        if (recovered) {
+          refreshIdleTimer()
+          return
+        }
+        failStream(error)
+      }).catch(recoveryError => {
+        transientRecoveryInFlight = false
+        if (finalChunkSent) return
+        failStream(recoveryError instanceof Error ? recoveryError : error)
+      })
+    }
+
     function onAbort() {
       failStream(new Error('Qwen AI response stream aborted because the client disconnected.'))
     }
 
     const onUpstreamError = (err: Error) => {
-      if (finalChunkSent || semanticRecoveryInFlight) {
+      if (finalChunkSent || semanticRecoveryInFlight || transientRecoveryInFlight) {
         return
       }
       const description = describeErrorForLog(err)
@@ -4805,13 +5301,29 @@ export class QwenAiStreamHandler {
       abortListenerAttached = true
     }
 
+    const publishQwenAiSessionState = () => {
+      const state = options.qwenAiSessionState
+      // A create-chat payload has only a local placeholder child ID. Persist
+      // a bridge state only when upstream SSE supplied the real parent
+      // response ID that a follow-up Qwen turn can use.
+      if (!state || !this.chatId.trim() || !this.responseId.trim()) return
+      transStream.qwenAiSessionState = state
+    }
+
+    const publishQwenAiToolCallIds = () => {
+      const toolCallIds = this.getEmittedToolCallIds()
+      if (toolCallIds.length > 0) transStream.qwenAiToolCallIds = toolCallIds
+    }
+
     const completeStream = (commitTerminalOutput: () => boolean): boolean => {
       if (failIfRequestDeadlineExpired()) return false
       if (!commitTerminalOutput()) return false
       this.streamCompleted = true
+      publishQwenAiSessionState()
+      publishQwenAiToolCallIds()
       finalChunkSent = true
       cleanup()
-      destroyReadableStream(stream)
+      destroySourceAfterOutput()
       return true
     }
 
@@ -4830,6 +5342,7 @@ export class QwenAiStreamHandler {
 
       let emittedManagedToolCall = false
       for (const outputChunk of outputChunks) {
+        this.recordEmittedToolCallIdsFromChunk(outputChunk)
         const choices = Array.isArray(outputChunk?.choices) ? outputChunk.choices : []
         if (choices.some((choice: any) => {
           const toolCalls = choice?.delta?.tool_calls
@@ -4851,7 +5364,12 @@ export class QwenAiStreamHandler {
       // a complete tool call. Some upstream responses never send a follow-up
       // `finished`/`[DONE]` event, so waiting for it leaves the downstream
       // client hanging after it already received an actionable tool call.
-      if (finishOnToolCall && emittedManagedToolCall && !finalChunkSent) {
+      if (
+        finishOnToolCall
+        && emittedManagedToolCall
+        && !finalChunkSent
+        && !bufferManagedBranch
+      ) {
         finishAnswer('tool_calls')
       }
     }
@@ -4992,7 +5510,7 @@ export class QwenAiStreamHandler {
           completeNativeToolCalls,
         )
         if (completeStream(() => {
-          flushManagedBranchFrames()
+          flushManagedBranchFrames(true)
           return this.emitNativeToolCalls(
             transStream,
             completeNativeToolCalls,
@@ -5009,11 +5527,13 @@ export class QwenAiStreamHandler {
       const baseChunk = createBaseChunk(this.responseId || this.chatId, this.model, this.created)
       const flushChunks = this.toolStreamParser?.flush(baseChunk) ?? []
       for (const outputChunk of flushChunks) {
+        this.recordEmittedToolCallIdsFromChunk(outputChunk)
         writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
       }
 
       const recoveredToolChunks = this.toolStreamParser?.recoverFromContent(this.content, baseChunk, !initialChunkSent) ?? []
       for (const outputChunk of recoveredToolChunks) {
+        this.recordEmittedToolCallIdsFromChunk(outputChunk)
         writeVisibleSse(`data: ${JSON.stringify(outputChunk)}\n\n`)
       }
       if (recoveredToolChunks.length > 0) {
@@ -5028,7 +5548,7 @@ export class QwenAiStreamHandler {
           options.reasoningOnlyAsContent ? undefined : `${reasoningText}${summaryText}`,
         )
         if (completeStream(() => {
-          flushManagedBranchFrames()
+          flushManagedBranchFrames(true)
           return this.sendToolCalls(transStream, usage)
         })) {
           return
@@ -5140,7 +5660,7 @@ export class QwenAiStreamHandler {
         created: this.created,
       }
       if (!completeStream(() => {
-        flushManagedBranchFrames()
+        flushManagedBranchFrames(emittedToolCall)
         writeDownstreamFrame(`data: ${JSON.stringify(finalChunk)}\n\n`)
         transStream.end('data: [DONE]\n\n')
         return true
@@ -5172,7 +5692,7 @@ export class QwenAiStreamHandler {
     parser = createParser({
       onEvent: (event: any) => {
         try {
-          if (finalChunkSent || semanticRecoveryInFlight) {
+          if (finalChunkSent || semanticRecoveryInFlight || transientRecoveryInFlight) {
             return
           }
           if (failIfRequestDeadlineExpired()) return
@@ -5201,14 +5721,26 @@ export class QwenAiStreamHandler {
           } catch (parseError) {
             const envelopeError = createQwenAiStreamEnvelopeError(event.data, event.data, event.event)
             if (envelopeError) {
-              failStream(envelopeError)
+              if (bufferManagedBranch && isQwenAiResponseEndedError(envelopeError)) {
+                recoverFromSemanticEmpty(envelopeError)
+              } else if (envelopeError.status !== undefined && envelopeError.status >= 500) {
+                recoverFromTransientUpstreamFailure(envelopeError)
+              } else {
+                failStream(envelopeError)
+              }
               return
             }
             throw parseError
           }
           const envelopeError = createQwenAiStreamEnvelopeError(data, event.data, event.event)
           if (envelopeError) {
-            failStream(envelopeError)
+            if (bufferManagedBranch && isQwenAiResponseEndedError(envelopeError)) {
+              recoverFromSemanticEmpty(envelopeError)
+            } else if (envelopeError.status !== undefined && envelopeError.status >= 500) {
+              recoverFromTransientUpstreamFailure(envelopeError)
+            } else {
+              failStream(envelopeError)
+            }
             return
           }
           upstreamEventCount += 1
@@ -5299,6 +5831,7 @@ export class QwenAiStreamHandler {
                 && completeUndeclaredNativeToolNames.length === 0
                 && incompleteDeclaredNativeToolNames.length === 0
                 && completeNativeToolCalls.length > 0
+                && !bufferManagedBranch
               ) {
                 finishAnswer('tool_calls')
                 if (finalChunkSent || semanticRecoveryInFlight) {
@@ -5353,6 +5886,10 @@ export class QwenAiStreamHandler {
 
             if (status === 'finished' && (phase === 'answer' || phase === null)) {
               sawUpstreamCompletion = true
+              // Qwen's Web SSE commonly ends with this provider-native
+              // terminal delta and then closes without a literal [DONE].
+              // Managed frames stay private until this point, so it is safe
+              // to validate and atomically commit the completed branch now.
               finishAnswer(delta.finish_reason || 'stop')
             } else if (imageGenerationFinished) {
               finishAnswer(delta.finish_reason || 'stop')
@@ -5377,8 +5914,8 @@ export class QwenAiStreamHandler {
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
         console.log('[QwenAI] Stream ended')
       }
-      if (!finalChunkSent && !semanticRecoveryInFlight) {
-        if (sawUpstreamCompletion) {
+      if (!finalChunkSent && !semanticRecoveryInFlight && !transientRecoveryInFlight) {
+        if (sawUpstreamCompletion && !bufferManagedBranch) {
           finishAnswer('stop')
         } else {
           failStream(createQwenAiStreamFailure('Qwen AI response stream ended before an upstream completion signal'))
@@ -5389,8 +5926,8 @@ export class QwenAiStreamHandler {
       if (QWEN_AI_DEBUG_STREAM_LOGS) {
         console.log('[QwenAI] Stream closed')
       }
-      if (!finalChunkSent && !semanticRecoveryInFlight) {
-        if (sawUpstreamCompletion) {
+      if (!finalChunkSent && !semanticRecoveryInFlight && !transientRecoveryInFlight) {
+        if (sawUpstreamCompletion && !bufferManagedBranch) {
           finishAnswer('stop')
         } else {
           failStream(createQwenAiStreamFailure('Qwen AI response stream closed before an upstream completion signal'))
@@ -5538,6 +6075,7 @@ export class QwenAiStreamHandler {
         }
         const toolCalls = this.getCompleteNativeToolCalls()
         if (toolCalls.length === 0) return false
+        this.recordEmittedToolCallIds(toolCalls)
         if (!flushNonStreamOutputGuards()) return true
 
         const choice = data.choices[0]

@@ -638,6 +638,7 @@ test('Qwen AI deferred stream risk failures are reported back to the governor', 
     error: 'FAIL_SYS_USER_VALIDATE RGV587 challenge',
     errorCode: 'qwen_ai_risk_control',
     retryable: false,
+    accountFault: true,
   })
 
   const status = governor.getStatus(
@@ -673,6 +674,7 @@ test('context compaction risk cools accounts without opening the ordinary global
       error: 'FAIL_SYS_USER_VALIDATE RGV587 challenge',
       errorCode: 'qwen_ai_risk_control',
       retryable: false,
+      accountFault: true,
     }, 'context_compaction')
   }
 
@@ -743,7 +745,7 @@ test('Qwen AI governor allows only one in-flight request per account until strea
   assert.equal(secondStarted, true)
 })
 
-test('Qwen AI governor honors a bounded Retry-After for ordinary 429 responses', () => {
+test('Qwen AI governor keeps ordinary 429 responses account-neutral', () => {
   const Governor = loadGovernorForRuntimeTest(3_000, {
     maxConcurrent: 1,
     globalMinIntervalMs: 0,
@@ -755,17 +757,19 @@ test('Qwen AI governor honors a bounded Retry-After for ordinary 429 responses',
     status: 429,
     headers: { 'Retry-After': '300' },
     error: 'upstream rate limited',
+    errorCode: 'qwen_ai_rate_limited',
+    accountFault: false,
   })).then(() => {
     const status = governor.getStatus(
       [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
       [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
     )
-    assert.ok(status.accounts[0].governorCooldownInMs >= 299_000)
-    assert.match(status.accounts[0].governorCooldownReason, /http_429_retry_after/)
+    assert.equal(status.accounts[0].governorCooldownInMs, 0)
+    assert.equal(status.accounts[0].governorCooldownReason, undefined)
   })
 })
 
-test('Qwen AI governor adds Retry-After from its configured cooldown when upstream omits it', async () => {
+test('Qwen AI governor adds Retry-After only to capacity 429 responses', async () => {
   const Governor = loadGovernorForRuntimeTest(3_000, {
     maxConcurrent: 1,
     globalMinIntervalMs: 0,
@@ -778,6 +782,7 @@ test('Qwen AI governor adds Retry-After from its configured cooldown when upstre
     success: false,
     status: 429,
     error: 'upstream capacity limited',
+    errorCode: 'qwen_ai_capacity_limit',
     retryable: false,
     accountFault: true,
     retryScope: 'next-account',
@@ -1126,9 +1131,10 @@ test('Qwen AI account-neutral failures bypass load-balancer penalties on immedia
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
 
   assert.match(proxyTypes, /accountFault\?: boolean/)
-  assert.match(forwarderSource, /accountFault: typeof upstreamAccountFault === 'boolean'/)
+  assert.match(forwarderSource, /upstreamAccountFault/)
+  assert.match(forwarderSource, /accountFault: sessionStateFailure \|\| continuationRejected[\s\S]*typeof upstreamAccountFault === 'boolean'/)
   assert.match(chatRouteSource, /result\.accountFault !== false/)
-  assert.match(chatRouteSource, /streamFailureAccountFault\(error\) !== false/)
+  assert.match(chatRouteSource, /isQwenAiAccountFault/)
   assert.match(chatRouteSource, /accountFault: streamFailureAccountFault\(error\)/)
 })
 
@@ -1242,7 +1248,7 @@ test('Qwen AI cancellation and timeout paths are not retried or logged as succes
   assert.match(qwenAiSource, /Qwen AI response stream aborted before reading started/)
   assert.match(qwenAiSource, /QWEN_AI_STREAM_FAILURE_EVENT/)
   assert.match(qwenAiSource, /transStream\.qwenAiFailure = error/)
-  assert.match(qwenAiSource, /const onUpstreamError = \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight\) \{\s*return/)
+  assert.match(qwenAiSource, /const onUpstreamError = \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight \|\| transientRecoveryInFlight\) \{\s*return/)
   assert.match(qwenAiSource, /stream\.once\('error', onUpstreamError\)[\s\S]*if \(options\.signal\?\.aborted\)/)
   assert.match(forwarderSource, /retryable = status === 499[\s\S]*status === 403[\s\S]*status === 429[\s\S]*status === 504[\s\S]*\? false/)
 
@@ -1329,6 +1335,39 @@ test('Qwen AI load balancing can still repair an incomplete session when no read
   const selected = loadBalancer.selectAccount('Qwen3.8-Max-Preview')
 
   assert.equal(selected.account.id, incomplete.id)
+})
+
+test('Qwen AI load balancing excludes an account persisted as inactive after signin rejection', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const inactive = {
+    id: 'account-unregistered',
+    name: 'Unregistered',
+    providerId: provider.id,
+    status: 'inactive',
+    credentials: { token: 'stale-jwt', cookies: 'cnaui=auxiliary' },
+  }
+  const healthy = {
+    id: 'account-healthy',
+    name: 'Healthy',
+    providerId: provider.id,
+    status: 'active',
+    credentials: { token: 'jwt-value', cookies: 'token=session-value' },
+  }
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => [inactive, healthy],
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+
+  const selected = new LoadBalancer().selectAccount('Qwen3.8-Max-Preview')
+
+  assert.equal(selected.account.id, healthy.id)
 })
 
 test('Qwen AI complete-session failover never falls through to an incomplete session', () => {

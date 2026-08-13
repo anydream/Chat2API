@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatMessageContent } from '../types'
+import type { QwenAiSessionBinding } from '../qwenAiSessionBridge'
 
 export interface ResponsesConversationStoreOptions {
   ttlMs?: number
@@ -10,8 +11,14 @@ export interface ResponsesConversationStoreOptions {
 
 interface StoredConversation {
   messages: ChatMessage[]
+  qwenAiSessionBinding?: QwenAiSessionBinding
   bytes: number
   expiresAt: number
+}
+
+export interface StoredResponsesConversation {
+  messages: ChatMessage[]
+  qwenAiSessionBinding?: QwenAiSessionBinding
 }
 
 const DEFAULT_TTL_MS = 30 * 60 * 1000
@@ -48,8 +55,17 @@ function cloneMessages(messages: ChatMessage[]): ChatMessage[] {
   }))
 }
 
-function estimateMessagesBytes(messages: ChatMessage[]): number {
-  return Buffer.byteLength(JSON.stringify(messages), 'utf8')
+function cloneQwenAiSessionBinding(
+  binding: QwenAiSessionBinding | undefined,
+): QwenAiSessionBinding | undefined {
+  return binding ? { ...binding } : undefined
+}
+
+function estimateConversationBytes(
+  messages: ChatMessage[],
+  qwenAiSessionBinding: QwenAiSessionBinding | undefined,
+): number {
+  return Buffer.byteLength(JSON.stringify({ messages, qwenAiSessionBinding }), 'utf8')
 }
 
 export class ResponsesConversationStore {
@@ -70,6 +86,10 @@ export class ResponsesConversationStore {
   }
 
   get(responseId: string): ChatMessage[] | undefined {
+    return this.getConversation(responseId)?.messages
+  }
+
+  getConversation(responseId: string): StoredResponsesConversation | undefined {
     this.pruneExpired()
     const entry = this.entries.get(responseId)
     if (!entry) return undefined
@@ -79,13 +99,21 @@ export class ResponsesConversationStore {
       ...Array.from(this.entries.entries()).filter(([id]) => id !== responseId),
       [responseId, entry],
     ])
-    return cloneMessages(entry.messages)
+    return {
+      messages: cloneMessages(entry.messages),
+      qwenAiSessionBinding: cloneQwenAiSessionBinding(entry.qwenAiSessionBinding),
+    }
   }
 
-  set(responseId: string, messages: ChatMessage[]): boolean {
+  set(
+    responseId: string,
+    messages: ChatMessage[],
+    qwenAiSessionBinding?: QwenAiSessionBinding,
+  ): boolean {
     this.pruneExpired()
     const cloned = cloneMessages(messages)
-    const bytes = estimateMessagesBytes(cloned)
+    const clonedBinding = cloneQwenAiSessionBinding(qwenAiSessionBinding)
+    const bytes = estimateConversationBytes(cloned, clonedBinding)
     if (bytes > this.maxEntryBytes || bytes > this.maxTotalBytes) return false
 
     const existing = this.entries.get(responseId)
@@ -107,6 +135,7 @@ export class ResponsesConversationStore {
 
     const entry: StoredConversation = {
       messages: cloned,
+      ...(clonedBinding ? { qwenAiSessionBinding: clonedBinding } : {}),
       bytes,
       expiresAt: this.now() + this.ttlMs,
     }
@@ -123,6 +152,22 @@ export class ResponsesConversationStore {
     if (!entry) return
     this.entries = new Map(Array.from(this.entries.entries()).filter(([id]) => id !== responseId))
     this.totalBytes -= entry.bytes
+  }
+
+  clearQwenAiSessionBinding(responseId: string): void {
+    const entry = this.entries.get(responseId)
+    if (!entry?.qwenAiSessionBinding) return
+
+    const nextEntry: StoredConversation = {
+      messages: entry.messages,
+      bytes: estimateConversationBytes(entry.messages, undefined),
+      expiresAt: entry.expiresAt,
+    }
+    this.entries = new Map([
+      ...Array.from(this.entries.entries()).filter(([id]) => id !== responseId),
+      [responseId, nextEntry],
+    ])
+    this.totalBytes += nextEntry.bytes - entry.bytes
   }
 
   clear(): void {

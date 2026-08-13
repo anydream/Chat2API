@@ -24,6 +24,7 @@ import type {
   EffectiveModel,
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
+  QwenAiSessionMode,
 } from '../../../shared/types'
 
 export type { 
@@ -52,6 +53,7 @@ export type {
   EffectiveModel,
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
+  QwenAiSessionMode,
 }
 
 export interface CustomProviderFormData {

@@ -518,6 +518,12 @@
     "clientDetection": "Client Detection",
     "clientDetectionDesc": "Identify the client source and let backend provider profiles decide the tool calling strategy",
     "qwenGovernor": {
+      "sessionMode": "Dynamic tool session binding",
+      "sessionModeSaved": "Qwen AI tool session mode saved",
+      "sessionModeDesc": {
+        "legacy": "Legacy: start a Qwen chat from the full client history on every turn",
+        "tool-call-binding": "Current: continue the original Qwen chat by tool_call_id and replay only after an account fault"
+      },
       "tab": "Qwen Governor",
       "title": "Qwen AI Rate Limits and Cooldowns",
       "description": "View and adjust Qwen AI request queueing, account cooldowns, and failure circuit breaker settings.",

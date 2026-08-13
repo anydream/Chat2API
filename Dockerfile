@@ -52,8 +52,8 @@ ENV CHAT2API_QWEN_AI_QUEUE_TIMEOUT_MS=120000
 # Keep one effective governor slot available for ordinary client requests
 # while a context-compaction map/reduce is active.
 ENV CHAT2API_QWEN_AI_COMPACTION_RESERVED_SLOTS=1
-# Managed answers and tool arguments remain private until terminal validation.
-# Genuine Qwen reasoning is forwarded live while account failover stays active.
+# Managed reasoning, answers, and tool arguments remain private until terminal
+# validation so a failed provider branch cannot leak before account recovery.
 ENV CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS=true
 # Start document offload before a large Qwen Web request reaches its model context.
 # This is a transport target, not a local client request limit; zero disables it.
@@ -77,10 +77,19 @@ ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 # Semantic continuation branches also share an absolute wall-clock deadline.
 ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
 # Busy-chat admission is bounded separately from the long generation timeout.
+# Leave the generic retry-count override unset so ordinary semantic workflow
+# continuations retain deadline mode; Responses tool-result continuations use
+# the dedicated override below.
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_BUDGET_MS=300000
 ENV CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_DELAY_MS=1000
+# Retained Responses tool-result continuations fail fast into same-account
+# full replay; semantic workflow continuations use the generic policy above.
+ENV CHAT2API_QWEN_AI_RESPONSES_CONTINUATION_RETRY_ATTEMPTS=0
 ENV CHAT2API_VALIDATED_SSE_MAX_HOLD_MS=60000
 ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
+# Keep the HTTP listener alive long enough for the longest configured request
+# to finish when Docker sends SIGTERM during an update.
+ENV CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS=540000
 # Keep the default cumulative deadline below typical downstream transport
 # limits so a structured terminal response has time to propagate.
 ENV QWEN_AI_REQUEST_TIMEOUT_MS=540000

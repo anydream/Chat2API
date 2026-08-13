@@ -53,7 +53,7 @@ Provider availability and model names follow the upstream web applications and m
 
 ### Desktop release
 
-Download a platform package from [GitHub Releases](https://github.com/pyf-feifei/Chat2API/releases) when a release is available:
+Download a platform package from [GitHub Releases](https://github.com/xiaoY233/Chat2API/releases) when a release is available. The source mirror is [pyf-feifei/Chat2API](https://github.com/pyf-feifei/Chat2API).
 
 | Platform | Package |
 | --- | --- |
@@ -64,7 +64,7 @@ Download a platform package from [GitHub Releases](https://github.com/pyf-feifei
 
 ### Build from source
 
-Requirements: Node.js 18+, npm, and Git.
+Requirements: Node.js 18+, npm, and Git. The Docker image uses Node.js 22.
 
 ```bash
 git clone https://github.com/pyf-feifei/Chat2API.git

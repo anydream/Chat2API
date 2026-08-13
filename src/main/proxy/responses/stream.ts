@@ -199,7 +199,11 @@ export class ChatCompletionsToResponsesStream extends Transform {
       usage: this.usage,
       error: responseError,
     })
-    this.onFailure?.(error, response)
+    try {
+      this.onFailure?.(error, response)
+    } catch (callbackError) {
+      this.reportLifecycleCallbackError('failure', callbackError)
+    }
     this.enqueueEvent('response.failed', { response })
   }
 
@@ -641,12 +645,28 @@ export class ChatCompletionsToResponsesStream extends Transform {
       ? { ...baseResponse, incomplete_details: { reason: incompleteReason } }
       : baseResponse
     if (incompleteReason) {
-      await this.onIncomplete?.(response)
+      try {
+        await this.onIncomplete?.(response)
+      } catch (callbackError) {
+        this.reportLifecycleCallbackError('incomplete', callbackError)
+      }
       this.enqueueEvent('response.incomplete', { response })
       return
     }
-    await this.onComplete?.(response)
+    try {
+      await this.onComplete?.(response)
+    } catch (callbackError) {
+      this.reportLifecycleCallbackError('completion', callbackError)
+    }
     this.enqueueEvent('response.completed', { response })
+  }
+
+  private reportLifecycleCallbackError(
+    phase: 'completion' | 'incomplete' | 'failure',
+    error: unknown,
+  ): void {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error(`[Responses] ${phase} callback failed after stream state was resolved: ${message}`)
   }
 
   private sortedOutput(): Array<Record<string, any>> {

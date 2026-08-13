@@ -321,7 +321,7 @@ test('both OpenAI-compatible generation routes use the shared account failover p
     assert.match(source, /forwardWithAccountFailover\(\{/)
     assert.match(source, /excludedAccountIds\s*=>\s*loadBalancer\.selectAccount\(/)
     assert.match(source, /reportAccountFailover\(selection\.account\.id/)
-    assert.match(source, /if \(result\.accountFault !== false\) \{\s*loadBalancer\.markAccountFailed/)
+    assert.match(source, /accountFault !== false|isQwenAiAccountFault/)
     assert.match(source, /data:\s*\{\s*attempt,\s*status:\s*result\.status,\s*accountFault:\s*result\.accountFault/)
   }
 

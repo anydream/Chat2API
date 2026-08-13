@@ -16,9 +16,16 @@ async function shutdown(signal: string): Promise<void> {
   }
 }
 
+let shutdownPromise: Promise<void> | undefined
+
+function requestShutdown(signal: string): void {
+  shutdownPromise ??= shutdown(signal)
+  void shutdownPromise
+}
+
 async function main(): Promise<void> {
-  process.on('SIGINT', () => void shutdown('SIGINT'))
-  process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  process.on('SIGINT', () => requestShutdown('SIGINT'))
+  process.on('SIGTERM', () => requestShutdown('SIGTERM'))
 
   process.on('uncaughtException', (error) => {
     console.error('[Server] Uncaught exception:', error)

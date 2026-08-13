@@ -138,6 +138,45 @@ test('Qwen AI session repair pauses the account sweep after upstream risk contro
   assert.equal(service.getAccountStatus(incomplete).state, 'backoff')
 })
 
+test('Qwen AI session repair skips an account persisted as unregistered', async () => {
+  const unregistered = account('unregistered', {
+    token: 'jwt-unregistered',
+    cookies: 'cnaui=value',
+    email: 'fixture@example.test',
+    password: 'fixture-password',
+  })
+  let calls = 0
+  const loaded = loadRepairModule({
+    accounts: [unregistered],
+    providers: [provider],
+    repairWebSession: async () => {
+      calls += 1
+      const error = Object.assign(new Error('Qwen AI account is not registered'), {
+        status: 401,
+        code: 'qwen_ai_token_refresh_failed',
+        accountFault: true,
+        retryScope: 'next-account',
+        accountStatus: 'inactive',
+      })
+      // The real refresher persists this state before it throws. Keep the
+      // service fixture focused on how it treats that persisted account.
+      unregistered.status = error.accountStatus
+      unregistered.errorMessage = error.message
+      throw error
+    },
+  })
+
+  const service = new loaded.QwenAiSessionRepairService()
+  const failed = await service.repairNext()
+  const idle = await service.repairNext()
+
+  assert.equal(failed.status, 'failed')
+  assert.equal(idle.status, 'idle')
+  assert.equal(unregistered.status, 'inactive')
+  assert.equal(service.getAccountStatus(unregistered).state, 'unrepairable')
+  assert.equal(calls, 1)
+})
+
 test('Qwen AI repair is wired into server lifecycle, validation, and governor status', () => {
   const serverSource = fs.readFileSync('src/main/proxy/server.ts', 'utf8')
   const accountsSource = fs.readFileSync('src/main/store/accounts.ts', 'utf8')

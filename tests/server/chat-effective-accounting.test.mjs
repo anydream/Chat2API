@@ -242,6 +242,18 @@ function loadChatRoute({
         lastUserTextPrefix: 'compact',
       }),
     },
+    '../qwenAiSessionBridge': {
+      createQwenAiSessionRequestFingerprint: () => 'qwen-chat-test-fingerprint',
+      resolveQwenAiSessionBinding: () => undefined,
+    },
+    '../qwenAiToolCallSessionStore': {
+      getTrailingQwenAiToolResultBatch: () => undefined,
+      qwenAiToolCallSessionStore: {
+        resolve: () => undefined,
+        set: () => true,
+        delete: () => {},
+      },
+    },
     '../toolCalling/assistantOutputBoundary': { createAssistantOutputBoundaryStream },
   }
   const testRequire = specifier => {

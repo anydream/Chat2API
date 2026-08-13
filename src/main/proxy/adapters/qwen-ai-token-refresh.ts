@@ -14,6 +14,8 @@ type QwenAiRefreshError = Error & {
   retryable?: boolean
   accountFault?: boolean
   retryScope?: 'next-account'
+  /** Persisted account state for an explicit, permanent credential result. */
+  accountStatus?: 'inactive'
 }
 
 type QwenAiSignInResponse = AxiosResponse<any>
@@ -179,12 +181,45 @@ function isRiskControlled(body: unknown): boolean {
   }
 }
 
+/**
+ * Qwen's sign-in endpoint has used several response shapes for an account
+ * that has never been registered. Keep this classifier deliberately narrow:
+ * ordinary invalid passwords and transient HTTP 401s must retain normal
+ * account-failover semantics without permanently disabling the account.
+ */
+function isUnregisteredAccountResponse(body: unknown, detail?: string): boolean {
+  let serialized = ''
+  try {
+    serialized = JSON.stringify(body || {})
+  } catch {
+    serialized = ''
+  }
+
+  return /(?:not[\s_-]*registered|unregistered|(?:account|user|email)[\s_-]*(?:does[\s_-]*not|is[\s_-]*not|not)[\s_-]*(?:exist|found|registered)|user[\s_-]*not[\s_-]*found|account[\s_-]*not[\s_-]*found|USER_NOT_REGISTERED|ACCOUNT_NOT_REGISTERED|USER_NOT_FOUND|ACCOUNT_NOT_FOUND|(?:\u5e10\u6237|\u8d26\u6237|\u8d26\u53f7|\u7528\u6237)(?:\u672a\u6ce8\u518c|\u4e0d\u5b58\u5728))/i
+    .test(`${detail || ''} ${serialized}`)
+}
+
+function persistUnregisteredAccount(account: Account, error: QwenAiRefreshError): void {
+  if (error.accountStatus !== 'inactive') return
+
+  try {
+    storeManager.updateAccount(account.id, {
+      status: 'inactive',
+      errorMessage: error.message,
+    })
+  } catch (persistError) {
+    // Keep the auth failure visible even while persistence is unavailable.
+    console.warn('[QwenAI] Failed to persist unregistered account state:', persistError)
+  }
+}
+
 function createRefreshError(options: {
   message: string
   status: number
   retryable: boolean
   accountFault: boolean
   retryScope?: 'next-account'
+  accountStatus?: 'inactive'
 }): QwenAiRefreshError {
   const error = new Error(options.message) as QwenAiRefreshError
   error.status = options.status
@@ -192,6 +227,7 @@ function createRefreshError(options: {
   error.retryable = options.retryable
   error.accountFault = options.accountFault
   if (options.retryScope) error.retryScope = options.retryScope
+  if (options.accountStatus) error.accountStatus = options.accountStatus
   return error
 }
 
@@ -200,6 +236,7 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
   const detail = extractQwenAiRefreshDetail(response.data)
   const detailSuffix = detail ? `: ${detail}` : ''
   const riskControlled = isRiskControlled(response.data)
+  const unregistered = isUnregisteredAccountResponse(response.data, detail)
 
   if (riskControlled) {
     return createRefreshError({
@@ -207,6 +244,17 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
       status: 403,
       retryable: false,
       accountFault: false,
+    })
+  }
+
+  if (unregistered) {
+    return createRefreshError({
+      message: `Qwen AI account is not registered${detailSuffix}`,
+      status: 401,
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+      accountStatus: 'inactive',
     })
   }
 
@@ -225,8 +273,10 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
       message: `Qwen AI token refresh was rate limited${detailSuffix}`,
       status: 429,
       retryable: false,
-      accountFault: true,
-      retryScope: 'next-account',
+      // Refresh throttling is a provider response, not proof that this
+      // credential is invalid. Keep the account eligible after the normal
+      // request pacing window instead of exhausting the whole pool.
+      accountFault: false,
     })
   }
 
@@ -235,8 +285,9 @@ function createRefreshResponseError(response: QwenAiSignInResponse): QwenAiRefre
       message: `Qwen AI token refresh service failed (HTTP ${upstreamStatus})${detailSuffix}`,
       status: upstreamStatus === 504 ? 504 : 502,
       retryable: true,
-      accountFault: true,
-      retryScope: 'next-account',
+      // A failed refresh can be retried against the same credentials once
+      // the upstream service recovers; do not mark the account as faulty.
+      accountFault: false,
     })
   }
 
@@ -361,7 +412,13 @@ export class QwenAiTokenRefresher {
 
     const token = extractSignInToken(response.data)
     if (response.status !== 200 || !token || typeof token !== 'string') {
-      throw createRefreshResponseError(response)
+      const refreshError = createRefreshResponseError(response)
+      // Keep an explicitly unregistered account out of both the request
+      // load-balancer and the background session-repair queue until its
+      // login is fixed. Other 401/403/429 cases preserve their normal
+      // account-failover semantics.
+      persistUnregisteredAccount(account, refreshError)
+      throw refreshError
     }
 
     const cookies = mergeCookieHeaders(

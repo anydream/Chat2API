@@ -32,6 +32,7 @@ import {
   CustomModel,
   DEFAULT_REQUEST_LOG_CONFIG,
   normalizeQwenAiGovernorConfig,
+  normalizeQwenAiSessionMode,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -251,6 +252,7 @@ class StoreManager {
       toolCallingConfig: normalizeToolCallingConfig(rawToolCallingConfig),
       toolPromptConfig: undefined,
       qwenAiGovernorConfig: normalizeQwenAiGovernorConfig(rawConfig.qwenAiGovernorConfig),
+      qwenAiSessionMode: normalizeQwenAiSessionMode(rawConfig.qwenAiSessionMode),
     }
   }
 

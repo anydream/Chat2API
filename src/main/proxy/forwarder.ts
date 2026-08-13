@@ -31,6 +31,7 @@ import {
   findModelCapability as findQwenAiModelCapability,
   isQwenAiUpstreamBusyMessage,
   qwenAiRequestTimeoutMsFromEnv,
+  qwenAiResponsesContinuationRetryAttemptsFromEnv,
   type QwenAiOutputStream,
   createQwenAiResumableStream,
 } from './adapters/qwen-ai'
@@ -68,6 +69,14 @@ import {
   planQwenAiCompactionChunks,
   type QwenAiCompactionChunk,
 } from './qwenAiCompactionBoundary'
+import {
+  isQwenAiAccountFault as classifyQwenAiAccountFault,
+  qwenAiAccountRetryScope,
+} from './qwenAiAccountPolicy'
+
+function isQwenAiAccountFault(value: Parameters<typeof classifyQwenAiAccountFault>[0] | undefined): boolean {
+  return classifyQwenAiAccountFault(value)
+}
 
 function shouldDeleteSession(): boolean {
   return sessionManager.shouldDeleteAfterChat()
@@ -145,6 +154,53 @@ function isQwenAiUpstreamBusyResult(result: ForwardResult): boolean {
     && result.accountFault === false
 }
 
+/**
+ * A retained Qwen conversation belongs to the account that created it. A
+ * missing chat or parent is therefore conversation state loss, rather than a
+ * credential/risk-control signal from that account. Qwen reports this as
+ * not-found/conflict, and some endpoints use a structured invalid
+ * chat/parent 400. Restrict that 400 match to the explicit reference field so
+ * an ordinary malformed tool result is not replayed as a fresh chat.
+ */
+function isQwenAiStaleSessionError(error: unknown): boolean {
+  const status = statusFromError(error)
+  if (status === 404 || status === 409) return true
+  if (status !== 400) return false
+
+  // Qwen has returned invalid parent/chat references as 400 from some web
+  // endpoints. Do not infer this from arbitrary message text: a tool payload
+  // error may mention a chat while still being a client-side validation error.
+  const record = error as { param?: unknown }
+  const param = typeof record?.param === 'string'
+    ? record.param.toLowerCase().replace(/[^a-z0-9]/g, '')
+    : ''
+  return param === 'chatid' || param === 'conversationid' || param === 'parentid'
+}
+
+function qwenAiToolCallIdsFromChatResponse(response: unknown): string[] {
+  if (!response || typeof response !== 'object') return []
+  const choices = (response as { choices?: unknown }).choices
+  if (!Array.isArray(choices)) return []
+
+  const ids = new Set<string>()
+  for (const choice of choices) {
+    if (!choice || typeof choice !== 'object') continue
+    const candidate = choice as {
+      message?: { tool_calls?: unknown }
+      delta?: { tool_calls?: unknown }
+    }
+    const toolCalls = candidate.message?.tool_calls ?? candidate.delta?.tool_calls
+    if (!Array.isArray(toolCalls)) continue
+    for (const toolCall of toolCalls) {
+      const id = toolCall && typeof toolCall === 'object'
+        ? (toolCall as { id?: unknown }).id
+        : undefined
+      if (typeof id === 'string' && id.trim()) ids.add(id.trim())
+    }
+  }
+  return Array.from(ids)
+}
+
 function createQwenAiRequestTimeoutResult(startTime: number): ForwardResult {
   return {
     success: false,
@@ -199,11 +255,23 @@ function qwenAiSseErrorFromPayload(payload: unknown, eventName: string): Error |
   const status = Number(detail?.status ?? envelope?.status)
   if (Number.isInteger(status) && status >= 400 && status <= 599) error.status = status
   if (typeof detail?.code === 'string') error.code = detail.code
+  else if (typeof detail?.errorCode === 'string') error.code = detail.errorCode
   if (typeof detail?.type === 'string') error.type = detail.type
   if (typeof detail?.param === 'string') error.param = detail.param
   if (typeof detail?.retryable === 'boolean') error.retryable = detail.retryable
   if (typeof detail?.accountFault === 'boolean') error.accountFault = detail.accountFault
-  if (detail?.retryScope === 'next-account') error.retryScope = 'next-account'
+  const classification = {
+    status: error.status,
+    code: error.code,
+    param: error.param,
+    accountFault: error.accountFault,
+  }
+  if (error.accountFault !== false && isQwenAiAccountFault(classification)) {
+    error.accountFault = true
+  }
+  if (detail?.retryScope === 'next-account' || qwenAiAccountRetryScope(classification) === 'next-account') {
+    error.retryScope = 'next-account'
+  }
   return error
 }
 
@@ -537,7 +605,7 @@ function validatedSseMaxHoldMsFromEnv(): number {
 
 /**
  * Keep managed answers and tool arguments private for validation and account
- * failover. Deferred routes may still forward genuine Qwen reasoning live.
+ * failover. Managed reasoning remains inside the same validated branch.
  */
 export function qwenAiBufferManagedStreamsFromEnv(): boolean {
   const raw = process.env.CHAT2API_QWEN_AI_BUFFER_MANAGED_STREAMS
@@ -1298,7 +1366,7 @@ export class RequestForwarder {
       }
 
       try {
-        const result = await this.doForward(
+        const rawResult = await this.doForward(
           modifiedRequest,
           account,
           provider,
@@ -1314,6 +1382,21 @@ export class RequestForwarder {
             attempt: attempt + 1,
           },
         )
+        // Adapter/wrapper boundaries can drop the derived accountFault flag.
+        // Recover only the narrow, status/code-defined account classes here;
+        // congestion, transport failures, and conversation-state errors stay
+        // account-neutral.
+        const result = !rawResult.success && isQwenAiProvider
+          ? {
+              ...rawResult,
+              accountFault: rawResult.accountFault === false
+                ? false
+                : isQwenAiAccountFault(rawResult)
+                  ? true
+                  : rawResult.accountFault,
+              retryScope: rawResult.retryScope ?? qwenAiAccountRetryScope(rawResult),
+            }
+          : rawResult
 
         if (result.success) {
           return result
@@ -1377,9 +1460,22 @@ export class RequestForwarder {
         lastHeaders = headersFromError(error)
         lastErrorCode = errorCodeFromError(error)
         const errorAccountFault = (error as { accountFault?: unknown })?.accountFault
-        lastAccountFault = typeof errorAccountFault === 'boolean' ? errorAccountFault : undefined
+        const errorClassification = {
+          ...(error && typeof error === 'object' ? error as Record<string, unknown> : {}),
+          status: lastStatus,
+          errorCode: lastErrorCode,
+        }
+        lastAccountFault = typeof errorAccountFault === 'boolean'
+          ? errorAccountFault
+          : isQwenAiProvider && isQwenAiAccountFault(errorClassification)
+            ? true
+            : undefined
         const errorRetryScope = (error as { retryScope?: unknown })?.retryScope
-        lastRetryScope = errorRetryScope === 'next-account' ? errorRetryScope : undefined
+        lastRetryScope = errorRetryScope === 'next-account'
+          ? errorRetryScope
+          : isQwenAiProvider
+            ? qwenAiAccountRetryScope(errorClassification)
+            : undefined
         const errorRetryable = (error as { retryable?: unknown })?.retryable
         lastRetryable = lastStatus === 499
           || (isQwenAiProvider && lastStatus === 504)
@@ -2490,7 +2586,7 @@ export class RequestForwarder {
           attempt,
           accountFault: routedResult.accountFault,
         })
-        if (routedResult.accountFault !== false) {
+        if (isQwenAiAccountFault(routedResult)) {
           loadBalancer.markAccountFailed(selection.account.id)
         }
         failedAccountIds.add(selection.account.id)
@@ -2621,7 +2717,11 @@ export class RequestForwarder {
             error: error instanceof Error ? error.message : 'Unknown compaction attempt error',
             errorCode: errorCodeFromError(error),
             retryable: false,
-            accountFault: (error as { accountFault?: boolean })?.accountFault,
+            accountFault: isQwenAiAccountFault(error as { accountFault?: unknown })
+              ? true
+              : (error as { accountFault?: unknown })?.accountFault === false
+                ? false
+                : undefined,
             latency: Date.now() - generationStartedAt,
           }))),
         )
@@ -2867,7 +2967,11 @@ export class RequestForwarder {
                 error: error instanceof Error ? error.message : 'Unknown compaction stage error',
                 errorCode: errorCodeFromError(error),
                 retryable: false,
-                accountFault: (error as { accountFault?: boolean })?.accountFault,
+                accountFault: isQwenAiAccountFault(error as { accountFault?: unknown })
+                  ? true
+                  : (error as { accountFault?: unknown })?.accountFault === false
+                    ? false
+                    : undefined,
                 latency: elapsed(),
               })
             }
@@ -3035,6 +3139,11 @@ export class RequestForwarder {
       }))
     }
     let activeChatId: string | undefined
+    // A retained Responses bridge chat predates this HTTP request. Do not
+    // discard it merely because continuation admission reports a temporary
+    // state such as CHAT_IN_PROGRESS.
+    let activeChatIsRetained = false
+    let usedResponsesSessionContinuation = false
     const cleanedChatIds = new Set<string>()
 
     const cleanupChat = (chatId: string): void => {
@@ -3078,26 +3187,128 @@ export class RequestForwarder {
           : Math.max(1, options.requestDeadlineAt - Date.now()),
         messageTransport: options.messageTransport,
       })
+      const sessionBridge = context?.qwenAiSessionBridge
+      const continuation = sessionBridge?.continuation
+      const continuationBinding = continuation?.binding
+      const expectedToolProtocol = transformed.plan.shouldParseResponse
+        ? transformed.plan.protocol
+        : undefined
+      const canContinueResponsesSession = Boolean(
+        continuation
+        && continuationBinding
+        && transformed.plan.shouldParseResponse
+        && continuation.inputMessages.length > 0
+        && continuationBinding.providerId === provider.id
+        && continuationBinding.accountId === account.id
+        && continuationBinding.requestedModel === providerRequest.model
+        && continuationBinding.actualModel === actualModel
+        && continuationBinding.requestFingerprint === sessionBridge?.requestFingerprint
+        && continuationBinding.toolProtocol === expectedToolProtocol,
+      )
+      usedResponsesSessionContinuation = canContinueResponsesSession
+
       if (options.requestDeadlineAt !== undefined && Date.now() >= options.requestDeadlineAt) {
         return createQwenAiRequestTimeoutResult(startTime)
       }
-      const { response, chatId, parentId } = await adapter.chatCompletion(
-        createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
-      )
-      activeChatId = chatId
+
+      let response: AxiosResponse
+      let chatId: string
+      if (canContinueResponsesSession && continuationBinding && continuation) {
+        activeChatId = continuationBinding.chatId
+        activeChatIsRetained = true
+        const workflowContinuationMessage = createToolWorkflowContinuationMessage({
+          activeUserRequest: extractLatestActiveUserRequest(providerRequest.messages),
+          failedToolResultPending: transformed.plan.failedToolResultPending,
+          plan: transformed.plan,
+        })
+        const continuationMessages: ChatMessage[] = [
+          ...continuation.inputMessages,
+          workflowContinuationMessage,
+        ]
+
+        try {
+          response = await adapter.continueChatCompletion({
+            chatId: continuationBinding.chatId,
+            parentId: continuationBinding.parentId,
+            model: actualModel,
+            originalModel: providerRequest.model,
+            messages: continuationMessages,
+            enable_thinking: providerRequest.enable_thinking !== undefined
+              ? providerRequest.enable_thinking
+              : providerRequest.reasoning_effort !== undefined
+                ? Boolean(providerRequest.reasoning_effort)
+                : undefined,
+            thinking_budget: providerRequest.thinking_budget,
+            managedToolCalling: true,
+            managedToolWorkflowContinuation: true,
+            // A retained Responses chat that is still finalizing should
+            // immediately use the same-account full-transcript replay path.
+            // Keep the generic semantic continuation retry policy unchanged.
+            chatInProgressRetryAttempts: qwenAiResponsesContinuationRetryAttemptsFromEnv(),
+            messageTransport: options.messageTransport,
+            signal: context?.signal,
+            deadlineAt: options.requestDeadlineAt,
+          })
+          chatId = continuationBinding.chatId
+          console.info('[QwenAI] Responses session continuation accepted', JSON.stringify({
+            requestId: context?.requestId,
+            accountId: account.id,
+            chatId,
+            parentId: continuationBinding.parentId,
+            deltaMessageCount: continuationMessages.length,
+          }))
+        } catch (error) {
+          const continuationCode = errorCodeFromError(error)
+          const continuationStatus = statusFromError(error)
+          const continuationBusy = continuationCode === 'CHAT_IN_PROGRESS'
+            || continuationStatus === 429 && /chat\s+in\s+progress|still\s+in\s+progress/i.test(
+              error instanceof Error ? error.message : String(error),
+            )
+          if (!isQwenAiStaleSessionError(error) && !continuationBusy) throw error
+
+          // Qwen can lose the retained branch or still be finalizing it when
+          // Claude immediately submits the tool result. Recreate only the
+          // provider branch on the same credential and replay the full client
+          // transcript; neither case is an account-health event.
+          console.info('[QwenAI] Responses session continuation unavailable; replaying full transcript on the same account', JSON.stringify({
+            requestId: context?.requestId,
+            accountId: account.id,
+            chatId: continuationBinding.chatId,
+            status: continuationStatus,
+            errorCode: continuationCode,
+          }))
+          cleanupChat(continuationBinding.chatId)
+          activeChatId = undefined
+          activeChatIsRetained = false
+          const restarted = await adapter.chatCompletion(
+            createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
+          )
+          response = restarted.response
+          chatId = restarted.chatId
+          activeChatId = chatId
+        }
+      } else {
+        const started = await adapter.chatCompletion(
+          createChatCompletionRequest(transformed.messages as ChatCompletionRequest['messages']),
+        )
+        response = started.response
+        chatId = started.chatId
+        activeChatId = chatId
+      }
 
       let latency = Date.now() - startTime
 
       if (response.status >= 400) {
         const errorMessage = this.extractErrorMessage(response)
         const errorCode = isQwenRiskControlText(errorMessage) ? 'qwen_ai_risk_control' : undefined
+        const continuationRejected = canContinueResponsesSession && response.status === 400
         cleanupChat(chatId)
         return {
           success: false,
           status: response.status,
           headers: sanitizeForwardedErrorHeaders(response.headers),
           error: errorMessage || `HTTP ${response.status}`,
-          errorCode,
+          errorCode: continuationRejected ? 'qwen_ai_continuation_rejected' : errorCode,
           retryable: response.status === 403
             || response.status === 429
             || response.status === 499
@@ -3105,6 +3316,7 @@ export class RequestForwarder {
             || errorCode === 'qwen_ai_risk_control'
             ? false
             : undefined,
+          accountFault: continuationRejected ? false : undefined,
           latency,
         }
       }
@@ -3116,11 +3328,27 @@ export class RequestForwarder {
         promptTokens,
       )
       handler.setChatId(chatId)
+      const qwenAiSessionState = sessionBridge
+        ? {
+            providerId: provider.id,
+            accountId: account.id,
+            requestedModel: providerRequest.model,
+            actualModel,
+            requestFingerprint: sessionBridge.requestFingerprint,
+            ...(expectedToolProtocol ? { toolProtocol: expectedToolProtocol } : {}),
+            getChatId: () => handler.getChatId(),
+            getParentId: () => handler.getResponseId(),
+          }
+        : undefined
       const canContinueManagedWorkflow = Boolean(
         transformed.plan.shouldParseResponse
         && transformed.plan.allowedToolNames?.size
         && typeof (adapter as any).continueChatCompletion === 'function',
       )
+      const bufferManagedStream = providerRequest.stream === true
+        && transformed.plan.shouldParseResponse
+        && qwenAiBufferManagedStreamsFromEnv()
+      const canRestartEndedResponse = providerRequest.stream !== true || bufferManagedStream
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
         workflowRecoveryDeadlineAt,
@@ -3132,6 +3360,25 @@ export class RequestForwarder {
           responseId,
           recoverySignal || context?.signal,
         ),
+        ...(canRestartEndedResponse
+          ? {
+              restartFreshChat: async (_recoveryError: Error, recoverySignal?: AbortSignal) => {
+                const currentChatId = activeChatId || chatId
+                const restarted = await adapter.chatCompletion({
+                  ...createChatCompletionRequest(
+                    transformed.messages as ChatCompletionRequest['messages'],
+                  ),
+                  signal: recoverySignal || context?.signal,
+                })
+                activeChatId = restarted.chatId
+                activeChatIsRetained = false
+                handler.setChatId(restarted.chatId)
+                cleanupChat(currentChatId)
+                return restarted.response
+              },
+              onFreshChatRestart: () => handler.prepareForWorkflowContinuation(),
+            }
+          : {}),
         ...(canContinueManagedWorkflow
           ? {
               continueWorkflow: async (
@@ -3192,6 +3439,7 @@ export class RequestForwarder {
                     throw restartError
                   }
                   activeChatId = restarted.chatId
+                  activeChatIsRetained = false
                   handler.setChatId(restarted.chatId)
                   cleanupChat(currentChatId)
                   return restarted.response
@@ -3219,14 +3467,12 @@ export class RequestForwarder {
       })
 
       if (providerRequest.stream) {
-        const bufferManagedStream = transformed.plan.shouldParseResponse
-          && qwenAiBufferManagedStreamsFromEnv()
         let transformedStream: any = await handler.handleStream(resumableResponseStream, {
           signal: context?.signal,
           requestDeadlineAt: options.requestDeadlineAt,
           bufferManagedBranch: bufferManagedStream,
-          onProgressFrame: context?.onQwenAiProgressFrame,
           onFailure: () => cleanupChat(activeChatId || chatId),
+          qwenAiSessionState,
           recoverFromIdle: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
           recoverFromSemanticEmpty: (error, onResume) => resumableResponseStream.recoverFromIdle(error, onResume),
           allowReasoningOnlyOutput: isContextCompaction,
@@ -3248,17 +3494,42 @@ export class RequestForwarder {
             ...(validationHoldMs === undefined ? {} : { maxHoldMs: validationHoldMs }),
             signal: context?.signal,
             forwardEvents: [QWEN_AI_STREAM_FAILURE_EVENT],
-            forwardProperties: ['qwenAiFailure'],
+            forwardProperties: ['qwenAiFailure', 'qwenAiToolCallIds'],
           })
           latency = Date.now() - startTime
         }
+
+        // Buffer wrappers do not retain arbitrary stream metadata. Preserve a
+        // getter-backed fallback on the final visible stream; the handler
+        // itself publishes the same state only after it learns the real Qwen
+        // response ID, and the Responses route resolves it at completion.
+        if (qwenAiSessionState) {
+          (transformedStream as QwenAiOutputStream).qwenAiSessionState = qwenAiSessionState
+        }
+        Object.defineProperty(transformedStream as QwenAiOutputStream, 'qwenAiToolCallIds', {
+          configurable: true,
+          enumerable: false,
+          get: () => handler.isComplete() ? handler.getEmittedToolCallIds() : undefined,
+        })
 
         if (isContextCompaction || shouldDeleteSession()) {
           let cleanupRequested = false
           const cleanupCompletedStream = () => {
             if (cleanupRequested) return
             cleanupRequested = true
-            cleanupChat(activeChatId || chatId)
+            // A managed-tool bridge needs the chat only when the terminal
+            // output actually exposed client-visible tool call IDs. Plain
+            // text replies cannot be continued through this bridge, so retain
+            // neither their Qwen chat nor a stale provider branch.
+            const retainForToolContinuation = Boolean(
+              !isContextCompaction
+              && sessionBridge
+              && typeof handler.isComplete === 'function'
+              && handler.isComplete()
+              && typeof handler.getEmittedToolCallIds === 'function'
+              && handler.getEmittedToolCallIds().length > 0,
+            )
+            if (!retainForToolContinuation) cleanupChat(activeChatId || chatId)
           }
           const streamState = transformedStream as {
             readableEnded?: boolean
@@ -3289,6 +3560,7 @@ export class RequestForwarder {
           skipTransform: true,
           latency,
           providerSessionId: activeChatId || chatId,
+          qwenAiSessionState,
         }
       }
 
@@ -3302,8 +3574,15 @@ export class RequestForwarder {
       })
 
       this.applyToolCallsToResponse(result, transformed)
+      const qwenAiToolCallIds = qwenAiToolCallIdsFromChatResponse(result)
 
-      if (isContextCompaction || shouldDeleteSession()) {
+      if (
+        isContextCompaction
+        || (
+          shouldDeleteSession()
+          && (!sessionBridge || qwenAiToolCallIds.length === 0)
+        )
+      ) {
         cleanupChat(activeChatId || chatId)
       }
 
@@ -3314,9 +3593,11 @@ export class RequestForwarder {
         body: result,
         latency,
         providerSessionId: activeChatId || chatId,
+        qwenAiSessionState,
+        ...(qwenAiToolCallIds.length > 0 ? { qwenAiToolCallIds } : {}),
       }
     } catch (error) {
-      if (activeChatId) {
+      if (activeChatId && !activeChatIsRetained) {
         cleanupChat(activeChatId)
       }
       let latency = Date.now() - startTime
@@ -3328,7 +3609,23 @@ export class RequestForwarder {
       )
         ? 'managed_tool_stream_validation' as const
         : undefined
-      const errorCode = errorCodeFromError(error)
+      const upstreamErrorCode = errorCodeFromError(error)
+      const sessionStateFailure = isQwenAiStaleSessionError(error)
+      // A continuation-specific 400 is a bad chat edge or tool-result
+      // payload, never evidence that the Qwen credential itself is unhealthy.
+      // Clear its binding at the Responses route so a client retry cannot keep
+      // submitting the same stale parent forever.
+      const continuationRejected = usedResponsesSessionContinuation && status === 400
+      const errorCode = sessionStateFailure
+        ? 'qwen_ai_session_stale'
+        : continuationRejected
+          ? 'qwen_ai_continuation_rejected'
+          : upstreamErrorCode
+      const continuationAccountFailover = usedResponsesSessionContinuation && (
+        status === 401
+        || status === 403
+        || (status === 429 && errorCode === 'qwen_ai_capacity_limit')
+      )
       const upstreamRetryable = (error as { retryable?: unknown })?.retryable
       const upstreamAccountFault = (error as { accountFault?: unknown })?.accountFault
       const upstreamRetryScope = (error as { retryScope?: unknown })?.retryScope
@@ -3349,8 +3646,16 @@ export class RequestForwarder {
         latency,
         retryable,
         errorCode,
-        accountFault: typeof upstreamAccountFault === 'boolean' ? upstreamAccountFault : undefined,
-        retryScope: upstreamRetryScope === 'next-account' ? upstreamRetryScope : undefined,
+        accountFault: sessionStateFailure || continuationRejected
+          ? false
+          : usedResponsesSessionContinuation
+            ? continuationAccountFailover
+          : typeof upstreamAccountFault === 'boolean' ? upstreamAccountFault : undefined,
+        retryScope: sessionStateFailure || continuationRejected
+          ? undefined
+          : usedResponsesSessionContinuation
+            ? continuationAccountFailover ? 'next-account' : undefined
+          : upstreamRetryScope === 'next-account' ? upstreamRetryScope : undefined,
         recoveryHint,
       }
     }

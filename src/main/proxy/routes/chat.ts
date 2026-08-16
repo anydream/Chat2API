@@ -152,7 +152,11 @@ function streamFailureCode(error: Error | undefined): string | undefined {
   return typeof code === 'string' && code.trim() ? code : undefined
 }
 
-function streamFailureAccountFault(error: Error | undefined): boolean | undefined {
+function streamFailureAccountFault(
+  error: Error | undefined,
+  status?: number,
+): boolean | undefined {
+  if (status === 499) return false
   const accountFault = (error as (Error & { accountFault?: unknown }) | undefined)?.accountFault
   return typeof accountFault === 'boolean' ? accountFault : undefined
 }
@@ -170,7 +174,11 @@ function streamFailureRetryable(error: Error | undefined): boolean | undefined {
   return typeof retryable === 'boolean' ? retryable : undefined
 }
 
-function streamFailureRetryScope(error: Error | undefined): 'next-account' | undefined {
+function streamFailureRetryScope(
+  error: Error | undefined,
+  status?: number,
+): 'next-account' | undefined {
+  if (status === 499) return undefined
   const retryScope = (error as (Error & { retryScope?: unknown }) | undefined)?.retryScope
   return retryScope === 'next-account' ? retryScope : undefined
 }
@@ -692,15 +700,18 @@ router.post('/completions', async (ctx: Context) => {
     const latency = Date.now() - startTime
 
     if (!result.success) {
+      const claimErrorCode = result.status === 499 ? undefined : result.errorCode
+      const claimAccountFault = result.status === 499 ? false : result.accountFault
+      const claimRetryScope = result.status === 499 ? undefined : result.retryScope
       finalizeFailedQwenAiToolCallClaim(
-        result.errorCode,
-        result.accountFault,
-        result.retryScope,
-        isQwenAiSessionStaleErrorCode(result.errorCode)
+        claimErrorCode,
+        claimAccountFault,
+        claimRetryScope,
+        isQwenAiSessionStaleErrorCode(claimErrorCode)
           ? 'session_stale'
-          : isQwenAiContinuationRejectedErrorCode(result.errorCode)
+          : isQwenAiContinuationRejectedErrorCode(claimErrorCode)
             ? 'continuation_rejected'
-            : result.accountFault === true && result.retryScope === 'next-account'
+            : claimAccountFault === true && claimRetryScope === 'next-account'
               ? 'account_failover_exhausted'
               : 'request_failed',
       )
@@ -912,10 +923,11 @@ router.post('/completions', async (ctx: Context) => {
         )
       }
       const finalizeFailedQwenAiToolCallBinding = (error: Error | undefined) => {
+        const status = streamFailureStatus(error, context.signal?.aborted)
         finalizeFailedQwenAiToolCallClaim(
-          streamFailureCode(error),
-          streamFailureAccountFault(error),
-          streamFailureRetryScope(error),
+          status === 499 ? undefined : streamFailureCode(error),
+          streamFailureAccountFault(error, status),
+          streamFailureRetryScope(error, status),
           'terminal_stream_failure',
         )
       }
@@ -974,6 +986,7 @@ router.post('/completions', async (ctx: Context) => {
           context.signal?.aborted,
         )
         const failureCode = streamFailureCode(error)
+        const failureAccountFault = streamFailureAccountFault(error, failureStatus)
         const qwenAiFailure = QwenAiAdapter.isQwenAiProvider(completionProvider)
         if (qwenAiFailure) {
           qwenAiRequestGovernor.reportDeferredFailure(completionAccount.id, {
@@ -983,15 +996,19 @@ router.post('/completions', async (ctx: Context) => {
             error: error?.message || 'Unknown Qwen AI stream error',
             errorCode: failureCode,
             retryable: false,
-            accountFault: streamFailureAccountFault(error),
+            accountFault: failureAccountFault,
           }, requestIntent.intent)
         }
         proxyStatusManager.recordRequestFailure(completionLatency)
         const shouldPenalizeStreamAccount = failureStatus !== 499 && (
           !qwenAiFailure
-            ? streamFailureAccountFault(error) !== false
+            ? failureAccountFault !== false
             : isQwenAiAccountFault({
-                accountFault: streamFailureAccountFault(error),
+                accountFault: failureAccountFault,
+                status: failureStatus,
+                code: failureCode,
+                errorCode: failureCode,
+                message: error?.message,
               })
         )
         if (shouldPenalizeStreamAccount) {
@@ -1092,9 +1109,9 @@ router.post('/completions', async (ctx: Context) => {
                 ? (qwenAiStream ? { retryable: false } : {})
                 : { retryable }),
               ...(errorParam === undefined ? {} : { param: errorParam }),
-              ...(streamFailureAccountFault(err) === undefined
+              ...(streamFailureAccountFault(err, status) === undefined
                 ? {}
-                : { accountFault: streamFailureAccountFault(err) }),
+                : { accountFault: streamFailureAccountFault(err, status) }),
             },
           })}\n\n`)
           if (qwenAiStream) wrapperStream.write('data: [DONE]\n\n')
@@ -1252,12 +1269,6 @@ router.post('/completions', async (ctx: Context) => {
     }
   } catch (error) {
     const caughtError = error instanceof Error ? error : undefined
-    finalizeFailedQwenAiToolCallClaim(
-      streamFailureCode(caughtError),
-      streamFailureAccountFault(caughtError),
-      streamFailureRetryScope(caughtError),
-      'request_exception',
-    )
     const latency = Date.now() - startTime
     proxyStatusManager.recordRequestFailure(latency)
 
@@ -1265,6 +1276,12 @@ router.post('/completions', async (ctx: Context) => {
     const errorStack = error instanceof Error ? error.stack : undefined
     const clientCancelled = context.signal?.aborted || isClientCancellationError(error)
     const errorStatus = clientCancelled ? 499 : 500
+    finalizeFailedQwenAiToolCallClaim(
+      errorStatus === 499 ? undefined : streamFailureCode(caughtError),
+      streamFailureAccountFault(caughtError, errorStatus),
+      streamFailureRetryScope(caughtError, errorStatus),
+      'request_exception',
+    )
 
     ctx.status = errorStatus
     ctx.body = {

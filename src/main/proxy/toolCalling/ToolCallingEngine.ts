@@ -58,8 +58,8 @@ const ACTIVE_USER_REQUEST_CONTINUATION_PROMPT = [
 ]
 
 const FAILED_TOOL_RESULT_CONTINUATION_PROMPT = [
-  'A previous tool result reported failure, so that operation is not complete.',
-  'Retry it with an appropriate declared tool or use another declared tool to complete and verify the operation.',
+  'A previous tool result reported failure.',
+  'Retry with an appropriate declared tool only when another attempt can make progress; otherwise explain the blocking failure clearly in the final answer instead of repeating the same operation.',
 ].join(' ')
 
 const MISSING_COMPLETION_PROOF_CONTINUATION_PROMPT = [
@@ -83,7 +83,7 @@ export function createToolWorkflowContinuationMessage(options: {
     | 'failedToolResultPending'
   >
 } = {}): ChatMessage {
-  const recoveryPrompt = (options.failedToolResultPending || options.requireManagedToolCall) && options.plan
+  const recoveryPrompt = options.requireManagedToolCall && options.plan
     ? getToolProtocol(options.plan.protocol).renderRecoveryPrompt?.(options.plan.tools)
     : undefined
   const completionPrompt = options.plan && requiresManagedWorkflowCompletionMarker(options.plan)

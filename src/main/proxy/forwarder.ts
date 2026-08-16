@@ -29,7 +29,9 @@ import {
   QwenAiAdapter,
   QwenAiStreamHandler,
   findModelCapability as findQwenAiModelCapability,
+  isQwenAiStaleSessionError,
   isQwenAiUpstreamBusyMessage,
+  isQwenAiTransientTransportError,
   qwenAiRequestTimeoutMsFromEnv,
   qwenAiResponsesContinuationRetryAttemptsFromEnv,
   type QwenAiOutputStream,
@@ -71,6 +73,8 @@ import {
 } from './qwenAiCompactionBoundary'
 import {
   isQwenAiAccountFault as classifyQwenAiAccountFault,
+  qwenAiAccountFailureDetails,
+  qwenAiSafeExplicitRetryScope,
   qwenAiAccountRetryScope,
 } from './qwenAiAccountPolicy'
 
@@ -92,44 +96,101 @@ function toThreeLevelReasoningEffort(
   return effort
 }
 
+type QwenAiErrorNode = { record: Record<string, unknown>; depth: number }
+
+function qwenAiErrorNodes(error: unknown): QwenAiErrorNode[] {
+  const nodes: QwenAiErrorNode[] = []
+  const visited = new Set<object>()
+  const visit = (value: unknown, depth: number): void => {
+    if (!value || typeof value !== 'object' || depth > 8) return
+    if (Array.isArray(value)) {
+      value.slice(0, 16).forEach(item => visit(item, depth + 1))
+      return
+    }
+    const record = value as Record<string, unknown>
+    if (visited.has(record) || nodes.length >= 128) return
+    visited.add(record)
+    nodes.push({ record, depth })
+    for (const key of [
+      'cause',
+      'original_exception',
+      'originalException',
+      'originalError',
+      'response',
+      'data',
+      'error',
+      'errors',
+      'detail',
+      'details',
+      'body',
+      'args',
+    ]) {
+      visit(record[key], depth + 1)
+    }
+  }
+  visit(error, 0)
+  return nodes
+}
+
 function statusFromError(error: unknown): number | undefined {
-  const errorRecord = error as {
-    status?: unknown
-    statusCode?: unknown
-    response?: { status?: unknown }
-  }
-  const maybeStatus = errorRecord?.status
-  if (typeof maybeStatus === 'number') {
-    return maybeStatus
-  }
-
-  const maybeStatusCode = errorRecord?.statusCode
-  if (typeof maybeStatusCode === 'number') {
-    return maybeStatusCode
-  }
-
-  const responseStatus = errorRecord?.response?.status
-  if (typeof responseStatus === 'number') {
-    return responseStatus
-  }
-
-  const errorLike = error as { message?: unknown }
-  const message = typeof errorLike?.message === 'string' ? errorLike.message : ''
-
   if (isClientCancellationError(error)) {
     return 499
   }
 
+  const nodes = qwenAiErrorNodes(error)
+  const candidates = nodes.flatMap(({ record, depth }) => [
+    record.status,
+    record.statusCode,
+    record.status_code,
+    record.httpStatus,
+    record.http_status,
+  ].map(value => {
+    const status = qwenAiErrorNumber(value)
+    return status === undefined ? undefined : { status, depth }
+  }).filter((candidate): candidate is { status: number; depth: number } => candidate !== undefined))
+  if (candidates.length > 0) {
+    // LiteLLM's MidStreamFallbackError frequently carries a synthetic 503 on
+    // the outer object and the real provider status below original_exception
+    // or response.data. Prefer the deepest client status, then the deepest
+    // upstream status, so the bridge can preserve account-bound 4xx errors.
+    const clientStatuses = candidates.filter(candidate => candidate.status >= 400 && candidate.status < 500)
+    const pool = clientStatuses.length > 0 ? clientStatuses : candidates
+    return pool
+      .slice()
+      .sort((left, right) => right.depth - left.depth)
+      .at(0)?.status
+  }
+
+  const message = nodes
+    .map(({ record }) => record.message)
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    || (error instanceof Error ? error.message : '')
+
   if (/timed out|timeout|idle for more than/i.test(message)) {
     return 504
+  }
+
+  if (isQwenAiTransientTransportError(error)) {
+    return 502
   }
 
   return undefined
 }
 
 function headersFromError(error: unknown): Record<string, string> | undefined {
-  const headers = (error as { headers?: unknown })?.headers
-  return sanitizeForwardedErrorHeaders(headers)
+  const records = qwenAiErrorNodes(error).map(node => node.record)
+  for (const record of records.slice().reverse()) {
+    const headers = sanitizeForwardedErrorHeaders(record.headers)
+    if (headers) return headers
+    const response = record.response
+    if (response && typeof response === 'object') {
+      const responseHeaders = sanitizeForwardedErrorHeaders(
+        (response as Record<string, unknown>).headers,
+      )
+      if (responseHeaders) return responseHeaders
+    }
+  }
+  return undefined
 }
 
 function hasRetryAfterHeader(headers?: Record<string, string>): boolean {
@@ -152,29 +213,6 @@ function isQwenAiUpstreamBusyResult(result: ForwardResult): boolean {
   return !result.success
     && result.errorCode === 'qwen_ai_upstream_busy'
     && result.accountFault === false
-}
-
-/**
- * A retained Qwen conversation belongs to the account that created it. A
- * missing chat or parent is therefore conversation state loss, rather than a
- * credential/risk-control signal from that account. Qwen reports this as
- * not-found/conflict, and some endpoints use a structured invalid
- * chat/parent 400. Restrict that 400 match to the explicit reference field so
- * an ordinary malformed tool result is not replayed as a fresh chat.
- */
-function isQwenAiStaleSessionError(error: unknown): boolean {
-  const status = statusFromError(error)
-  if (status === 404 || status === 409) return true
-  if (status !== 400) return false
-
-  // Qwen has returned invalid parent/chat references as 400 from some web
-  // endpoints. Do not infer this from arbitrary message text: a tool payload
-  // error may mention a chat while still being a client-side validation error.
-  const record = error as { param?: unknown }
-  const param = typeof record?.param === 'string'
-    ? record.param.toLowerCase().replace(/[^a-z0-9]/g, '')
-    : ''
-  return param === 'chatid' || param === 'conversationid' || param === 'parentid'
 }
 
 function qwenAiToolCallIdsFromChatResponse(response: unknown): string[] {
@@ -223,8 +261,88 @@ function qwenAiUpstreamBusyRetryDelayMs(
 }
 
 function errorCodeFromError(error: unknown): string | undefined {
-  const code = (error as { code?: unknown })?.code
-  return typeof code === 'string' && code.trim() ? code : undefined
+  const candidates = qwenAiErrorNodes(error).flatMap(({ record, depth }) => [
+    record.errorCode,
+    record.error_code,
+    record.code,
+  ].map(value => (
+    typeof value === 'string' && value.trim()
+      ? { code: value.trim(), depth }
+      : undefined
+  )).filter((candidate): candidate is { code: string; depth: number } => candidate !== undefined))
+  return candidates
+    .slice()
+    .sort((left, right) => right.depth - left.depth)
+    .at(0)?.code
+}
+
+function qwenAiErrorRecords(error: unknown): Array<Record<string, unknown>> {
+  return qwenAiErrorNodes(error).map(node => node.record)
+}
+
+function qwenAiErrorNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 400 && value <= 599) return value
+  if (typeof value === 'string' && /^\d{3}$/.test(value.trim())) {
+    const parsed = Number(value.trim())
+    return parsed >= 400 && parsed <= 599 ? parsed : undefined
+  }
+  return undefined
+}
+
+function qwenAiErrorMessage(error: unknown): string {
+  const generic = /^(?:litellm\.)?midstreamfallbackerror|response api in-stream error$/i
+  const candidates = qwenAiErrorNodes(error)
+    .map(({ record, depth }) => {
+      const message = typeof record.message === 'string' ? record.message.trim() : ''
+      return message ? { message, depth } : undefined
+    })
+    .filter((candidate): candidate is { message: string; depth: number } => candidate !== undefined)
+    .filter(candidate => !generic.test(candidate.message))
+  return candidates
+    .sort((left, right) => right.depth - left.depth)
+    .at(0)?.message
+    || (error instanceof Error ? error.message : 'Unknown error')
+}
+
+function qwenAiCompactionFailureFromError(
+  error: unknown,
+  latency: number,
+  statusOverride?: number,
+): ForwardResult {
+  const records = qwenAiErrorRecords(error)
+  const status = statusOverride ?? statusFromError(error)
+  const clientCancelled = status === 499
+  const errorCode = errorCodeFromError(error)
+  const accountDetails = qwenAiAccountFailureDetails({
+    ...(error && typeof error === 'object' ? error as Record<string, unknown> : {}),
+    status,
+    code: errorCode,
+    errorCode,
+    message: qwenAiErrorMessage(error),
+  })
+  const accountFault = clientCancelled ? false : accountDetails.accountFault
+  const retryScope = clientCancelled
+    ? undefined
+    : accountDetails.retryScope
+      || qwenAiSafeExplicitRetryScope(
+        error && typeof error === 'object' ? error as Record<string, unknown> : undefined,
+      )
+  const message = qwenAiErrorMessage(error) || 'Unknown compaction attempt error'
+  const headerSource = headersFromError(error)
+
+  return {
+    success: false,
+    status: status ?? 502,
+    headers: headerSource,
+    error: message,
+    errorCode,
+    retryable: records
+      .map(record => record.retryable)
+      .find((value): value is boolean => typeof value === 'boolean') ?? false,
+    accountFault,
+    retryScope,
+    latency,
+  }
 }
 
 function qwenAiSseErrorFromPayload(payload: unknown, eventName: string): Error | undefined {
@@ -237,11 +355,9 @@ function qwenAiSseErrorFromPayload(payload: unknown, eventName: string): Error |
   const detail = errorValue && typeof errorValue === 'object'
     ? errorValue as Record<string, unknown>
     : envelope
-  const message = typeof detail?.message === 'string'
-    ? detail.message
-    : typeof errorValue === 'string'
-      ? errorValue
-      : 'Qwen AI returned an error event before producing output'
+  const message = qwenAiErrorMessage(payload)
+    || (typeof errorValue === 'string' ? errorValue : '')
+    || 'Qwen AI returned an error event before producing output'
   const error = new Error(message) as Error & {
     status?: number
     code?: string
@@ -252,26 +368,18 @@ function qwenAiSseErrorFromPayload(payload: unknown, eventName: string): Error |
     accountFault?: boolean
     retryScope?: 'next-account'
   }
-  const status = Number(detail?.status ?? envelope?.status)
-  if (Number.isInteger(status) && status >= 400 && status <= 599) error.status = status
-  if (typeof detail?.code === 'string') error.code = detail.code
+  const accountDetails = qwenAiAccountFailureDetails(
+    envelope as Record<string, unknown> | undefined,
+  )
+  if (accountDetails.status !== undefined) error.status = accountDetails.status
+  if (accountDetails.code) error.code = accountDetails.code
+  else if (typeof detail?.code === 'string') error.code = detail.code
   else if (typeof detail?.errorCode === 'string') error.code = detail.errorCode
   if (typeof detail?.type === 'string') error.type = detail.type
   if (typeof detail?.param === 'string') error.param = detail.param
   if (typeof detail?.retryable === 'boolean') error.retryable = detail.retryable
-  if (typeof detail?.accountFault === 'boolean') error.accountFault = detail.accountFault
-  const classification = {
-    status: error.status,
-    code: error.code,
-    param: error.param,
-    accountFault: error.accountFault,
-  }
-  if (error.accountFault !== false && isQwenAiAccountFault(classification)) {
-    error.accountFault = true
-  }
-  if (detail?.retryScope === 'next-account' || qwenAiAccountRetryScope(classification) === 'next-account') {
-    error.retryScope = 'next-account'
-  }
+  if (accountDetails.accountFault !== undefined) error.accountFault = accountDetails.accountFault
+  if (accountDetails.retryScope === 'next-account') error.retryScope = accountDetails.retryScope
   return error
 }
 
@@ -1387,15 +1495,15 @@ export class RequestForwarder {
         // congestion, transport failures, and conversation-state errors stay
         // account-neutral.
         const result = !rawResult.success && isQwenAiProvider
-          ? {
-              ...rawResult,
-              accountFault: rawResult.accountFault === false
-                ? false
-                : isQwenAiAccountFault(rawResult)
-                  ? true
-                  : rawResult.accountFault,
-              retryScope: rawResult.retryScope ?? qwenAiAccountRetryScope(rawResult),
-            }
+          ? (() => {
+              const accountDetails = qwenAiAccountFailureDetails(rawResult)
+              return {
+                ...rawResult,
+                accountFault: accountDetails.accountFault,
+                retryScope: accountDetails.retryScope
+                  || qwenAiSafeExplicitRetryScope(rawResult),
+              }
+            })()
           : rawResult
 
         if (result.success) {
@@ -1410,6 +1518,13 @@ export class RequestForwarder {
         lastAccountFault = result.accountFault
         lastRetryScope = result.retryScope
         previousRecoveryHint = result.recoveryHint
+
+        const canRetryTransport = isQwenAiProvider
+          && isQwenAiTransientTransportError({
+            code: result.errorCode,
+            message: result.error,
+            status: result.status,
+          })
 
         if (context.signal?.aborted) {
           lastAccountFault = undefined
@@ -1442,6 +1557,7 @@ export class RequestForwarder {
         if (
           defaultManagedToolRecoveryOnly
           && result.recoveryHint !== 'managed_tool_stream_validation'
+          && !canRetryTransport
         ) {
           break
         }
@@ -1459,28 +1575,36 @@ export class RequestForwarder {
         lastStatus = statusFromError(error)
         lastHeaders = headersFromError(error)
         lastErrorCode = errorCodeFromError(error)
-        const errorAccountFault = (error as { accountFault?: unknown })?.accountFault
         const errorClassification = {
           ...(error && typeof error === 'object' ? error as Record<string, unknown> : {}),
           status: lastStatus,
           errorCode: lastErrorCode,
         }
-        lastAccountFault = typeof errorAccountFault === 'boolean'
-          ? errorAccountFault
-          : isQwenAiProvider && isQwenAiAccountFault(errorClassification)
-            ? true
-            : undefined
-        const errorRetryScope = (error as { retryScope?: unknown })?.retryScope
-        lastRetryScope = errorRetryScope === 'next-account'
-          ? errorRetryScope
-          : isQwenAiProvider
-            ? qwenAiAccountRetryScope(errorClassification)
+        const normalizedErrorDetails = isQwenAiProvider
+          ? qwenAiAccountFailureDetails(errorClassification)
+          : {}
+        lastAccountFault = isQwenAiProvider
+          ? normalizedErrorDetails.accountFault
+          : (errorClassification.accountFault === false
+            ? false
+            : typeof errorClassification.accountFault === 'boolean'
+              ? errorClassification.accountFault
+              : undefined)
+        lastRetryScope = isQwenAiProvider
+          ? normalizedErrorDetails.retryScope
+            || qwenAiSafeExplicitRetryScope(errorClassification)
+          : errorClassification.retryScope === 'next-account'
+            ? 'next-account'
             : undefined
         const errorRetryable = (error as { retryable?: unknown })?.retryable
+        const transientTransportFailure = isQwenAiProvider
+          && isQwenAiTransientTransportError(error)
         lastRetryable = lastStatus === 499
           || (isQwenAiProvider && lastStatus === 504)
           || errorCodeFromError(error) === 'qwen_ai_risk_control'
           ? false
+          : transientTransportFailure
+            ? true
           : typeof errorRetryable === 'boolean'
             ? errorRetryable
             : undefined
@@ -2710,20 +2834,11 @@ export class RequestForwarder {
             candidate.selection,
             candidate.attempt,
             waveBypassesGlobalInterval,
-          ).catch(error => ({
-            success: false,
-            status: context?.signal?.aborted ? 499 : statusFromError(error) || 502,
-            headers: headersFromError(error),
-            error: error instanceof Error ? error.message : 'Unknown compaction attempt error',
-            errorCode: errorCodeFromError(error),
-            retryable: false,
-            accountFault: isQwenAiAccountFault(error as { accountFault?: unknown })
-              ? true
-              : (error as { accountFault?: unknown })?.accountFault === false
-                ? false
-                : undefined,
-            latency: Date.now() - generationStartedAt,
-          }))),
+          ).catch(error => qwenAiCompactionFailureFromError(
+            error,
+            Date.now() - generationStartedAt,
+            context?.signal?.aborted ? 499 : undefined,
+          ))),
         )
         let terminalFailure: ForwardResult | undefined
         for (let index = 0; index < wave.length; index += 1) {
@@ -2960,20 +3075,11 @@ export class RequestForwarder {
               }
               summaries[stageIndex] = generated.summary
             } catch (error) {
-              stopPipeline({
-                success: false,
-                status: statusFromError(error) || 502,
-                headers: headersFromError(error),
-                error: error instanceof Error ? error.message : 'Unknown compaction stage error',
-                errorCode: errorCodeFromError(error),
-                retryable: false,
-                accountFault: isQwenAiAccountFault(error as { accountFault?: unknown })
-                  ? true
-                  : (error as { accountFault?: unknown })?.accountFault === false
-                    ? false
-                    : undefined,
-                latency: elapsed(),
-              })
+              stopPipeline(qwenAiCompactionFailureFromError(
+                error,
+                elapsed(),
+                context?.signal?.aborted ? 499 : undefined,
+              ))
             }
           })().finally(() => {
             running.delete(stageIndex)
@@ -3302,21 +3408,42 @@ export class RequestForwarder {
         const errorMessage = this.extractErrorMessage(response)
         const errorCode = isQwenRiskControlText(errorMessage) ? 'qwen_ai_risk_control' : undefined
         const continuationRejected = canContinueResponsesSession && response.status === 400
+        // Compaction calls this method directly from its per-account runner,
+        // so they do not pass through the outer forwardChatCompletion()
+        // normalization layer. Infer the account boundary here as well when
+        // an adapter returns an HTTP error response instead of throwing.
+        const responseEnvelope = {
+          status: response.status,
+          data: response.data,
+        }
+        const responseCode = errorCode || errorCodeFromError(responseEnvelope)
+        const responseClassification = {
+          status: response.status,
+          code: responseCode,
+          errorCode: responseCode,
+          message: errorMessage,
+          data: response.data,
+        }
+        const responseDetails = qwenAiAccountFailureDetails(responseClassification)
+        const responseStatus = responseDetails.status ?? response.status
+        const inferredAccountFault = responseDetails.accountFault
+        const inferredRetryScope = responseDetails.retryScope
         cleanupChat(chatId)
         return {
           success: false,
-          status: response.status,
+          status: responseStatus,
           headers: sanitizeForwardedErrorHeaders(response.headers),
           error: errorMessage || `HTTP ${response.status}`,
-          errorCode: continuationRejected ? 'qwen_ai_continuation_rejected' : errorCode,
-          retryable: response.status === 403
-            || response.status === 429
-            || response.status === 499
-            || response.status === 504
+          errorCode: continuationRejected ? 'qwen_ai_continuation_rejected' : responseCode,
+          retryable: responseStatus === 403
+            || responseStatus === 429
+            || responseStatus === 499
+            || responseStatus === 504
             || errorCode === 'qwen_ai_risk_control'
             ? false
             : undefined,
-          accountFault: continuationRejected ? false : undefined,
+          accountFault: continuationRejected ? false : inferredAccountFault,
+          retryScope: continuationRejected ? undefined : inferredRetryScope,
           latency,
         }
       }
@@ -3349,6 +3476,23 @@ export class RequestForwarder {
         && transformed.plan.shouldParseResponse
         && qwenAiBufferManagedStreamsFromEnv()
       const canRestartEndedResponse = providerRequest.stream !== true || bufferManagedStream
+      const restartQwenAiStaleSession = async (
+        _recoveryError: Error,
+        recoverySignal?: AbortSignal,
+      ) => {
+        const currentChatId = activeChatId || chatId
+        const restarted = await adapter.chatCompletion({
+          ...createChatCompletionRequest(
+            transformed.messages as ChatCompletionRequest['messages'],
+          ),
+          signal: recoverySignal || context?.signal,
+        })
+        activeChatId = restarted.chatId
+        activeChatIsRetained = false
+        handler.setChatId(restarted.chatId)
+        cleanupChat(currentChatId)
+        return restarted.response
+      }
       const resumableResponseStream = createQwenAiResumableStream(response.data, {
         signal: context?.signal,
         workflowRecoveryDeadlineAt,
@@ -3362,23 +3506,14 @@ export class RequestForwarder {
         ),
         ...(canRestartEndedResponse
           ? {
-              restartFreshChat: async (_recoveryError: Error, recoverySignal?: AbortSignal) => {
-                const currentChatId = activeChatId || chatId
-                const restarted = await adapter.chatCompletion({
-                  ...createChatCompletionRequest(
-                    transformed.messages as ChatCompletionRequest['messages'],
-                  ),
-                  signal: recoverySignal || context?.signal,
-                })
-                activeChatId = restarted.chatId
-                activeChatIsRetained = false
-                handler.setChatId(restarted.chatId)
-                cleanupChat(currentChatId)
-                return restarted.response
-              },
+              restartFreshChat: restartQwenAiStaleSession,
               onFreshChatRestart: () => handler.prepareForWorkflowContinuation(),
             }
           : {}),
+        // A retained Qwen chat can disappear while a live stream is still
+        // private. This recovery is independently gated by the stream
+        // handler's visible-output check and the bridge's shared budget.
+        restartStaleSession: restartQwenAiStaleSession,
         ...(canContinueManagedWorkflow
           ? {
               continueWorkflow: async (
@@ -3389,8 +3524,7 @@ export class RequestForwarder {
                 const currentChatId = activeChatId || chatId
 
                 const recoveryCode = errorCodeFromError(recoveryError)
-                const requireManagedToolCall = transformed.plan.failedToolResultPending
-                  || transformed.plan.toolChoiceMode === 'required'
+                const requireManagedToolCall = transformed.plan.toolChoiceMode === 'required'
                   || transformed.plan.toolChoiceMode === 'forced'
                   || recoveryCode === 'qwen_ai_wrapper_leak'
                   || recoveryCode === 'qwen_ai_invalid_tool_arguments'
@@ -3602,6 +3736,7 @@ export class RequestForwarder {
       }
       let latency = Date.now() - startTime
       const status = context?.signal?.aborted ? 499 : statusFromError(error)
+      const clientCancelled = status === 499
       const recoveryHint = error instanceof BufferedSseError && (
         error.type === 'tool_call_parse_error'
         || error.code === 'qwen_ai_stream_incomplete'
@@ -3628,7 +3763,22 @@ export class RequestForwarder {
       )
       const upstreamRetryable = (error as { retryable?: unknown })?.retryable
       const upstreamAccountFault = (error as { accountFault?: unknown })?.accountFault
-      const upstreamRetryScope = (error as { retryScope?: unknown })?.retryScope
+      // Compaction invokes forwardQwenAi() directly, so an Axios/SSE wrapper
+      // that strips the adapter's derived flags must still retain the narrow
+      // account boundary classification here. Neutral stale-session and
+      // continuation errors are explicitly excluded by the policy helper.
+      const errorClassification = {
+        ...(error && typeof error === 'object' ? error as Record<string, unknown> : {}),
+        status,
+        code: upstreamErrorCode,
+        errorCode,
+        message: error instanceof Error ? error.message : undefined,
+        accountFault: upstreamAccountFault,
+      }
+      const normalizedErrorDetails = qwenAiAccountFailureDetails(errorClassification)
+      const inferredErrorAccountFault = normalizedErrorDetails.accountFault
+      const inferredErrorRetryScope = normalizedErrorDetails.retryScope
+        || qwenAiSafeExplicitRetryScope(errorClassification)
       const retryable = status === 499
         || status === 403
         || status === 429
@@ -3646,16 +3796,16 @@ export class RequestForwarder {
         latency,
         retryable,
         errorCode,
-        accountFault: sessionStateFailure || continuationRejected
+        accountFault: clientCancelled || sessionStateFailure || continuationRejected
           ? false
           : usedResponsesSessionContinuation
             ? continuationAccountFailover
-          : typeof upstreamAccountFault === 'boolean' ? upstreamAccountFault : undefined,
-        retryScope: sessionStateFailure || continuationRejected
+            : inferredErrorAccountFault,
+        retryScope: clientCancelled || sessionStateFailure || continuationRejected
           ? undefined
           : usedResponsesSessionContinuation
             ? continuationAccountFailover ? 'next-account' : undefined
-          : upstreamRetryScope === 'next-account' ? upstreamRetryScope : undefined,
+          : inferredErrorRetryScope,
         recoveryHint,
       }
     }

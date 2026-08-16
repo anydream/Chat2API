@@ -192,6 +192,8 @@ type QwenAiResumableStreamOptions = {
    * request after Qwen declares the current response id permanently ended.
    */
   restartFreshChat?: (recoveryError: Error, signal?: AbortSignal) => Promise<any>
+  /** Same-account full replay specifically for a retained chat that vanished. */
+  restartStaleSession?: (recoveryError: Error, signal?: AbortSignal) => Promise<any>
   /** Reset provider/parser state before a fresh workflow stream is attached. */
   onWorkflowContinuation?: () => void
   /** Reset provider/parser state before a same-account fresh chat is attached. */
@@ -552,26 +554,50 @@ function destroyReadableStream(stream: any, error?: Error): void {
   }
 }
 
-function isResumableQwenAiTransportError(error: unknown): boolean {
+/**
+ * Identify transient transport failures without treating provider responses
+ * (401/403/429/5xx) as transport failures. This is deliberately protocol
+ * neutral so the same classification can be used before a stream exists and
+ * while an accepted stream is being resumed.
+ */
+export function isQwenAiTransientTransportError(error: unknown): boolean {
   if (!error || isClientCancellationError(error)) return false
 
-  const candidate = error as {
-    status?: unknown
-    code?: unknown
-    name?: unknown
-    message?: unknown
+  const queue: unknown[] = [error]
+  const visited = new Set<object>()
+  const evidence: string[] = []
+
+  while (queue.length > 0 && visited.size < 32) {
+    const value = queue.shift()
+    if (!value || typeof value !== 'object') {
+      if (typeof value === 'string') evidence.push(value)
+      continue
+    }
+
+    const record = value as Record<string, unknown>
+    if (visited.has(record)) continue
+    visited.add(record)
+
+    const status = record.status ?? record.statusCode ?? record.status_code
+    if (typeof status === 'number' && status >= 400) return false
+    if (typeof status === 'string' && /^\d{3}$/.test(status) && Number(status) >= 400) return false
+
+    for (const field of ['code', 'errorCode', 'error_code', 'name', 'message']) {
+      const candidate = record[field]
+      if (typeof candidate === 'string') evidence.push(candidate)
+    }
+    for (const field of ['cause', 'original_exception', 'originalException', 'originalError']) {
+      if (record[field] !== undefined) queue.push(record[field])
+    }
   }
-  if (typeof candidate.status === 'number' && candidate.status >= 400) return false
 
-  const code = typeof candidate.code === 'string' ? candidate.code : ''
-  const name = typeof candidate.name === 'string' ? candidate.name : ''
-  const message = typeof candidate.message === 'string'
-    ? candidate.message
-    : String(error)
-
-  return /ECONNRESET|ECONNABORTED|ERR_STREAM_PREMATURE_CLOSE|ERR_NETWORK|ERR_SOCKET|socket hang up|premature close|network error/i.test(
-    `${name} ${code} ${message}`,
+  return /EAI_AGAIN|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|ECONNREFUSED|ECONNRESET|ECONNABORTED|ERR_STREAM_PREMATURE_CLOSE|ERR_NETWORK|ERR_SOCKET|socket hang up|premature close|network error/i.test(
+    evidence.join(' '),
   )
+}
+
+function isResumableQwenAiTransportError(error: unknown): boolean {
+  return isQwenAiTransientTransportError(error)
 }
 
 /**
@@ -609,6 +635,7 @@ export function createQwenAiResumableStream(
   let workflowContinuationAttempts = 0
   let freshChatRestartAttempts = 0
   let transientFreshChatRecoveryEligible = false
+  let staleSessionRecoveryEligible = false
   let settled = false
   let settledError: Error | undefined
   const configuredRecoveryBudgetMs = options.recoveryBudgetMs ?? qwenAiRecoveryBudgetMsFromEnv()
@@ -923,6 +950,7 @@ export function createQwenAiResumableStream(
     let semanticRecoveryEligible = isQwenAiSemanticRecoveryError(initialError)
     let responseEndedRecoveryEligible = isQwenAiResponseEndedError(initialError)
     transientFreshChatRecoveryEligible = isQwenAiUpstreamBusyError(initialError)
+    staleSessionRecoveryEligible = isQwenAiStaleSessionError(initialError)
     if (responseEndedRecoveryEligible) {
       lastError = markQwenAiResponseEnded(normalizeQwenAiStreamFailure(lastError))
     }
@@ -959,12 +987,15 @@ export function createQwenAiResumableStream(
     // continuation is available, go straight to that new user turn. Keep the
     // response-id loop for transport/idle recovery and for callers that do
     // not provide a workflow continuation callback.
-    const useWorkflowContinuation = semanticRecoveryEligible && Boolean(options.continueWorkflow)
+    const useWorkflowContinuation = semanticRecoveryEligible
+      && !staleSessionRecoveryEligible
+      && Boolean(options.continueWorkflow)
     while (
       !settled
       && attempts < maxAttempts
       && !useWorkflowContinuation
       && !responseEndedRecoveryEligible
+      && !staleSessionRecoveryEligible
     ) {
       ensureRecoveryBudget()
       if (checkComplete()) {
@@ -1067,6 +1098,10 @@ export function createQwenAiResumableStream(
           responseEndedRecoveryEligible = true
           break
         }
+        if (isQwenAiStaleSessionError(lastError)) {
+          staleSessionRecoveryEligible = true
+          break
+        }
         if (isQwenAiUpstreamBusyError(lastError)) {
           transientFreshChatRecoveryEligible = true
         }
@@ -1086,11 +1121,19 @@ export function createQwenAiResumableStream(
     // permanently closed. Repeating the GET can never make progress. While
     // the managed response is still private, replay the complete request once
     // in a new chat on the same credential instead.
-    if (!settled && (responseEndedRecoveryEligible || transientFreshChatRecoveryEligible)) {
-      const endedError = responseEndedRecoveryEligible
-        ? markQwenAiResponseEnded(normalizeQwenAiStreamFailure(lastError))
-        : normalizeQwenAiStreamFailure(lastError)
-      const restartFreshChat = options.restartFreshChat
+    if (!settled && (
+      responseEndedRecoveryEligible
+      || transientFreshChatRecoveryEligible
+      || staleSessionRecoveryEligible
+    )) {
+      const endedError = staleSessionRecoveryEligible
+        ? markQwenAiStaleSessionError(normalizeQwenAiStreamFailure(lastError))
+        : responseEndedRecoveryEligible
+          ? markQwenAiResponseEnded(normalizeQwenAiStreamFailure(lastError))
+          : normalizeQwenAiStreamFailure(lastError)
+      const restartFreshChat = staleSessionRecoveryEligible
+        ? (options.restartStaleSession || options.restartFreshChat)
+        : options.restartFreshChat
       if (!restartFreshChat) {
         failRecovery(endedError)
       }
@@ -1901,6 +1944,128 @@ function markQwenAiResponseEnded(error: QwenAiUpstreamError): QwenAiUpstreamErro
   return error
 }
 
+/**
+ * Qwen occasionally loses a retained web chat while the credential remains
+ * healthy.  The provider has returned this state as a structured
+ * CHAT_NOT_FOUND code, as a human-readable message, and as 400/422 validation
+ * responses.  Keep the classifier conservative: only explicit chat/session
+ * references are considered stale so ordinary tool/schema validation errors
+ * do not trigger a full replay.
+ */
+function qwenAiErrorText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value === undefined || value === null) return ''
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function qwenAiErrorStatus(error: unknown): number | undefined {
+  if (!isObjectValue(error)) return undefined
+  const record = error as Record<string, unknown>
+  const response = isObjectValue(record.response) ? record.response : undefined
+  const candidates = [record.status, record.statusCode, record.httpStatus, response?.status]
+  for (const candidate of candidates) {
+    const status = typeof candidate === 'number'
+      ? candidate
+      : typeof candidate === 'string' && /^\d{3}$/.test(candidate.trim())
+        ? Number(candidate)
+        : undefined
+    if (status !== undefined && status >= 400 && status <= 599) return status
+  }
+  return undefined
+}
+
+function qwenAiErrorCodeValues(error: unknown): string[] {
+  const values: string[] = []
+  const visited = new Set<object>()
+  const visit = (value: unknown, depth: number) => {
+    if (depth > 5 || value === undefined || value === null) return
+    if (typeof value === 'string') {
+      values.push(value)
+      return
+    }
+    if (!isObjectValue(value) || visited.has(value)) return
+    visited.add(value)
+    const record = value as Record<string, unknown>
+    for (const key of ['code', 'errorCode', 'error_code', 'type']) visit(record[key], depth + 1)
+    for (const key of ['error', 'errors', 'data', 'detail', 'response']) visit(record[key], depth + 1)
+  }
+  visit(error, 0)
+  return values
+}
+
+function normalizeQwenAiErrorToken(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+}
+
+export function isQwenAiStaleSessionError(error: unknown): boolean {
+  if (!error) return false
+  const status = qwenAiErrorStatus(error)
+  const record = isObjectValue(error) ? error as Record<string, unknown> : undefined
+  const param = typeof record?.param === 'string'
+    ? record.param.toLowerCase().replace(/[^a-z0-9]/g, '')
+    : ''
+  if ((status === 400 || status === 422) && (
+    param === 'chatid'
+    || param === 'conversationid'
+    || param === 'parentid'
+    || param === 'responseid'
+    || param === 'sessionid'
+  )) return true
+  const codeTokens = qwenAiErrorCodeValues(error).map(normalizeQwenAiErrorToken)
+  const explicitCode = codeTokens.some(code => (
+    code === 'qwen_ai_session_stale'
+    || code === 'chat_not_found'
+    || code === 'chat_notfound'
+    || code === 'conversation_not_found'
+    || code === 'conversation_notfound'
+    || code === 'parent_not_found'
+    || code === 'response_not_found'
+    || code === 'session_not_found'
+    || code === 'chat_missing'
+    || code === 'chat_expired'
+    || code === 'invalid_chat_id'
+    || code === 'invalid_chat'
+  ))
+  if (explicitCode) return true
+
+  // A bare 404/409 from the retained-chat endpoint has no useful body in
+  // some deployments.  Restrict this fallback to those session-oriented HTTP
+  // statuses; a generic 400/422 needs explicit reference evidence below.
+  if (status === 404 || status === 409) return true
+
+  const text = [
+    error instanceof Error ? error.message : '',
+    qwenAiErrorText(error),
+    ...qwenAiErrorCodeValues(error),
+  ].join(' ').toLowerCase()
+  const referencePattern = /(?:chat|conversation|parent|response|session)\s*(?:id|reference|branch)?\s*(?:[_-]?not\s*found|[_-]?missing|[_-]?expired|[_-]?invalid)|(?:chat|conversation|parent|response|session)[_-]?not[_-]?found/i
+  if (!referencePattern.test(text)) return false
+
+  return status === undefined
+    || status === 400
+    || status === 404
+    || status === 409
+    || status === 422
+    || status >= 500
+}
+
+function markQwenAiStaleSessionError(error: QwenAiUpstreamError): QwenAiUpstreamError {
+  if (!error.status || error.status < 400 || error.status > 599) error.status = 502
+  error.code = 'qwen_ai_session_stale'
+  error.retryable = false
+  error.accountFault = false
+  delete error.retryScope
+  return error
+}
+
 export function isQwenAiResponseEndedError(error: unknown): boolean {
   if (!error) return false
   const record = typeof error === 'object' ? error as Record<string, unknown> : undefined
@@ -2243,10 +2408,6 @@ function isDanglingManagedToolAnswer(
     return false
   }
 
-  if (plan.failedToolResultPending === true) {
-    return true
-  }
-
   return requiresManagedWorkflowCompletionMarker(plan)
     && !hasManagedWorkflowCompletionMarker(content, plan)
 }
@@ -2432,6 +2593,7 @@ function isQwenAiSemanticRecoveryError(error: unknown): boolean {
     || code === 'undeclared_native_tool_call'
     || code === 'malformed_tool_call'
     || code === 'missing_tool_call'
+    || isQwenAiStaleSessionError(error)
 }
 
 function createQwenAiToolValidationError(
@@ -2484,6 +2646,9 @@ function createQwenAiIncompleteNativeToolError(names: string[]): QwenAiUpstreamE
 function normalizeQwenAiStreamFailure(error: unknown): QwenAiUpstreamError {
   const source = error instanceof Error ? error : new Error(String(error))
   const sourceRecord = source as QwenAiUpstreamError
+  if (isQwenAiStaleSessionError(source)) {
+    return markQwenAiStaleSessionError(sourceRecord)
+  }
   const declaredStatus = typeof sourceRecord.status === 'number'
     && sourceRecord.status >= 400
     && sourceRecord.status <= 599
@@ -2763,6 +2928,9 @@ function createQwenAiStreamEnvelopeError(
       error.accountFault = false
       delete error.retryScope
     }
+    if (isQwenAiStaleSessionError(error)) {
+      return markQwenAiStaleSessionError(error)
+    }
     return error
   }
 
@@ -2835,6 +3003,12 @@ function createQwenAiStreamEnvelopeError(
     && isQwenAiRateLimitMessage(classificationEvidence)
   ))
   const isResponseEnded = isQwenAiResponseEndedError(classificationEvidence)
+  const isStaleSession = isQwenAiStaleSessionError({
+    status: explicitStatus,
+    code: envelopeMetadata.code,
+    message: classificationEvidence,
+    data: record,
+  })
 
   if (!isUpstreamBusy && !isRiskControl && !hasErrorSignal && !isRateLimited) return undefined
 
@@ -2868,6 +3042,9 @@ function createQwenAiStreamEnvelopeError(
     error.code = 'qwen_ai_capacity_limit'
   } else if (envelopeMetadata.code) {
     error.code = envelopeMetadata.code
+  }
+  if (isStaleSession) {
+    return markQwenAiStaleSessionError(error)
   }
   if (isResponseEnded) {
     // Same-account fresh-chat recovery owns this exact terminal response.
@@ -3398,6 +3575,9 @@ export class QwenAiAdapter {
     } else if (error.status >= 500) {
       error.accountFault = false
       delete error.retryScope
+    }
+    if (isQwenAiStaleSessionError(error)) {
+      return markQwenAiStaleSessionError(error)
     }
     return error
   }
@@ -5168,6 +5348,10 @@ export class QwenAiStreamHandler {
         failStream(error)
         return
       }
+      if (isQwenAiStaleSessionError(error) && visibleFrameCommitted) {
+        failStream(error)
+        return
+      }
 
       const recover = options.recoverFromSemanticEmpty ?? options.recoverFromIdle
       if (!recover) {
@@ -5721,7 +5905,10 @@ export class QwenAiStreamHandler {
           } catch (parseError) {
             const envelopeError = createQwenAiStreamEnvelopeError(event.data, event.data, event.event)
             if (envelopeError) {
-              if (bufferManagedBranch && isQwenAiResponseEndedError(envelopeError)) {
+              if (
+                isQwenAiStaleSessionError(envelopeError)
+                || (bufferManagedBranch && isQwenAiResponseEndedError(envelopeError))
+              ) {
                 recoverFromSemanticEmpty(envelopeError)
               } else if (envelopeError.status !== undefined && envelopeError.status >= 500) {
                 recoverFromTransientUpstreamFailure(envelopeError)
@@ -5734,7 +5921,10 @@ export class QwenAiStreamHandler {
           }
           const envelopeError = createQwenAiStreamEnvelopeError(data, event.data, event.event)
           if (envelopeError) {
-            if (bufferManagedBranch && isQwenAiResponseEndedError(envelopeError)) {
+            if (
+              isQwenAiStaleSessionError(envelopeError)
+              || (bufferManagedBranch && isQwenAiResponseEndedError(envelopeError))
+            ) {
               recoverFromSemanticEmpty(envelopeError)
             } else if (envelopeError.status !== undefined && envelopeError.status >= 500) {
               recoverFromTransientUpstreamFailure(envelopeError)
@@ -6377,14 +6567,22 @@ export class QwenAiStreamHandler {
             } catch (parseError) {
               const envelopeError = createQwenAiStreamEnvelopeError(event.data, event.data, event.event)
               if (envelopeError) {
-                rejectOnce(envelopeError)
+                if (isQwenAiStaleSessionError(envelopeError)) {
+                  recoverFromSemanticEmpty(envelopeError)
+                } else {
+                  rejectOnce(envelopeError)
+                }
                 return
               }
               throw parseError
             }
             const envelopeError = createQwenAiStreamEnvelopeError(parsed, event.data, event.event)
             if (envelopeError) {
-              rejectOnce(envelopeError)
+              if (isQwenAiStaleSessionError(envelopeError)) {
+                recoverFromSemanticEmpty(envelopeError)
+              } else {
+                rejectOnce(envelopeError)
+              }
               return
             }
 

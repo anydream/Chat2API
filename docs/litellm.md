@@ -57,6 +57,21 @@ patch when the base source no longer matches.
 
 The Anthropic-compatible base URL is `http://127.0.0.1:4000`. The Compose service listens only on loopback by default.
 
+The Compose health check verifies both LiteLLM's own liveness endpoint and the
+`/health` endpoint derived from `CHAT2API_BASE_URL`. This prevents a bridge
+from being reported healthy while its Chat2API target is stopped or points at
+an old port. The default Docker topology is therefore:
+
+```text
+LiteLLM container -> host.docker.internal:8080 (Chat2API container)
+```
+
+For a native Chat2API process, set `CHAT2API_BASE_URL` to the native listener
+and regenerate the native supervisor config with the same `-Chat2ApiPort`
+value. The native setup defaults to `18080` specifically to keep it separate
+from the Docker listener; do not combine a stale native config with a Docker
+Chat2API process.
+
 The bundled route is intentionally generic: it preserves each incoming model
 name and forwards it to Chat2API. If a client sends a startup probe or another
 alias that differs from the provider model ID, create a normal Chat2API model

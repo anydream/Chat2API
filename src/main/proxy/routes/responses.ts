@@ -132,12 +132,20 @@ function streamFailureCode(error: Error | undefined): string | undefined {
   return typeof code === 'string' && code.trim() ? code : undefined
 }
 
-function streamFailureAccountFault(error: Error | undefined): boolean | undefined {
+function streamFailureAccountFault(
+  error: Error | undefined,
+  status?: number,
+): boolean | undefined {
+  if (status === 499) return false
   const accountFault = (error as (Error & { accountFault?: unknown }) | undefined)?.accountFault
   return typeof accountFault === 'boolean' ? accountFault : undefined
 }
 
-function streamFailureRetryScope(error: Error | undefined): 'next-account' | undefined {
+function streamFailureRetryScope(
+  error: Error | undefined,
+  status?: number,
+): 'next-account' | undefined {
+  if (status === 499) return undefined
   const retryScope = (error as (Error & { retryScope?: unknown }) | undefined)?.retryScope
   return retryScope === 'next-account' ? retryScope : undefined
 }
@@ -662,41 +670,45 @@ router.post('/responses', async (ctx: Context) => {
     outcomeRecorded = true
     logStreamDelivery('failed', status, error)
     const latency = Date.now() - startedAt
-    const accountFault = streamFailureAccountFault(error)
+    const accountFault = streamFailureAccountFault(error, status)
+    const retryScope = streamFailureRetryScope(error, status)
     const errorCode = streamFailureCode(error)
+    const claimErrorCode = status === 499 ? undefined : errorCode
     const clearsPreviousBinding = (
+      status !== 499
+      &&
       initialUsesQwenAiContinuation
-      && !isQwenAiChatInProgressErrorCode(errorCode)
+      && !isQwenAiChatInProgressErrorCode(claimErrorCode)
       && (
-        isQwenAiSessionStaleErrorCode(errorCode)
-        || isQwenAiContinuationRejectedErrorCode(errorCode)
+        isQwenAiSessionStaleErrorCode(claimErrorCode)
+        || isQwenAiContinuationRejectedErrorCode(claimErrorCode)
         || deferredStreamFailure
         || (
           accountFault === true
-          && streamFailureRetryScope(error) === 'next-account'
+          && retryScope === 'next-account'
         )
       )
     )
     if (clearsPreviousBinding) {
       clearPreviousQwenAiSessionBinding(
-        isQwenAiSessionStaleErrorCode(errorCode)
+        isQwenAiSessionStaleErrorCode(claimErrorCode)
           ? 'terminal_stale_session'
-          : isQwenAiContinuationRejectedErrorCode(errorCode)
+          : isQwenAiContinuationRejectedErrorCode(claimErrorCode)
             ? 'terminal_continuation_rejected'
-            : accountFault === true && streamFailureRetryScope(error) === 'next-account'
+            : accountFault === true && retryScope === 'next-account'
               ? 'terminal_account_failover'
             : 'terminal_stream_failure',
       )
     }
     finalizeFailedQwenAiToolCallClaim(
-      errorCode,
+      claimErrorCode,
       accountFault,
-      streamFailureRetryScope(error),
-      isQwenAiSessionStaleErrorCode(errorCode)
+      retryScope,
+      isQwenAiSessionStaleErrorCode(claimErrorCode)
         ? 'terminal_stale_session'
-        : isQwenAiContinuationRejectedErrorCode(errorCode)
+        : isQwenAiContinuationRejectedErrorCode(claimErrorCode)
           ? 'terminal_continuation_rejected'
-          : accountFault === true && streamFailureRetryScope(error) === 'next-account'
+          : accountFault === true && retryScope === 'next-account'
             ? 'terminal_account_failover'
             : 'terminal_stream_failure',
     )
@@ -705,6 +717,10 @@ router.post('/responses', async (ctx: Context) => {
         ? accountFault !== false
         : isQwenAiAccountFault({
             accountFault,
+            status,
+            code: errorCode,
+            errorCode,
+            message: error.message,
           })
     )
     if (deferredStreamFailure && QwenAiAdapter.isQwenAiProvider(provider)) {

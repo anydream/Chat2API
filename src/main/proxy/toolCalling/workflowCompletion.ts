@@ -62,10 +62,12 @@ export function stripManagedWorkflowCompletionMarker(
 export function requiresManagedWorkflowCompletionMarker(plan?: ManagedWorkflowCompletionPlan): boolean {
   return Boolean(
     supportsManagedWorkflowCompletionMarker(plan)
-    // Once a matched, successful tool-result batch has been supplied, normal
-    // terminal assistant text is the standard tool protocol completion signal.
-    // Failed results remain pending and still require explicit proof.
-    && (!plan?.workflowContinuation || plan.failedToolResultPending)
+    // A matched tool-result batch, including an error result, opens a normal
+    // assistant turn. In auto mode the model may call another tool or explain
+    // why the operation could not complete; ordinary terminal text is valid
+    // in either case. The private marker is needed only on the initial turn,
+    // where it distinguishes a final answer from a progress announcement.
+    && !plan?.workflowContinuation
   )
 }
 

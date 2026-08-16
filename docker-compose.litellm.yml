@@ -46,7 +46,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2)"
+        - "import os, urllib.parse, urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2); target=urllib.parse.urlsplit(os.environ['CHAT2API_BASE_URL']); health=target._replace(path='/health', query='', fragment='').geturl(); urllib.request.urlopen(health, timeout=2)"
       interval: 10s
       timeout: 3s
       retries: 12

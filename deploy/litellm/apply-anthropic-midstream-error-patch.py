@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import py_compile
+import re
 import site
 import sys
 from pathlib import Path
+from typing import Any
 
 
 MODULE_PATH = Path(
@@ -16,6 +19,9 @@ RESPONSES_MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/responses_adapters/streaming_iterator.py"
 )
 RESPONSES_MAIN_MODULE_PATH = Path("litellm/responses/main.py")
+RESPONSES_STREAMING_ITERATOR_MODULE_PATH = Path(
+    "litellm/responses/streaming_iterator.py"
+)
 ANTHROPIC_ADAPTER_MODULE_PATH = Path(
     "litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py"
 )
@@ -33,6 +39,7 @@ PATCHED_STANDARD_IMPORTS = (
     "import copy\n"
     "import json\n"
     "import os\n"
+    "import re\n"
     "import traceback\n"
 )
 
@@ -43,14 +50,260 @@ PATCHED_IMPORTS = (
     "from litellm.llms.base_llm.chat.transformation import BaseLLMException\n"
 )
 
+
+# This source fragment is injected into both Anthropic streaming adapters.
+# Keep the traversal bounded: exception objects can contain cyclic references
+# and provider response bodies can be unexpectedly large.
+ANTHROPIC_ERROR_HELPERS = r'''
+
+
+_CHAT2API_ANTHROPIC_ERROR_MAX_DEPTH = 8
+_CHAT2API_ANTHROPIC_ERROR_MAX_NODES = 128
+_CHAT2API_ANTHROPIC_ERROR_MAX_TEXT = 4096
+_CHAT2API_ANTHROPIC_ERROR_CHILD_FIELDS = (
+    "original_exception",
+    "__cause__",
+    "__context__",
+    "error",
+    "errors",
+    "detail",
+    "details",
+    "body",
+    "data",
+    "response",
+)
+_CHAT2API_ANTHROPIC_ERROR_STATUS_FIELDS = (
+    "status",
+    "status_code",
+    "http_status",
+    "httpStatus",
+)
+_CHAT2API_ANTHROPIC_ERROR_CODE_FIELDS = (
+    "code",
+    "error_code",
+    "errorCode",
+)
+_CHAT2API_ANTHROPIC_ERROR_MESSAGE_FIELDS = (
+    "message",
+    "detail",
+    "error_description",
+)
+_CHAT2API_ANTHROPIC_ERROR_TYPE_FIELDS = (
+    "type",
+    "error_type",
+    "errorType",
+)
+_CHAT2API_ANTHROPIC_TRANSPORT_CODE_RE = re.compile(
+    r"\bE(?:CONNRESET|CONNREFUSED|CONNABORTED|TIMEDOUT|PIPE|HOSTUNREACH|NETWORKUNREACH|AI_AGAIN|ADDRINUSE)\b"
+)
+
+
+def _chat2api_anthropic_error_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()[:_CHAT2API_ANTHROPIC_ERROR_MAX_TEXT]
+    if value is None or isinstance(value, (bytes, bytearray)):
+        return ""
+    try:
+        return str(value).strip()[:_CHAT2API_ANTHROPIC_ERROR_MAX_TEXT]
+    except Exception:
+        return ""
+
+
+def _chat2api_anthropic_error_field(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _chat2api_anthropic_error_children(value: Any) -> list[Any]:
+    children: list[Any] = []
+    if isinstance(value, dict):
+        for name in _CHAT2API_ANTHROPIC_ERROR_CHILD_FIELDS:
+            if name in value and value[name] is not None:
+                children.append(value[name])
+        return children
+
+    for name in _CHAT2API_ANTHROPIC_ERROR_CHILD_FIELDS:
+        child = _chat2api_anthropic_error_field(value, name)
+        if child is not None:
+            children.append(child)
+
+    # Some SDK response objects expose the structured payload only through
+    # json(). Reading it is best effort and remains bounded by the graph walk.
+    json_method = _chat2api_anthropic_error_field(value, "json")
+    if callable(json_method):
+        try:
+            parsed = json_method()
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            children.append(parsed)
+    return children
+
+
+def _chat2api_anthropic_error_nodes(root: Any) -> list[tuple[int, Any]]:
+    queue: list[tuple[int, Any]] = [(0, root)]
+    nodes: list[tuple[int, Any]] = []
+    seen: set[int] = set()
+    while queue and len(nodes) < _CHAT2API_ANTHROPIC_ERROR_MAX_NODES:
+        depth, value = queue.pop(0)
+        if value is None or depth > _CHAT2API_ANTHROPIC_ERROR_MAX_DEPTH:
+            continue
+        if isinstance(value, (dict, list, tuple, set)) or hasattr(value, "__dict__"):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+        nodes.append((depth, value))
+
+        if isinstance(value, (list, tuple, set)):
+            queue.extend((depth + 1, child) for child in value)
+        else:
+            queue.extend((depth + 1, child) for child in _chat2api_anthropic_error_children(value))
+
+        args = _chat2api_anthropic_error_field(value, "args")
+        if isinstance(args, (list, tuple)):
+            queue.extend((depth + 1, child) for child in args[:8])
+
+        text = _chat2api_anthropic_error_text(value)
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                queue.append((depth + 1, json.loads(text)))
+            except Exception:
+                pass
+    return nodes
+
+
+def _chat2api_anthropic_error_number(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if 400 <= number <= 599 else None
+
+
+def _chat2api_anthropic_error_details(value: Any, fallback_message: str = "") -> dict[str, Any]:
+    """Extract bounded, provider-neutral details from an exception graph."""
+    nodes = _chat2api_anthropic_error_nodes(value)
+    status_candidates: list[tuple[int, int]] = []
+    code_candidates: list[tuple[int, str]] = []
+    type_candidates: list[tuple[int, str]] = []
+    message_candidates: list[tuple[int, str]] = []
+
+    for depth, node in nodes:
+        for field in _CHAT2API_ANTHROPIC_ERROR_STATUS_FIELDS:
+            status = _chat2api_anthropic_error_number(_chat2api_anthropic_error_field(node, field))
+            if status is not None:
+                status_candidates.append((depth, status))
+        for field in _CHAT2API_ANTHROPIC_ERROR_CODE_FIELDS:
+            candidate = _chat2api_anthropic_error_text(_chat2api_anthropic_error_field(node, field))
+            if candidate and not candidate.isdigit():
+                code_candidates.append((depth, candidate))
+        for field in _CHAT2API_ANTHROPIC_ERROR_TYPE_FIELDS:
+            candidate = _chat2api_anthropic_error_text(_chat2api_anthropic_error_field(node, field))
+            if candidate and candidate.lower() != "error":
+                type_candidates.append((depth, candidate))
+        for field in _CHAT2API_ANTHROPIC_ERROR_MESSAGE_FIELDS:
+            candidate = _chat2api_anthropic_error_text(_chat2api_anthropic_error_field(node, field))
+            if candidate:
+                message_candidates.append((depth, candidate))
+
+        # Bare SDK/transport exceptions often only carry text in __str__ and
+        # args, without a ``message`` attribute. Include that text so a nested
+        # original_exception remains visible after LiteLLM wraps it.
+        if not isinstance(node, (dict, list, tuple, set)) and depth > 0:
+            node_text = _chat2api_anthropic_error_text(node)
+            if node_text:
+                message_candidates.append((depth, node_text))
+
+        transport_match = _CHAT2API_ANTHROPIC_TRANSPORT_CODE_RE.search(
+            _chat2api_anthropic_error_text(node)
+        )
+        if transport_match:
+            code_candidates.append((depth, transport_match.group(0)))
+
+    # LiteLLM's MidStreamFallbackError defaults to 503 when its wrapped
+    # transport exception has no HTTP status. Prefer a nested real status.
+    status = None
+    for _, candidate in sorted(status_candidates, key=lambda item: item[0]):
+        if candidate != 503:
+            status = candidate
+            break
+    if status is None and status_candidates:
+        status = status_candidates[0][1]
+
+    code = code_candidates[-1][1] if code_candidates else None
+    upstream_type = type_candidates[-1][1] if type_candidates else None
+    # The nested/original exception is queued after the wrapper, so the last
+    # candidate is the provider's most specific message.
+    message = message_candidates[-1][1] if message_candidates else ""
+    if not message:
+        message = _chat2api_anthropic_error_text(fallback_message)
+    if not message:
+        message = "Upstream stream ended before completion"
+
+    probe = " ".join([message, code or ""]).lower()
+    # A default 503 on MidStreamFallbackError means "no status propagated";
+    # transport-specific evidence is more useful for clients and diagnostics.
+    if status is None or status == 503:
+        if "timeout" in probe or "timed out" in probe:
+            status = 504
+        elif _CHAT2API_ANTHROPIC_TRANSPORT_CODE_RE.search(message) or any(
+            term in probe for term in ("connection", "transport", "socket", "premature eof")
+        ):
+            status = 502
+
+    return {
+        "status": status,
+        "code": code,
+        "message": message[:_CHAT2API_ANTHROPIC_ERROR_MAX_TEXT],
+        "upstream_type": upstream_type,
+    }
+
+
+def _chat2api_anthropic_error_response(value: Any, fallback_message: str = "") -> dict[str, Any]:
+    from litellm.anthropic_interface.exceptions.exception_mapping_utils import (
+        AnthropicExceptionMapping,
+    )
+
+    details = _chat2api_anthropic_error_details(value, fallback_message)
+    status = details["status"] if details["status"] is not None else 500
+    response = AnthropicExceptionMapping.transform_to_anthropic_error(
+        status_code=status,
+        raw_message=details["message"],
+    )
+    error = response.get("error")
+    if isinstance(error, dict):
+        if details["status"] is not None:
+            error["status"] = details["status"]
+        if details["code"]:
+            error["code"] = details["code"]
+        if details["upstream_type"]:
+            error["upstream_type"] = details["upstream_type"]
+    return response
+
+
+'''
+
+
+# The same fragment is exposed in the patcher namespace for offline tests.
+exec(ANTHROPIC_ERROR_HELPERS, globals())
+
 HELPER_ANCHOR = """if TYPE_CHECKING:
     from litellm.types.utils import ModelResponseStream
 
 
 class _CombinedChunkSplitter:
 """
-PATCHED_HELPERS = """if TYPE_CHECKING:
+PATCHED_HELPERS = '''if TYPE_CHECKING:
     from litellm.types.utils import ModelResponseStream
+
+''' + ANTHROPIC_ERROR_HELPERS + '''
 
 
 DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS = 15_000
@@ -74,26 +327,23 @@ def _anthropic_sse_ping_event() -> bytes:
 
 
 def _error_status_and_message(exc: Exception) -> tuple[int, str]:
-    if isinstance(exc, (BaseLLMException, MidStreamFallbackError)):
-        return exc.status_code, exc.message
-    return 500, str(exc) or "Upstream stream ended before completion"
+    details = _chat2api_anthropic_error_details(
+        exc,
+        _chat2api_anthropic_error_text(getattr(exc, "message", "")),
+    )
+    return details["status"] or 500, details["message"]
 
 
 def _mid_stream_error_sse_event(exc: Exception) -> bytes:
-    from litellm.anthropic_interface.exceptions.exception_mapping_utils import (
-        AnthropicExceptionMapping,
-    )
-
-    status_code, message = _error_status_and_message(exc)
-    error_response = AnthropicExceptionMapping.transform_to_anthropic_error(
-        status_code=status_code,
-        raw_message=message,
+    error_response = _chat2api_anthropic_error_response(
+        exc,
+        _chat2api_anthropic_error_text(getattr(exc, "message", "")),
     )
     return f"event: error\\ndata: {json.dumps(error_response)}\\n\\n".encode()
 
 
 class _CombinedChunkSplitter:
-"""
+'''
 
 ORIGINAL_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:
         """
@@ -171,6 +421,7 @@ RESPONSES_PATCHED_IMPORTS = '''import asyncio
 import contextlib
 import json
 import os
+import re
 import traceback
 from collections import deque
 from typing import Any, AsyncIterator, Dict
@@ -185,6 +436,7 @@ RESPONSES_HELPER_ANCHOR = '''from litellm._uuid import uuid
 class AnthropicResponsesStreamWrapper:'''
 
 RESPONSES_PATCHED_HELPERS = '''from litellm._uuid import uuid
+''' + ANTHROPIC_ERROR_HELPERS + '''
 
 
 DEFAULT_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS = 15_000
@@ -207,17 +459,35 @@ def _anthropic_sse_ping_event() -> bytes:
     return b'event: ping\\ndata: {"type":"ping"}\\n\\n'
 
 
-def _anthropic_responses_error_event(message: str) -> Dict[str, Any]:
+def _anthropic_responses_error_event(error: Any, fallback_message: str = "") -> Dict[str, Any]:
     return {
-        "type": "error",
-        "error": {
-            "type": "api_error",
-            "message": message or "Upstream Responses stream ended before completion",
-        },
+        **_chat2api_anthropic_error_response(error, fallback_message),
     }
 
 
 class AnthropicResponsesStreamWrapper:'''
+
+# Import blocks emitted by the previous overlay revision. They are kept
+# separate from the clean-image anchors so upgrades can be validated exactly.
+LEGACY_STANDARD_IMPORTS = (
+    "import asyncio\n"
+    "import contextlib\n"
+    "import copy\n"
+    "import json\n"
+    "import os\n"
+    "import traceback\n"
+)
+LEGACY_RESPONSES_IMPORTS = '''import asyncio
+import contextlib
+import json
+import os
+import traceback
+from collections import deque
+from typing import Any, AsyncIterator, Dict
+
+from litellm import verbose_logger
+from litellm._uuid import uuid
+'''
 
 RESPONSES_STATE_ANCHOR = '''        self._sent_message_start = False
         self._sent_message_stop = False
@@ -255,12 +525,12 @@ RESPONSES_PROCESS_EVENT_PATCH = '''    @staticmethod
             return nested_message
         return "Upstream Responses stream failed before completion"
 
-    def _queue_terminal_error(self, message: str) -> None:
+    def _queue_terminal_error(self, error: Any, fallback_message: str = "") -> None:
         if self._terminal_error_seen or self._sent_message_stop:
             return
         self._terminal_error_seen = True
         self._sent_message_stop = True
-        self._chunk_queue.append(_anthropic_responses_error_event(message))
+        self._chunk_queue.append(_anthropic_responses_error_event(error, fallback_message))
 
     def _process_event(self, event: Any) -> None:
         """Convert one Responses API event into zero or more Anthropic chunks queued for emission."""
@@ -285,7 +555,7 @@ RESPONSES_OUTPUT_ITEM_ANCHOR = '''        # ---- content_block_start for a new o
 
 RESPONSES_OUTPUT_ITEM_PATCH = '''        # ---- terminal Responses error ----
         if event_type == "error":
-            self._queue_terminal_error(self._event_error_message(event))
+            self._queue_terminal_error(event, self._event_error_message(event))
             return
 
         # ---- content_block_start for a new output message item ----
@@ -302,7 +572,7 @@ RESPONSES_TERMINAL_ANCHOR = '''        # ---- response completed -> message_delt
 
 RESPONSES_TERMINAL_PATCH = '''        # ---- failed response -> terminal Anthropic error ----
         if event_type == "response.failed":
-            self._queue_terminal_error(self._event_error_message(event))
+            self._queue_terminal_error(event, self._event_error_message(event))
             return
 
         # ---- response completed -> message_delta + message_stop ----
@@ -366,12 +636,13 @@ RESPONSES_ANEXT_PATCH = '''    async def __anext__(self) -> Dict[str, Any]:
             verbose_logger.error(
                 f"AnthropicResponsesStreamWrapper error: {exc}\\n{traceback.format_exc()}"
             )
-            self._queue_terminal_error(str(exc) or "Upstream Responses transport failed")
+            self._queue_terminal_error(exc, str(exc) or "Upstream Responses transport failed")
 
         # A clean EOF without a Responses terminal event is still a broken stream.
         if not self._sent_message_stop and not self._terminal_error_seen:
             self._queue_terminal_error(
-                "Upstream Responses stream ended before response.completed"
+                None,
+                "Upstream Responses stream ended before response.completed",
             )
         if self._chunk_queue:
             return self._chunk_queue.popleft()
@@ -428,7 +699,8 @@ RESPONSES_PATCHED_WRAPPER = '''    async def async_anthropic_sse_wrapper(self) -
             )
             if not self._terminal_error_seen and not self._sent_message_stop:
                 payload = _anthropic_responses_error_event(
-                    str(exc) or "Upstream Responses transport failed"
+                    exc,
+                    str(exc) or "Upstream Responses transport failed",
                 )
                 yield f"event: error\\ndata: {json.dumps(payload)}\\n\\n".encode()
         finally:
@@ -457,6 +729,289 @@ RESPONSES_NATIVE_STREAM_PATCH = '''            # Chat2API wildcard declares nati
                     custom_llm_provider=custom_llm_provider,
                 )
             ),
+'''
+
+
+# LiteLLM's generic Responses iterator turns terminal ``error`` and
+# ``response.failed`` events into exceptions before the Anthropic adapter can
+# inspect them.  Keep the extraction provider-neutral and accept both the
+# OpenAI-shaped nested error object and Chat2API's top-level error fields.
+RESPONSES_ITERATOR_ERROR_DETAILS_MARKER = (
+    "_CHAT2API_RESPONSES_ITERATOR_ERROR_DETAILS"
+)
+RESPONSES_ITERATOR_ERROR_HELPERS = r'''_CHAT2API_RESPONSES_ITERATOR_ERROR_DETAILS = True
+
+
+_CHAT2API_RESPONSES_ERROR_STATUS_FIELDS = (
+    "status",
+    "status_code",
+    "http_status",
+    "httpStatus",
+)
+_CHAT2API_RESPONSES_ERROR_CODE_FIELDS = (
+    "code",
+    "error_code",
+    "errorCode",
+)
+_CHAT2API_RESPONSES_ERROR_TYPE_FIELDS = (
+    "type",
+    "error_type",
+    "errorType",
+)
+_CHAT2API_RESPONSES_ERROR_MESSAGE_FIELDS = (
+    "message",
+    "detail",
+    "error_description",
+)
+
+
+def _chat2api_responses_error_field(value: object, name: str) -> object:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(name)
+    getter = getattr(value, "get", None)
+    if callable(getter):
+        try:
+            result = getter(name, None)
+        except Exception:
+            result = None
+        if result is not None:
+            return result
+    try:
+        return getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _chat2api_responses_error_status(value: object) -> Optional[int]:
+    for field in _CHAT2API_RESPONSES_ERROR_STATUS_FIELDS:
+        raw = _chat2api_responses_error_field(value, field)
+        if isinstance(raw, bool):
+            continue
+        try:
+            status = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if 400 <= status <= 599:
+            return status
+    return None
+
+
+def _chat2api_responses_error_text(value: object) -> Optional[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+    return None
+
+
+def _error_event_fields(
+    error_obj: object,
+    fallback_obj: object = None,
+) -> tuple[str, Optional[str], Optional[str], Optional[int]]:
+    """Read structured error fields without discarding event-level metadata."""
+    candidates = (error_obj, fallback_obj)
+
+    def first_text(fields: tuple[str, ...]) -> Optional[str]:
+        for candidate in candidates:
+            for field in fields:
+                text = _chat2api_responses_error_text(
+                    _chat2api_responses_error_field(candidate, field)
+                )
+                if text:
+                    return text
+        return None
+
+    status: Optional[int] = None
+    for candidate in candidates:
+        status = _chat2api_responses_error_status(candidate)
+        if status is not None:
+            break
+
+    message = first_text(_CHAT2API_RESPONSES_ERROR_MESSAGE_FIELDS)
+    error_type = first_text(_CHAT2API_RESPONSES_ERROR_TYPE_FIELDS)
+    if error_type in {"error", "response.failed"}:
+        error_type = None
+    error_code = first_text(_CHAT2API_RESPONSES_ERROR_CODE_FIELDS)
+    return (
+        message or "Response API in-stream error",
+        error_type,
+        error_code,
+        status,
+    )
+
+
+def _status_code_for_error_fields(
+    error_type: Optional[str],
+    error_code: Optional[str],
+    explicit_status: Optional[int] = None,
+) -> int:
+    if explicit_status is not None and 400 <= explicit_status <= 599:
+        return explicit_status
+    fields = tuple(field for field in (error_type, error_code) if field is not None)
+    if any(field.startswith("rate_limit") or field == "insufficient_quota" for field in fields):
+        return 429
+    if any(field in _CLIENT_ERROR_CODES for field in fields):
+        return 400
+    return 500
+
+
+def _annotate_error_exception(
+    exception: Exception,
+    error_type: Optional[str],
+    error_code: Optional[str],
+    status_code: int,
+) -> Exception:
+    """Make structured fields available to LiteLLM fallback/error mappers."""
+    if error_code:
+        setattr(exception, "code", error_code)
+        setattr(exception, "error_code", error_code)
+    if error_type:
+        setattr(exception, "type", error_type)
+        setattr(exception, "error_type", error_type)
+    setattr(exception, "status", status_code)
+    setattr(exception, "status_code", status_code)
+    return exception
+'''
+
+RESPONSES_ITERATOR_ERROR_HELPERS_ANCHOR = '''_CLIENT_ERROR_CODES: frozenset[str] = frozenset(
+    (
+        "invalid_request_error",
+        "context_length_exceeded",
+        "content_policy_violation",
+        "model_not_found",
+    )
+)
+
+
+def _error_event_fields(error_obj: object) -> tuple[str, Optional[str], Optional[str]]:
+    if isinstance(error_obj, dict):
+        raw_message = error_obj.get("message")
+        raw_type = error_obj.get("type")
+        raw_code = error_obj.get("code")
+    elif error_obj is not None:
+        raw_message = getattr(error_obj, "message", None)
+        raw_type = getattr(error_obj, "type", None)
+        raw_code = getattr(error_obj, "code", None)
+    else:
+        raw_message = None
+        raw_type = None
+        raw_code = None
+    message = str(raw_message) if raw_message is not None else "Response API in-stream error"
+    error_type = raw_type if isinstance(raw_type, str) else None
+    code = raw_code if isinstance(raw_code, str) else None
+    return message, error_type, code
+
+
+def _status_code_for_error_fields(error_type: Optional[str], error_code: Optional[str]) -> int:
+    fields = tuple(field for field in (error_type, error_code) if field is not None)
+    if any(field.startswith("rate_limit") or field == "insufficient_quota" for field in fields):
+        return 429
+    if any(field in _CLIENT_ERROR_CODES for field in fields):
+        return 400
+    return 500
+'''
+
+RESPONSES_ITERATOR_FAILURE_HANDLERS = '''    def _handle_logging_failed_response(self):
+        """
+        Handle logging for RESPONSE_FAILED events by routing to failure handlers.
+
+        Unlike _handle_logging_completed_response (which calls success handlers),
+        this constructs an exception from the response error and routes to
+        async_failure_handler / failure_handler so logging integrations correctly
+        record the call as failed.
+        """
+        response_obj = getattr(self.completed_response, "response", None) if self.completed_response else None
+        error_info = getattr(response_obj, "error", None) if response_obj else None
+        error_message, error_type, error_code, explicit_status = _error_event_fields(
+            error_info,
+            self.completed_response,
+        )
+        self._record_failed_response_usage(response_obj)
+        status_code = _status_code_for_error_fields(
+            error_type,
+            error_code,
+            explicit_status,
+        )
+        exception = litellm.APIError(
+            status_code=status_code,
+            message=error_message,
+            llm_provider=self.custom_llm_provider or "",
+            model=self.model or "",
+        )
+        self._handle_failure(
+            _annotate_error_exception(exception, error_type, error_code, status_code)
+        )
+
+    def _record_failed_response_usage(self, response_obj: Optional[Any]) -> None:
+        if response_obj is None or self.logging_obj is None:
+            return
+        usage_obj = getattr(response_obj, "usage", None)
+        if usage_obj is None:
+            return
+        try:
+            self.logging_obj.model_call_details["combined_usage_object"] = (
+                ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(usage_obj)
+            )
+        except (TypeError, ValueError) as usage_error:
+            verbose_logger.debug(
+                "could not record usage for failed responses stream: %s",
+                usage_error,
+            )
+            return
+        self.logging_obj.model_call_details["response_cost"] = (
+            self.logging_obj._response_cost_calculator(result=response_obj) or 0.0
+        )
+
+    def _maybe_raise_for_error_event(self, result: object) -> None:
+        chunk_type = getattr(result, "type", None)
+        if chunk_type not in ("error", "response.failed"):
+            return
+
+        response_obj = _chat2api_responses_error_field(result, "response")
+        error_obj = (
+            _chat2api_responses_error_field(response_obj, "error")
+            if chunk_type == "response.failed"
+            else _chat2api_responses_error_field(result, "error")
+        )
+        error_message, error_type, error_code, explicit_status = _error_event_fields(
+            error_obj,
+            result,
+        )
+        status_code = _status_code_for_error_fields(
+            error_type,
+            error_code,
+            explicit_status,
+        )
+        mapped_exception = litellm.APIError(
+            status_code=status_code,
+            message=error_message,
+            llm_provider=self.custom_llm_provider or "",
+            model=self.model or "",
+        )
+        mapped_exception = _annotate_error_exception(
+            mapped_exception,
+            error_type,
+            error_code,
+            status_code,
+        )
+        if 400 <= status_code < 500 and status_code != 429:
+            raise mapped_exception
+        fallback_exception = MidStreamFallbackError(
+            message=str(mapped_exception),
+            model=self.model or "",
+            llm_provider=self.custom_llm_provider or "",
+            original_exception=mapped_exception,
+            generated_content=self._generated_content,
+            is_pre_first_chunk=not self._yielded_first_chunk,
+        )
+        raise _annotate_error_exception(
+            fallback_exception,
+            error_type,
+            error_code,
+            status_code,
+        )
+
 '''
 
 TOKEN_COUNTER_MARKER = "def _chat2api_anthropic_image_url("
@@ -1225,6 +1780,23 @@ def replace_exact(source: str, old: str, new: str, description: str) -> str:
     return source.replace(old, new, 1)
 
 
+def replace_region(source: str, start_marker: str, end_marker: str, new: str, description: str) -> str:
+    start = source.find(start_marker)
+    if start < 0 or source.find(start_marker, start + 1) >= 0:
+        raise RuntimeError(f"Expected one {description} start marker in the installed LiteLLM source.")
+    end = source.find(end_marker, start)
+    if end < 0:
+        raise RuntimeError(f"Could not find {description} end marker in the installed LiteLLM source.")
+    return source[:start] + new + source[end:]
+
+
+def replace_to_end(source: str, start_marker: str, new: str, description: str) -> str:
+    start = source.find(start_marker)
+    if start < 0 or source.find(start_marker, start + 1) >= 0:
+        raise RuntimeError(f"Expected one {description} start marker in the installed LiteLLM source.")
+    return source[:start] + new
+
+
 def patch_source(source: str) -> str:
     if "def _mid_stream_error_sse_event(" in source:
         raise RuntimeError(
@@ -1243,6 +1815,123 @@ def patch_source(source: str) -> str:
     patched = replace_exact(patched, ORIGINAL_WRAPPER, PATCHED_WRAPPER, "async SSE wrapper")
     compile(patched, str(MODULE_PATH), "exec")
     return patched
+
+
+def upgrade_source(source: str) -> str:
+    """Refresh the error extraction in an overlay made by an older revision."""
+    if "_CHAT2API_ANTHROPIC_ERROR_MAX_DEPTH" in source:
+        raise RuntimeError("LiteLLM standard Anthropic error extraction is already current.")
+    if "def _mid_stream_error_sse_event(" not in source:
+        raise RuntimeError("The target is not an existing Chat2API Anthropic stream overlay.")
+
+    patched = replace_exact(
+        source,
+        LEGACY_STANDARD_IMPORTS,
+        LEGACY_STANDARD_IMPORTS.replace("import os\n", "import os\nimport re\n"),
+        "legacy standard imports",
+    )
+    helper_start = "if TYPE_CHECKING:\n    from litellm.types.utils import ModelResponseStream\n"
+    helper_end = "class _CombinedChunkSplitter:"
+    helper_region = PATCHED_HELPERS.split(helper_end, 1)[0]
+    patched = replace_region(
+        patched,
+        helper_start,
+        helper_end,
+        helper_region,
+        "standard Anthropic helper region",
+    )
+    compile(patched, str(MODULE_PATH), "exec")
+    return patched
+
+
+def upgrade_responses_source(source: str) -> str:
+    """Refresh error extraction in an existing Responses compatibility overlay."""
+    if "_CHAT2API_ANTHROPIC_ERROR_MAX_DEPTH" in source:
+        raise RuntimeError("LiteLLM Responses error extraction is already current.")
+    if "def _anthropic_responses_error_event(" not in source:
+        raise RuntimeError("The target is not an existing Chat2API Responses overlay.")
+
+    patched = replace_exact(
+        source,
+        LEGACY_RESPONSES_IMPORTS,
+        LEGACY_RESPONSES_IMPORTS.replace("import os\n", "import os\nimport re\n"),
+        "legacy Responses imports",
+    )
+    helper_start = "from litellm._uuid import uuid\n"
+    helper_end = "class AnthropicResponsesStreamWrapper:"
+    helper_region = RESPONSES_PATCHED_HELPERS.rsplit(helper_end, 1)[0]
+    patched = replace_region(
+        patched,
+        helper_start,
+        helper_end,
+        helper_region,
+        "Responses Anthropic helper region",
+    )
+    if RESPONSES_STATE_PATCH not in patched:
+        patched = replace_exact(
+            patched,
+            RESPONSES_STATE_ANCHOR,
+            RESPONSES_STATE_PATCH,
+            "legacy Responses terminal state",
+        )
+    event_start = "    @staticmethod\n    def _event_field"
+    event_end = "    def _process_event"
+    event_helpers = RESPONSES_PROCESS_EVENT_PATCH.split(event_end, 1)[0]
+    patched = replace_region(
+        patched,
+        event_start,
+        event_end,
+        event_helpers,
+        "legacy Responses event helpers",
+    )
+    old_event_call = "self._queue_terminal_error(self._event_error_message(event))"
+    new_event_call = "self._queue_terminal_error(event, self._event_error_message(event))"
+    if patched.count(old_event_call) != 2:
+        raise RuntimeError("Expected two legacy Responses event error call sites.")
+    patched = patched.replace(old_event_call, new_event_call)
+    patched = replace_exact(
+        patched,
+        'self._queue_terminal_error(str(exc) or "Upstream Responses transport failed")',
+        'self._queue_terminal_error(exc, str(exc) or "Upstream Responses transport failed")',
+        "legacy Responses transport error call",
+    )
+    patched = replace_exact(
+        patched,
+        'self._queue_terminal_error(\n                "Upstream Responses stream ended before response.completed"\n            )',
+        'self._queue_terminal_error(\n                None,\n                "Upstream Responses stream ended before response.completed",\n            )',
+        "legacy Responses EOF error call",
+    )
+    patched = replace_exact(
+        patched,
+        '_anthropic_responses_error_event(\n                    str(exc) or "Upstream Responses transport failed"\n                )',
+        '_anthropic_responses_error_event(\n                    exc,\n                    str(exc) or "Upstream Responses transport failed",\n                )',
+        "legacy Responses wrapper error call",
+    )
+    wrapper_start = "    async def async_anthropic_sse_wrapper(self) -> AsyncIterator[bytes]:"
+    patched = replace_to_end(
+        patched,
+        wrapper_start,
+        RESPONSES_PATCHED_WRAPPER,
+        "legacy Responses SSE wrapper",
+    )
+    compile(patched, str(RESPONSES_MODULE_PATH), "exec")
+    return patched
+
+
+def patch_or_upgrade_source(source: str) -> str:
+    if "_CHAT2API_ANTHROPIC_ERROR_MAX_DEPTH" in source:
+        raise RuntimeError("LiteLLM standard Anthropic error extraction is already current.")
+    if "def _mid_stream_error_sse_event(" in source:
+        return upgrade_source(source)
+    return patch_source(source)
+
+
+def patch_or_upgrade_responses_source(source: str) -> str:
+    if "_CHAT2API_ANTHROPIC_ERROR_MAX_DEPTH" in source:
+        raise RuntimeError("LiteLLM Responses error extraction is already current.")
+    if "def _anthropic_responses_error_event(" in source:
+        return upgrade_responses_source(source)
+    return patch_responses_source(source)
 
 
 def patch_responses_source(source: str) -> str:
@@ -1308,6 +1997,81 @@ def patch_responses_source(source: str) -> str:
     )
     compile(patched, str(RESPONSES_MODULE_PATH), "exec")
     return patched
+
+
+def patch_responses_iterator_source(source: str) -> str:
+    """Preserve structured errors in LiteLLM's generic Responses iterator."""
+    if RESPONSES_ITERATOR_ERROR_DETAILS_MARKER in source:
+        raise RuntimeError(
+            "LiteLLM generic Responses iterator error patch is already present; "
+            "review the base image before removing this build patch."
+        )
+    if "def _chat2api_responses_error_field(" in source:
+        raise RuntimeError(
+            "LiteLLM generic Responses iterator contains an unknown partial "
+            "Chat2API patch; review the base image before applying this patch."
+        )
+
+    client_error_codes = RESPONSES_ITERATOR_ERROR_HELPERS_ANCHOR.split(
+        "\n\n\ndef _error_event_fields",
+        1,
+    )[0]
+    patched = replace_exact(
+        source,
+        RESPONSES_ITERATOR_ERROR_HELPERS_ANCHOR,
+        RESPONSES_ITERATOR_ERROR_HELPERS + "\n\n" + client_error_codes,
+        "generic Responses iterator error helper anchor",
+    )
+    patched = replace_region(
+        patched,
+        "    def _handle_logging_failed_response(self):",
+        "    def _get_completed_response_object(self)",
+        RESPONSES_ITERATOR_FAILURE_HANDLERS,
+        "generic Responses iterator failure handlers",
+    )
+    compile(patched, str(RESPONSES_STREAMING_ITERATOR_MODULE_PATH), "exec")
+    return patched
+
+
+def upgrade_responses_iterator_source(source: str) -> str:
+    """Refresh a generic Responses iterator overlay from the prior revision."""
+    if RESPONSES_ITERATOR_ERROR_DETAILS_MARKER not in source:
+        raise RuntimeError(
+            "The target is not an existing Chat2API generic Responses iterator overlay."
+        )
+    if (
+        'if error_type in {"error", "response.failed"}' in source
+        and "fallback_exception = MidStreamFallbackError(" in source
+    ):
+        raise RuntimeError(
+            "LiteLLM generic Responses iterator error extraction is already current."
+        )
+
+    helper_start = RESPONSES_ITERATOR_ERROR_DETAILS_MARKER
+    helper_end = "_CLIENT_ERROR_CODES: frozenset[str] = frozenset("
+    patched = replace_region(
+        source,
+        helper_start,
+        helper_end,
+        RESPONSES_ITERATOR_ERROR_HELPERS + "\n\n",
+        "legacy generic Responses iterator error helpers",
+    )
+    patched = replace_region(
+        patched,
+        "    def _handle_logging_failed_response(self):",
+        "    def _get_completed_response_object(self)",
+        RESPONSES_ITERATOR_FAILURE_HANDLERS,
+        "legacy generic Responses iterator failure handlers",
+    )
+    compile(patched, str(RESPONSES_STREAMING_ITERATOR_MODULE_PATH), "exec")
+    return patched
+
+
+def patch_or_upgrade_responses_iterator_source(source: str) -> str:
+    """Apply the generic Responses iterator patch with explicit upgrade checks."""
+    if RESPONSES_ITERATOR_ERROR_DETAILS_MARKER in source:
+        return upgrade_responses_iterator_source(source)
+    return patch_responses_iterator_source(source)
 
 
 def patch_responses_main_source(source: str) -> str:
@@ -1555,6 +2319,7 @@ def resolve_targets() -> list[Path]:
     return [
         resolve_installed_target(MODULE_PATH),
         resolve_installed_target(RESPONSES_MODULE_PATH),
+        resolve_installed_target(RESPONSES_STREAMING_ITERATOR_MODULE_PATH),
         resolve_installed_target(RESPONSES_MAIN_MODULE_PATH),
         resolve_installed_target(ANTHROPIC_ADAPTER_MODULE_PATH),
         resolve_installed_target(ANTHROPIC_RESPONSES_TRANSFORMATION_MODULE_PATH),
@@ -1569,7 +2334,9 @@ def main() -> None:
         source = target.read_text(encoding="utf-8")
         target_path = target.as_posix()
         if target_path.endswith(RESPONSES_MODULE_PATH.as_posix()):
-            patched = patch_responses_source(source)
+            patched = patch_or_upgrade_responses_source(source)
+        elif target_path.endswith(RESPONSES_STREAMING_ITERATOR_MODULE_PATH.as_posix()):
+            patched = patch_or_upgrade_responses_iterator_source(source)
         elif target_path.endswith(RESPONSES_MAIN_MODULE_PATH.as_posix()):
             patched = patch_responses_main_source(source)
         elif target_path.endswith(ANTHROPIC_ADAPTER_MODULE_PATH.as_posix()):
@@ -1583,7 +2350,7 @@ def main() -> None:
         elif target_path.endswith(ANTHROPIC_ENDPOINTS_MODULE_PATH.as_posix()):
             patched = patch_anthropic_endpoints_source(source)
         else:
-            patched = patch_source(source)
+            patched = patch_or_upgrade_source(source)
         target.write_text(patched, encoding="utf-8")
         py_compile.compile(str(target), doraise=True)
         print(f"Applied Anthropic stream safety patch to {target}")

@@ -5,6 +5,10 @@ import { createRequire } from 'node:module'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import {
+  isQwenAiAccountFault,
+  qwenAiAccountRetryScope,
+} from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 
@@ -269,6 +273,7 @@ function loadChatRouteHarness(options = {}) {
       getTrailingQwenAiToolResultBatch: toolCallSessionStoreModule.getTrailingQwenAiToolResultBatch,
       qwenAiToolCallSessionStore: toolCallSessions,
     },
+    '../qwenAiAccountPolicy': { isQwenAiAccountFault, qwenAiAccountRetryScope },
   }
   const module = { exports: {} }
   const testRequire = specifier => {

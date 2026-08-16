@@ -59,6 +59,12 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(compose, /REQUEST_TIMEOUT:\s*"\$\{LITELLM_REQUEST_TIMEOUT:-900\}"/)
   assert.match(compose, /LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:\s*"\$\{LITELLM_ANTHROPIC_SSE_HEARTBEAT_INTERVAL_MS:-15000\}"/)
   assert.match(compose, /LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:\s*"\$\{LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY:-true\}"/)
+  assert.match(compose, /CHAT2API_BASE_URL:\s*"\$\{CHAT2API_BASE_URL:-http:\/\/host\.docker\.internal:8080\/v1\}"/)
+  assert.match(compose, /extra_hosts:/)
+  assert.match(compose, /urlsplit\(os\.environ\['CHAT2API_BASE_URL'\]\)/)
+  assert.match(compose, /path='\/health'/)
+  assert.match(docs, /Compose health check verifies both LiteLLM's own liveness endpoint and the/)
+  assert.match(docs, /native setup defaults to `18080`/)
   assert.match(compose, /LITELLM_BASE_IMAGE:\s*"\$\{LITELLM_BASE_IMAGE:-docker\.litellm\.ai\/berriai\/litellm:v1\.93\.0\}"/)
   assert.match(compose, /image:\s*"\$\{LITELLM_IMAGE:-chat2api-litellm:v1\.93\.0-anthropic-stream-guard\}"/)
   const serverCompose = fs.readFileSync('docker-compose.yml', 'utf8')
@@ -107,6 +113,10 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /event: error\\\\ndata:/)
   assert.match(patcher, /event: ping\\\\ndata: \{\"type\":\"ping\"\}/)
   assert.match(patcher, /RESPONSES_MODULE_PATH/)
+  assert.match(patcher, /RESPONSES_STREAMING_ITERATOR_MODULE_PATH/)
+  assert.match(patcher, /_CHAT2API_RESPONSES_ERROR_STATUS_FIELDS/)
+  assert.match(patcher, /_annotate_error_exception/)
+  assert.match(patcher, /patch_responses_iterator_source/)
   assert.match(patcher, /RESPONSES_MAIN_MODULE_PATH/)
   assert.match(patcher, /responses_adapters/)
   assert.match(patcher, /RESPONSES_PATCHED_WRAPPER/)
@@ -133,6 +143,93 @@ test('bundled LiteLLM configuration keeps client probe and protocol bridge confi
   assert.match(patcher, /if \"citations\" in c/)
   assert.match(patcher, /asyncio\.to_thread/)
   assert.match(patcher, /LITELLM_ANTHROPIC_COUNT_TOKENS_LOCAL_ONLY/)
+})
+
+test('LiteLLM Anthropic patch preserves nested stream status, code, and message', async () => {
+  const script = String.raw`
+import importlib.util
+import json
+
+spec = importlib.util.spec_from_file_location(
+    "chat2api_litellm_patch",
+    "deploy/litellm/apply-anthropic-midstream-error-patch.py",
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def wrapped(message, status=None, code=None):
+    inner = Exception(message)
+    if status is not None:
+        inner.status_code = status
+    if code is not None:
+        inner.code = code
+    outer = Exception("litellm.MidStreamFallbackError: Response API in-stream error")
+    outer.status_code = 503
+    outer.original_exception = inner
+    return module._chat2api_anthropic_error_details(outer)
+
+print(json.dumps([
+    wrapped("Qwen recovery budget exhausted", 504, "qwen_ai_recovery_timeout"),
+    wrapped("Qwen returned an undeclared native tool", 422, "malformed_tool_call"),
+    wrapped("upstream socket reset ECONNRESET"),
+]))
+`
+
+  const { stdout } = await execFileAsync('python', ['-c', script], {
+    cwd: process.cwd(),
+    windowsHide: true,
+  })
+  const details = JSON.parse(stdout)
+  assert.deepEqual(details.map(({ status, code }) => ({ status, code })), [
+    { status: 504, code: 'qwen_ai_recovery_timeout' },
+    { status: 422, code: 'malformed_tool_call' },
+    { status: 502, code: 'ECONNRESET' },
+  ])
+  assert.match(details[0].message, /recovery budget exhausted/i)
+  assert.match(details[1].message, /undeclared native tool/i)
+  assert.match(details[2].message, /ECONNRESET/)
+})
+
+test('LiteLLM Responses iterator patch preserves event status and codes', async () => {
+  const script = String.raw`
+import importlib.util
+import json
+from typing import Optional
+
+spec = importlib.util.spec_from_file_location(
+    "chat2api_litellm_patch",
+    "deploy/litellm/apply-anthropic-midstream-error-patch.py",
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.Optional = Optional
+module._CLIENT_ERROR_CODES = frozenset({
+    "invalid_request_error",
+    "context_length_exceeded",
+    "content_policy_violation",
+    "model_not_found",
+})
+exec(module.RESPONSES_ITERATOR_ERROR_HELPERS, module.__dict__)
+specs = [
+    ({"type": "error", "status": 504, "code": "qwen_ai_recovery_timeout", "message": "timeout"}),
+    ({"type": "response.failed", "response": {"error": {"status_code": 502, "code": "CHAT_NOT_FOUND", "message": "missing"}}}),
+]
+print(json.dumps([
+    module._error_event_fields(
+        item.get("error") or item.get("response", {}).get("error"),
+        item,
+    )
+    for item in specs
+]))
+`
+  const { stdout } = await execFileAsync('python', ['-c', script], {
+    cwd: process.cwd(),
+    windowsHide: true,
+  })
+  assert.deepEqual(JSON.parse(stdout), [
+    ['timeout', null, 'qwen_ai_recovery_timeout', 504],
+    ['missing', null, 'CHAT_NOT_FOUND', 502],
+  ])
 })
 
 function captureOutput(child, maxLength = 64 * 1024) {
@@ -1381,12 +1478,12 @@ test('patched LiteLLM v1.93.0 exposes Anthropic Messages over Chat2API completel
       {
         name: 'type:error event',
         prompt: 'MIDSTREAM_ERROR',
-        messagePattern: /Response API in-stream error|MidStreamFallbackError/i,
+        messagePattern: /synthetic upstream ECONNRESET aborted|Response API in-stream error|MidStreamFallbackError/i,
       },
       {
         name: 'response.failed event',
         prompt: 'RESPONSES_FAILED_EVENT',
-        messagePattern: /Response API in-stream error|MidStreamFallbackError/i,
+        messagePattern: /synthetic response.failed terminal|Response API in-stream error|MidStreamFallbackError/i,
       },
       {
         name: 'transport failure',

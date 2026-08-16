@@ -5,6 +5,10 @@ import { createRequire } from 'node:module'
 import { PassThrough, Transform } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import {
+  isQwenAiAccountFault,
+  qwenAiAccountRetryScope,
+} from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 const QWEN_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
@@ -335,6 +339,7 @@ function loadResponsesRoute(createResult, options = {}) {
     '../toolCalling/workflowHeuristics': {
       hasTrailingMatchedToolResultBatch: () => false,
     },
+    '../qwenAiAccountPolicy': { isQwenAiAccountFault, qwenAiAccountRetryScope },
   }
   const testRequire = specifier => {
     if (Object.prototype.hasOwnProperty.call(localModules, specifier)) {

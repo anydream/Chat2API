@@ -73,3 +73,6 @@ backup/
 # Local migration artifacts and development data
 .local/
 .local-artifacts/
+
+# Local live debug logs
+.tmp-live-*.ndjson

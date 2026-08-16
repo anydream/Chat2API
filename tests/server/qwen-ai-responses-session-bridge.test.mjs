@@ -32,6 +32,7 @@ function loadTypeScriptModule(path, localModules = {}) {
 }
 
 const sessionBridge = loadTypeScriptModule('src/main/proxy/qwenAiSessionBridge.ts')
+const qwenAiAccountPolicy = loadTypeScriptModule('src/main/proxy/qwenAiAccountPolicy.ts')
 const storeModule = loadTypeScriptModule('src/main/proxy/responses/store.ts', {
   '../qwenAiSessionBridge': sessionBridge,
 })
@@ -428,6 +429,17 @@ function loadResponsesRouteHarness(options = {}) {
     },
     '../adapters/qwen-ai': {
       QWEN_AI_STREAM_FAILURE_EVENT: 'qwen-ai-stream-failure',
+      isQwenAiStaleSessionError: value => Boolean(
+        value && (
+          value.code === 'qwen_ai_session_stale'
+          || value.errorCode === 'qwen_ai_session_stale'
+          || value.status === 404
+          || value.status === 409
+          || ((value.status === 400 || value.status === 422)
+            && /^(chat|conversation|parent|response|session)[_-]?id$/i.test(String(value.param || '')))
+          || /chat(?:id)?[^\n]*not[ _-]?found|parent[^\n]*not[ _-]?found/i.test(String(value.message || value.error || ''))
+        )
+      ),
       QwenAiAdapter: {
         isQwenAiProvider: candidate => candidate?.apiEndpoint === 'https://chat.qwen.ai',
       },
@@ -603,6 +615,7 @@ function loadResponsesRouteHarness(options = {}) {
       getTrailingQwenAiToolResultBatch: toolCallSessionStoreModule.getTrailingQwenAiToolResultBatch,
       qwenAiToolCallSessionStore: toolCallSessions,
     },
+    '../qwenAiAccountPolicy': qwenAiAccountPolicy,
     '../toolCalling/workflowHeuristics': workflowHeuristics,
     '../responses/image': {
       ResponseImageResolutionError: MockImageResolutionError,
@@ -1221,6 +1234,18 @@ function loadForwarderForBridgeTests(overrides = {}) {
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
       findModelCapability: () => undefined,
+      isQwenAiStaleSessionError: value => Boolean(
+        value && (
+          value.code === 'qwen_ai_session_stale'
+          || value.errorCode === 'qwen_ai_session_stale'
+          || value.status === 404
+          || value.status === 409
+          || ((value.status === 400 || value.status === 422)
+            && /^(chat|conversation|parent|response|session)[_-]?id$/i.test(String(value.param || '')))
+          || /chat(?:id)?[^\n]*not[ _-]?found|parent[^\n]*not[ _-]?found/i.test(String(value.message || value.error || ''))
+        )
+      ),
+      isQwenAiTransientTransportError: () => false,
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
@@ -1249,6 +1274,7 @@ function loadForwarderForBridgeTests(overrides = {}) {
     './qwenAiRequestGovernor': {
       qwenAiRequestGovernor: { run: (_accountId, operation) => operation() },
     },
+    './qwenAiAccountPolicy': qwenAiAccountPolicy,
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
       bufferValidatedSseStream: async stream => stream,

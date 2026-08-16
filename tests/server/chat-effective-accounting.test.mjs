@@ -5,6 +5,10 @@ import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
 import { createAssistantOutputBoundaryStream } from '../../src/main/proxy/toolCalling/assistantOutputBoundary.ts'
+import {
+  isQwenAiAccountFault,
+  qwenAiAccountRetryScope,
+} from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'
 
@@ -255,6 +259,7 @@ function loadChatRoute({
       },
     },
     '../toolCalling/assistantOutputBoundary': { createAssistantOutputBoundaryStream },
+    '../qwenAiAccountPolicy': { isQwenAiAccountFault, qwenAiAccountRetryScope },
   }
   const testRequire = specifier => {
     if (specifier in localModules) return localModules[specifier]

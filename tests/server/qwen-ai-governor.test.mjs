@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import { isQwenAiAccountFault } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 function deferred() {
   let resolve
@@ -64,6 +65,7 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
     if (specifier === './qwenAiGovernorPolicy') {
       return { calculateQwenAiAdaptiveLimits, calculateQwenAiRequestReadyAt, parseQwenAiRetryAfterMs }
     }
+    if (specifier === './qwenAiAccountPolicy') return { isQwenAiAccountFault }
     throw new Error(`Unexpected governor test import: ${specifier}`)
   }
 
@@ -1131,11 +1133,13 @@ test('Qwen AI account-neutral failures bypass load-balancer penalties on immedia
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
 
   assert.match(proxyTypes, /accountFault\?: boolean/)
-  assert.match(forwarderSource, /upstreamAccountFault/)
-  assert.match(forwarderSource, /accountFault: sessionStateFailure \|\| continuationRejected[\s\S]*typeof upstreamAccountFault === 'boolean'/)
+  assert.match(forwarderSource, /qwenAiAccountFailureDetails\(/)
+  assert.match(forwarderSource, /inferredErrorAccountFault/)
+  assert.match(forwarderSource, /accountFault: clientCancelled \|\| sessionStateFailure \|\| continuationRejected/)
+  assert.match(forwarderSource, /: inferredErrorAccountFault/)
   assert.match(chatRouteSource, /result\.accountFault !== false/)
   assert.match(chatRouteSource, /isQwenAiAccountFault/)
-  assert.match(chatRouteSource, /accountFault: streamFailureAccountFault\(error\)/)
+  assert.match(chatRouteSource, /const failureAccountFault = streamFailureAccountFault\(error, failureStatus\)/)
 })
 
 test('Qwen AI risk-control failures cool the account and require distinct accounts before global circuit', () => {

@@ -7,6 +7,10 @@ import ts from 'typescript'
 import {
   sanitizeAssistantInputHistory as sanitizeRealAssistantInputHistory,
 } from '../../src/main/proxy/toolCalling/assistantInputBoundary.ts'
+import {
+  isQwenAiAccountFault,
+  qwenAiAccountRetryScope,
+} from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 const runtimeRequire = createRequire(import.meta.url)
 
@@ -121,6 +125,32 @@ function loadRequestForwarder(overrides = {}) {
         error.retryable = true
         governorMetrics.events.push({ type: 'upstream-fail', segment, accountId: this.account.id })
         throw error
+      }
+      const responseFailure = typeof overrides.responseFailure === 'function'
+        ? overrides.responseFailure({ accountId: this.account.id, segment, index })
+        : undefined
+      if (responseFailure) {
+        const status = responseFailure.status || 403
+        const code = responseFailure.code || 'qwen_ai_risk_control'
+        const message = responseFailure.message || 'mock response failure'
+        governorMetrics.events.push({ type: 'upstream-fail', segment, accountId: this.account.id })
+        return {
+          response: {
+            status,
+            headers: responseFailure.headers || {},
+            data: {
+              error: {
+                message,
+                code,
+                ...(responseFailure.accountFault === undefined
+                  ? {}
+                  : { accountFault: responseFailure.accountFault }),
+              },
+            },
+          },
+          chatId: `chat-${index}`,
+          parentId: null,
+        }
       }
       const failAccount = typeof overrides.failAccount === 'function'
         ? overrides.failAccount({ accountId: this.account.id, segment, index })
@@ -266,6 +296,8 @@ function loadRequestForwarder(overrides = {}) {
       QwenAiStreamHandler: MockQwenAiStreamHandler,
       createQwenAiResumableStream: stream => stream,
       findModelCapability: () => ({ maxContextLength: 100, maxSummaryGenerationLength: 10 }),
+      isQwenAiStaleSessionError: () => false,
+      isQwenAiTransientTransportError: () => false,
       isQwenAiUpstreamBusyMessage: () => false,
       qwenAiRequestTimeoutMsFromEnv: () => 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
@@ -378,6 +410,15 @@ function loadRequestForwarder(overrides = {}) {
         },
         reportAccountFailover: () => {},
       },
+    },
+    './qwenAiAccountPolicy': {
+      isQwenAiAccountFault,
+      qwenAiAccountRetryScope,
+      qwenAiAccountFailureDetails: value => ({
+        accountFault: isQwenAiAccountFault(value),
+        retryScope: qwenAiAccountRetryScope(value),
+      }),
+      qwenAiSafeExplicitRetryScope: () => undefined,
     },
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
@@ -548,6 +589,34 @@ test('final compaction ignores an empty role frame and changes account after a p
   for await (const chunk of result.stream) chunks.push(chunk.toString())
   assert.match(chunks.join(''), /"content":"final"/)
   assert.doesNotMatch(chunks.join(''), /"role":"assistant"/)
+})
+
+test('direct compaction HTTP 403 responses retain account failover metadata', async () => {
+  const harness = loadRequestForwarder({
+    responseFailure: ({ accountId, segment }) => (
+      segment === 'final context summary' && accountId === 'account-1'
+        ? { status: 403, code: 'qwen_ai_risk_control', message: 'risk control' }
+        : undefined
+    ),
+  })
+  const forwarder = new harness.RequestForwarder()
+  const result = await forwarder.forwardChatCompletion(
+    createRequest(true),
+    { id: 'account-1', credentials: {} },
+    { id: 'qwen-ai', apiEndpoint: 'https://chat.qwen.ai' },
+    'qwen3.7-plus',
+    createContext(true),
+  )
+
+  assert.equal(result.success, true)
+  assert.equal(result.effectiveAccountId, 'account-4')
+  assert.deepEqual(
+    harness.calls.filter(call => call.segment === 'final context summary').map(call => call.accountId),
+    ['account-1', 'account-4'],
+  )
+  const chunks = []
+  for await (const chunk of result.stream) chunks.push(chunk.toString())
+  assert.match(chunks.join(''), /"content":"final"/)
 })
 
 test('chunked compaction returns a real 403 when every final account fails before content', async () => {

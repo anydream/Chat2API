@@ -15,6 +15,27 @@ import {
 
 const runtimeRequire = createRequire(import.meta.url)
 
+function loadTypeScriptModule(path, localModules = {}) {
+  const source = fs.readFileSync(path, 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      esModuleInterop: true,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const module = { exports: {} }
+  const testRequire = specifier => {
+    if (Object.prototype.hasOwnProperty.call(localModules, specifier)) return localModules[specifier]
+    if (specifier.startsWith('.')) throw new Error(`Unexpected policy test import: ${specifier}`)
+    return runtimeRequire(specifier)
+  }
+  new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
+  return module.exports
+}
+
+const qwenAiAccountPolicy = loadTypeScriptModule('src/main/proxy/qwenAiAccountPolicy.ts')
+
 function adapterWithMatcher(name, matches = false) {
   const Adapter = class {}
   Adapter[name] = () => matches
@@ -78,6 +99,19 @@ function loadRequestForwarder(overrides = {}) {
       QwenAiAdapter: overrides.QwenAiAdapter || adapterWithMatcher('isQwenAiProvider', true),
       QwenAiStreamHandler: overrides.QwenAiStreamHandler || StreamHandler,
       findQwenAiModelCapability: overrides.findQwenAiModelCapability || (() => undefined),
+      findModelCapability: overrides.findModelCapability || (() => undefined),
+      isQwenAiStaleSessionError: overrides.isQwenAiStaleSessionError || (value => Boolean(
+        value && (
+          value.code === 'qwen_ai_session_stale'
+          || value.errorCode === 'qwen_ai_session_stale'
+          || value.status === 404
+          || value.status === 409
+          || ((value.status === 400 || value.status === 422)
+            && /^(chat|conversation|parent|response|session)[_-]?id$/i.test(String(value.param || '')))
+          || /chat(?:id)?[^\n]*not[ _-]?found|parent[^\n]*not[ _-]?found/i.test(String(value.message || value.error || ''))
+        )
+      )),
+      isQwenAiTransientTransportError: overrides.isQwenAiTransientTransportError || (() => false),
       isQwenAiUpstreamBusyMessage: value => /qwen_ai_upstream_busy/i.test(String(value || '')),
       qwenAiRequestTimeoutMsFromEnv: () => overrides.qwenAiRequestTimeoutMs ?? 600_000,
       qwenAiResponsesContinuationRetryAttemptsFromEnv: () => 0,
@@ -106,6 +140,7 @@ function loadRequestForwarder(overrides = {}) {
       qwenAiRequestGovernor: overrides.qwenAiRequestGovernor
         || { run: (_accountId, operation) => operation() },
     },
+    './qwenAiAccountPolicy': qwenAiAccountPolicy,
     './utils/validatedSseStream': {
       BufferedSseError: class BufferedSseError extends Error {},
       bufferValidatedSseStream: overrides.bufferValidatedSseStream || (async stream => stream),
@@ -1537,25 +1572,28 @@ test('Qwen AI forwarder keeps malformed-tool recovery in the same chat', async (
   continuedUpstream.destroy()
 })
 
-test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => {
+test('Qwen AI forwarder keeps only structural recovery cases tool-only', async (t) => {
   const scenarios = [
     {
       name: 'required tool choice',
       toolChoiceMode: 'required',
       failedToolResultPending: false,
       recoveryCode: 'qwen_ai_semantic_incomplete',
+      requireManagedToolCall: true,
     },
     {
       name: 'failed tool result',
       toolChoiceMode: 'auto',
       failedToolResultPending: true,
       recoveryCode: 'qwen_ai_semantic_incomplete',
+      requireManagedToolCall: false,
     },
     {
       name: 'invalid tool arguments',
       toolChoiceMode: 'auto',
       failedToolResultPending: false,
       recoveryCode: 'qwen_ai_invalid_tool_arguments',
+      requireManagedToolCall: true,
     },
     {
       name: 'managed tool-result wrapper leak',
@@ -1563,6 +1601,7 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
       failedToolResultPending: false,
       recoveryCode: 'qwen_ai_wrapper_leak',
       freshChat: true,
+      requireManagedToolCall: true,
     },
   ]
 
@@ -1654,8 +1693,15 @@ test('Qwen AI forwarder keeps mandatory recovery cases tool-only', async (t) => 
       await bridgeOptions[0].continueWorkflow('mandatory-recovery-response', recoveryError)
 
       assert.equal(continuationMessageOptions.length, 1)
-      assert.equal(continuationMessageOptions[0].requireManagedToolCall, true)
-      assert.equal(continuationMessageOptions[0].completionProofMissing, false)
+      assert.equal(
+        continuationMessageOptions[0].requireManagedToolCall,
+        scenario.requireManagedToolCall,
+      )
+      assert.equal(
+        continuationMessageOptions[0].completionProofMissing,
+        scenario.recoveryCode === 'qwen_ai_semantic_incomplete'
+          && !scenario.requireManagedToolCall,
+      )
       assert.equal(chatCompletionCalls.length, scenario.freshChat ? 2 : 1)
       assert.equal(continuationCalls.length, scenario.freshChat ? 0 : 1)
       if (scenario.freshChat) {

@@ -62,13 +62,13 @@ test('successful tool-result continuations use terminal assistant text as comple
   )
 })
 
-test('failed-result continuations still require a completion marker', () => {
+test('failed-result continuations allow terminal assistant text', () => {
   assert.equal(
     requiresManagedWorkflowCompletionMarker(managedPlan({
       workflowContinuation: true,
       failedToolResultPending: true,
     })),
-    true,
+    false,
   )
 })
 
@@ -162,7 +162,9 @@ test('workflow continuation completion proof follows protocol state and capabili
   assert.match(String(hermes.content), /chat2api_workflow_complete/)
   assert.match(String(hermes.content), /transport marker.*proxy removes it before delivery/i)
   assert.doesNotMatch(String(successfulHermes.content), /chat2api_workflow_complete/)
-  assert.match(String(failedHermes.content), /chat2api_workflow_complete/)
+  assert.doesNotMatch(String(failedHermes.content), /chat2api_workflow_complete/)
+  assert.match(String(failedHermes.content), /otherwise explain the blocking failure/i)
+  assert.doesNotMatch(String(failedHermes.content), /Return only one or more Qwen function calls/i)
   assert.doesNotMatch(String(managedXml.content), /chat2api_workflow_complete/)
 })
 

@@ -283,16 +283,18 @@ test('failed tool result state is preserved in the plan and continuation prompt'
     provider,
     actualModel: 'deepseek-chat',
   })
+  const renderedMessages = result.messages.map(message => String(message.content)).join('\n')
 
   assert.equal(result.plan.failedToolResultPending, true)
   assert.equal(result.plan.diagnostics.failedToolResultPending, true)
   assert.match(String(result.messages.at(-1)?.content), /previous tool result reported failure/)
   assert.match(String(result.messages.at(-1)?.content), /appropriate declared tool/)
   assert.match(String(result.messages.at(-1)?.content), /undeclared provider-side tools or capabilities/)
-  assert.match(String(result.messages.at(-1)?.content), /entire next response must be one managed tool-call XML block/)
-  assert.match(String(result.messages.at(-1)?.content), /Declared tool names: default_api:read_file, default_api:list_dir, default_api:write, default_api:todowrite/)
-  assert.match(String(result.messages.at(-1)?.content), /<\|CHAT2API\|invoke name="default_api:write">/)
-  assert.match(String(result.messages.at(-1)?.content), /<\|CHAT2API\|parameter name="filePath">/)
+  assert.match(String(result.messages.at(-1)?.content), /otherwise explain the blocking failure/i)
+  assert.doesNotMatch(String(result.messages.at(-1)?.content), /entire next response must be one managed tool-call XML block/)
+  assert.match(renderedMessages, /Tool `default_api:read_file`[\s\S]*Tool `default_api:todowrite`/)
+  assert.match(renderedMessages, /<\|CHAT2API\|invoke name="default_api:write">/)
+  assert.match(renderedMessages, /<\|CHAT2API\|parameter name="filePath">/)
   assert.doesNotMatch(String(result.messages.at(-1)?.content), /the operation failed|\/tmp\/a/)
 })
 

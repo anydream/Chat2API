@@ -75,7 +75,7 @@ ENV CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
 # Default to one same-chat semantic correction; the deployment controls the count.
 ENV CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 # Semantic continuation branches also share an absolute wall-clock deadline.
-ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
+ENV CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # Busy-chat admission is bounded separately from the long generation timeout.
 # Leave the generic retry-count override unset so ordinary semantic workflow
 # continuations retain deadline mode; Responses tool-result continuations use
@@ -92,7 +92,7 @@ ENV CHAT2API_SSE_KEEPALIVE_INTERVAL_MS=15000
 ENV CHAT2API_SHUTDOWN_DRAIN_TIMEOUT_MS=540000
 # Keep the default cumulative deadline below typical downstream transport
 # limits so a structured terminal response has time to propagate.
-ENV QWEN_AI_REQUEST_TIMEOUT_MS=540000
+ENV QWEN_AI_REQUEST_TIMEOUT_MS=840000
 # Zero disables only the additional post-admission response cap. The
 # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline still bounds the full request.
 ENV QWEN_AI_RESPONSE_TIMEOUT_MS=0

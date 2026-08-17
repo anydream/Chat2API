@@ -285,7 +285,7 @@ available through the generic Qwen AI governor panel or management API; no
 Claude-specific model or request path is required.
 
 Long-context Qwen responses use separate generic transport and response limits.
-`QWEN_AI_REQUEST_TIMEOUT_MS` defaults to `540000` ms in the Docker image and
+`QWEN_AI_REQUEST_TIMEOUT_MS` defaults to `840000` ms in the Docker image and
 Compose example, while `QWEN_AI_STREAM_IDLE_TIMEOUT_MS` defaults to `180000`
 ms. The value is deployment-configurable and should leave enough headroom below
 the downstream client or proxy deadline for a structured terminal response.
@@ -327,7 +327,7 @@ Response-id resumes and managed-tool continuations share the cumulative
  remain inside the configured cumulative request deadline. Set the recovery
  budget to `0` to disable recovery and return the original upstream failure.
 Managed semantic recovery also has an absolute
-`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` deadline (default `540000` ms).
+`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` deadline (default `840000` ms).
 It starts with the first workflow continuation and keeps running across active
 replacement streams, so repeated incomplete progress cannot bypass the
 no-progress budget or reach LiteLLM's outer timeout. It is clamped to the

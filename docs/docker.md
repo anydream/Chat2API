@@ -186,7 +186,7 @@ CHAT2API_QWEN_AI_AUTO_TUNE_ENABLED=true
 CHAT2API_QWEN_AI_AUTO_TUNE_MAX_CONCURRENT=20
 CHAT2API_QWEN_AI_AUTO_TUNE_MIN_GLOBAL_INTERVAL_MS=1000
 CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS=30000
-QWEN_AI_REQUEST_TIMEOUT_MS=540000
+QWEN_AI_REQUEST_TIMEOUT_MS=840000
 QWEN_AI_RESPONSE_TIMEOUT_MS=0
 QWEN_AI_STREAM_IDLE_TIMEOUT_MS=180000
 QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS=2000
@@ -199,7 +199,7 @@ CHAT2API_QWEN_AI_RETRY_COUNT=1
 CHAT2API_QWEN_AI_BUSY_RETRY_COUNT=1
 CHAT2API_QWEN_AI_WORKFLOW_CONTINUATION_ATTEMPTS=1
 CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS=180000
-CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=540000
+CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS=840000
 # Leave blank/unset for deadline mode; set a non-negative integer for an
 # explicit retry cap (0 disables busy-chat recovery).
 CHAT2API_QWEN_AI_CHAT_IN_PROGRESS_RETRY_ATTEMPTS=
@@ -275,7 +275,7 @@ Transport resumes and managed workflow continuations also share the bounded
  preserving generations that are making progress within the route budget.
 Set it to `0` to disable recovery and surface the original upstream failure.
 Once a managed semantic recovery starts,
-`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` (default `540000` ms) adds an
+`CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS` (default `840000` ms) adds an
 absolute wall-clock limit across every replacement branch. Unlike the
 no-progress budget, this timer keeps running while a continuation emits output,
 so repeated incomplete branches cannot outlive the outer LiteLLM timeout. On

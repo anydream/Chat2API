@@ -6,7 +6,7 @@ services:
     image: chat2api:server
     container_name: chat2api
     restart: unless-stopped
-    # Match the server's default 9-minute request budget plus a small margin;
+    # Match the server's default 14-minute request budget plus a small margin;
     # override for deployments with a different shutdown drain policy.
     stop_grace_period: ${CHAT2API_STOP_GRACE_PERIOD:-10m}
     ports:
@@ -87,7 +87,7 @@ services:
       CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS: ${CHAT2API_QWEN_AI_RECOVERY_BUDGET_MS:-180000}
       # Once semantic recovery begins, cap the full continuation chain even
       # while replacement branches keep producing incomplete progress.
-      CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-540000}
+      CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS: ${CHAT2API_QWEN_AI_WORKFLOW_RECOVERY_TIMEOUT_MS:-840000}
       # A busy-chat admission response retries the exact same continuation
       # payload; it never creates another user turn or switches accounts.
       # Busy-chat admission has its own wall-clock budget; it must not inherit
@@ -111,7 +111,7 @@ services:
       CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS: ${CHAT2API_QWEN_AI_ACCOUNT_MIN_INTERVAL_MS-}
       # Leave transport headroom for downstream clients and proxy layers to
       # receive a structured terminal response. Override per deployment.
-      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-540000}
+      QWEN_AI_REQUEST_TIMEOUT_MS: ${QWEN_AI_REQUEST_TIMEOUT_MS:-840000}
       # Zero disables only the additional post-admission response cap. The
       # cumulative QWEN_AI_REQUEST_TIMEOUT_MS deadline remains authoritative.
       QWEN_AI_RESPONSE_TIMEOUT_MS: ${QWEN_AI_RESPONSE_TIMEOUT_MS:-0}

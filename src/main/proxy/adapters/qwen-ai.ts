@@ -64,7 +64,7 @@ import {
 import type { QwenAiSessionState } from '../qwenAiSessionBridge'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
-const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 300000)
+const QWEN_AI_REQUEST_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_REQUEST_TIMEOUT_MS', 840000)
 const QWEN_AI_RESPONSE_TIMEOUT_MS = nonNegativeNumberFromEnv('QWEN_AI_RESPONSE_TIMEOUT_MS', 0)
 const QWEN_AI_STREAM_IDLE_TIMEOUT_MS = positiveNumberFromEnv('QWEN_AI_STREAM_IDLE_TIMEOUT_MS', 180000)
 const QWEN_AI_REQUEST_MAX_BYTES_DEFAULT = 90 * 1024
@@ -94,7 +94,7 @@ const QWEN_AI_RECOVERY_MAX_BUDGET_MS = 30 * 60 * 1_000
 // Once semantic recovery starts, every replacement branch belongs to one
 // logical recovery episode. Bound its total wall time even while Qwen keeps
 // producing progress that would otherwise pause the no-progress budget.
-const QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS = 540_000
+const QWEN_AI_WORKFLOW_RECOVERY_DEFAULT_TIMEOUT_MS = 840_000
 const QWEN_AI_WORKFLOW_RECOVERY_MAX_TIMEOUT_MS = 30 * 60 * 1_000
 
 export const QWEN_AI_STREAM_FAILURE_EVENT = 'qwen-ai-stream-failure'

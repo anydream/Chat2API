@@ -35,7 +35,7 @@ export function detectMarkers(buffer: string, markers: string[]): ToolProtocolDe
 }
 
 export function stripFencedCodeBlocks(content: string): string {
-  return content.replace(/```[\s\S]*?```/g, '')
+  return content.replace(/```[\s\S]*?(?:```|$)/g, '')
 }
 
 export function toolNames(tools: NormalizedToolDefinition[]): Set<string> {
@@ -95,12 +95,14 @@ export function normalizeArguments(args: unknown, tool?: NormalizedToolDefinitio
     }
   }
 
-  return JSON.stringify(normalizeArgumentsForSchema(args ?? {}, tool))
+  return JSON.stringify(normalizeArgumentsForSchema(args === undefined ? {} : args, tool))
 }
 
 export interface ToolArgumentValidationIssues {
   missingRequired: string[]
   unexpected: string[]
+  typeMismatches: string[]
+  valueMismatches?: string[]
 }
 
 /**
@@ -114,16 +116,33 @@ export function getToolArgumentValidationIssues(
   args: unknown,
   tool?: NormalizedToolDefinition,
 ): ToolArgumentValidationIssues {
-  if (!tool) return { missingRequired: [], unexpected: [] }
+  if (!tool) return { missingRequired: [], unexpected: [], typeMismatches: [] }
 
   const parsed = parseArgumentCandidate(args)
-  if (!parsed.ok) return { missingRequired: [], unexpected: [] }
+  if (!parsed.ok) return { missingRequired: [], unexpected: [], typeMismatches: [] }
 
-  const normalized = normalizeArgumentsForSchema(parsed.value ?? {}, tool)
+  const normalized = normalizeArgumentsForSchema(
+    parsed.value === undefined ? {} : parsed.value,
+    tool,
+  )
+  const issues = collectSchemaValidationIssues(normalized, tool.parameters)
   return {
-    missingRequired: collectMissingRequiredFields(normalized, tool.parameters),
-    unexpected: collectUnexpectedArgumentFields(normalized, tool.parameters),
+    missingRequired: issues.missingRequired,
+    unexpected: issues.unexpected,
+    typeMismatches: issues.typeMismatches,
+    ...(issues.valueMismatches.length > 0 ? { valueMismatches: issues.valueMismatches } : {}),
   }
+}
+
+export function hasToolArgumentValidationIssues(
+  args: unknown,
+  tool?: NormalizedToolDefinition,
+): boolean {
+  const issues = getToolArgumentValidationIssues(args, tool)
+  return issues.missingRequired.length > 0
+    || issues.unexpected.length > 0
+    || issues.typeMismatches.length > 0
+    || (issues.valueMismatches?.length ?? 0) > 0
 }
 
 export function getMissingRequiredArguments(args: unknown, tool?: NormalizedToolDefinition): string[] {
@@ -280,41 +299,114 @@ export function normalizeArgumentsForSchema(
 }
 
 function normalizeValueForSchema(value: unknown, schema: unknown): unknown {
-  const variants = schemaVariants(schema)
-  const arraySchema = variants.find(schemaExpectsArray)
-  if (arraySchema) {
-    const itemSchema = getSchemaProperty(arraySchema, 'items')
-    if (Array.isArray(value)) {
-      return value.map((item) => normalizeValueForSchema(item, itemSchema))
-    }
+  if (!isPlainObject(schema)) return normalizeUntypedValue(value)
 
-    if (isPlainObject(value)) {
-      return [normalizeValueForSchema(value, itemSchema)]
-    }
+  let normalized = normalizeDirectValueForSchema(value, schema)
 
-    return value
+  // allOf adds constraints; each branch must be applied to the same value.
+  for (const branch of getSchemaArray(schema, 'allOf')) {
+    normalized = normalizeValueForSchema(normalized, branch)
   }
 
-  const objectSchema = variants.find(schemaExpectsObject)
-  if (objectSchema && isPlainObject(value)) {
-    const properties = getObjectSchemaProperties(objectSchema)
-    if (!properties) return normalizeObjectProperties(value, undefined)
-
-    return normalizeObjectProperties(value, properties)
+  // oneOf/anyOf are alternatives. Select one complete branch instead of
+  // mixing array handling from one branch with object/scalar rules from another.
+  for (const key of ['oneOf', 'anyOf'] as const) {
+    const branches = getSchemaArray(schema, key)
+    if (branches.length > 0) {
+      normalized = normalizeBestSchemaVariant(normalized, branches, schema)
+    }
   }
 
-  const scalar = normalizeScalarForSchema(value, variants)
-  if (scalar !== value) return scalar
+  return normalized
+}
 
+function normalizeDirectValueForSchema(value: unknown, schema: Record<string, unknown>): unknown {
+  const structuredValue = restoreStructuredJsonValue(value, schema)
+  const expectsArray = schemaExpectsArray(schema)
+  const expectsObject = schemaExpectsObject(schema)
+
+  if (Array.isArray(structuredValue) && expectsArray) {
+    const itemSchema = getSchemaProperty(schema, 'items')
+    return structuredValue.map((item) => normalizeValueForSchema(item, itemSchema))
+  }
+
+  if (isPlainObject(structuredValue) && expectsObject) {
+    return normalizeObjectProperties(structuredValue, schema)
+  }
+
+  if (isPlainObject(structuredValue) && expectsArray && !expectsObject) {
+    const itemSchema = getSchemaProperty(schema, 'items')
+    return [normalizeValueForSchema(structuredValue, itemSchema)]
+  }
+
+  const scalar = normalizeScalarForSchema(structuredValue, [schema])
+  if (scalar !== structuredValue) return scalar
+  return normalizeUntypedValue(structuredValue)
+}
+
+function normalizeUntypedValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((item) => normalizeValueForSchema(item, undefined))
   }
-
-  if (isPlainObject(value)) {
-    return normalizeObjectProperties(value, undefined)
-  }
-
+  if (isPlainObject(value)) return normalizeObjectProperties(value, undefined)
   return value
+}
+
+function restoreStructuredJsonValue(value: unknown, schema: Record<string, unknown>): unknown {
+  if (typeof value !== 'string' || schemaAcceptsStringValue(schema, value)) return value
+
+  const trimmed = value.trim()
+  const expectsArray = schemaExpectsArray(schema)
+  const expectsObject = schemaExpectsObject(schema)
+  const couldBeArray = expectsArray && trimmed.startsWith('[') && trimmed.endsWith(']')
+  const couldBeObject = (expectsObject || expectsArray)
+    && trimmed.startsWith('{')
+    && trimmed.endsWith('}')
+  if (!couldBeArray && !couldBeObject) return value
+
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (Array.isArray(parsed) && expectsArray) return parsed
+    if (isPlainObject(parsed) && (expectsObject || expectsArray)) return parsed
+  } catch {
+    // Only exact JSON is eligible here. Malformed-snapshot recovery belongs to
+    // the outer tool-call parser and must not guess nested argument values.
+  }
+  return value
+}
+
+function schemaAcceptsStringValue(schema: Record<string, unknown>, value: string): boolean {
+  if (schemaTypeIncludes(schema, 'string')) return true
+  if (Object.prototype.hasOwnProperty.call(schema, 'const') && schema.const === value) return true
+  const enumValues = Array.isArray(schema.enum) ? schema.enum : []
+  return enumValues.some((candidate) => candidate === value)
+}
+
+function normalizeBestSchemaVariant(
+  value: unknown,
+  branches: unknown[],
+  parentSchema: Record<string, unknown>,
+): unknown {
+  const candidates = branches.map((branch, index) => {
+    const originalIssues = collectSchemaValidationIssues(value, parentSchema)
+    const normalized = normalizeValueForSchema(value, branch)
+    const normalizedIssues = collectSchemaValidationIssues(normalized, parentSchema)
+    return {
+      index,
+      normalized,
+      issueCount: schemaIssueCount(normalizedIssues),
+      originalWasValid: schemaIssueCount(originalIssues) === 0,
+      changedKind: jsonValueKind(value) !== jsonValueKind(normalized),
+    }
+  })
+
+  candidates.sort((left, right) => {
+    if (left.issueCount !== right.issueCount) return left.issueCount - right.issueCount
+    if (left.originalWasValid !== right.originalWasValid) return left.originalWasValid ? -1 : 1
+    if (left.changedKind !== right.changedKind) return left.changedKind ? 1 : -1
+    return left.index - right.index
+  })
+  return candidates[0]?.normalized ?? value
 }
 
 function normalizeScalarForSchema(value: unknown, variants: unknown[]): unknown {
@@ -377,28 +469,30 @@ function schemaAcceptsScalar(schema: unknown, value: unknown): boolean {
 
 function normalizeObjectProperties(
   value: Record<string, unknown>,
-  properties: Record<string, unknown> | undefined,
+  schema: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
+  const properties = getObjectSchemaProperties(schema)
+  const patternProperties = getSchemaProperty(schema, 'patternProperties')
+  const additionalProperties = getSchemaProperty(schema, 'additionalProperties')
   return Object.fromEntries(
-    Object.entries(value).map(([key, item]) => [
-      key,
-      normalizeValueForSchema(item, properties?.[key]),
-    ]),
+    Object.entries(value).map(([key, item]) => {
+      const propertySchema = properties?.[key]
+      const patternSchemas = getMatchingPatternSchemas(key, patternProperties)
+      let normalized = propertySchema === undefined
+        ? item
+        : normalizeValueForSchema(item, propertySchema)
+      for (const patternSchema of patternSchemas) {
+        normalized = normalizeValueForSchema(normalized, patternSchema)
+      }
+      if (propertySchema === undefined && patternSchemas.length === 0 && isPlainObject(additionalProperties)) {
+        normalized = normalizeValueForSchema(normalized, additionalProperties)
+      }
+      if (propertySchema === undefined && patternSchemas.length === 0 && !isPlainObject(additionalProperties)) {
+        normalized = normalizeValueForSchema(normalized, undefined)
+      }
+      return [key, normalized]
+    }),
   )
-}
-
-function schemaVariants(schema: unknown): unknown[] {
-  if (!isPlainObject(schema)) return []
-
-  const variants: unknown[] = [schema]
-  for (const key of ['oneOf', 'anyOf', 'allOf'] as const) {
-    const nested = schema[key]
-    if (Array.isArray(nested)) {
-      variants.push(...nested.flatMap(schemaVariants))
-    }
-  }
-
-  return variants
 }
 
 function schemaExpectsArray(schema: unknown): boolean {
@@ -406,7 +500,11 @@ function schemaExpectsArray(schema: unknown): boolean {
 }
 
 function schemaExpectsObject(schema: unknown): boolean {
-  return schemaTypeIncludes(schema, 'object') || Boolean(getObjectSchemaProperties(schema))
+  return schemaTypeIncludes(schema, 'object')
+    || Boolean(getObjectSchemaProperties(schema))
+    || isPlainObject(getSchemaProperty(schema, 'patternProperties'))
+    || isPlainObject(getSchemaProperty(schema, 'additionalProperties'))
+    || getRequiredFields(schema).length > 0
 }
 
 function schemaTypeIncludes(schema: unknown, type: string): boolean {
@@ -456,117 +554,354 @@ function parseArgumentCandidate(args: unknown): { ok: true; value: unknown } | {
   }
 }
 
-function collectMissingRequiredFields(value: unknown, schema: unknown, path: string = ''): string[] {
-  if (!isPlainObject(schema)) return []
+interface SchemaValidationIssueSet {
+  missingRequired: string[]
+  unexpected: string[]
+  typeMismatches: string[]
+  valueMismatches: string[]
+}
 
-  const oneOf = getSchemaArray(schema, 'oneOf')
-  const anyOf = getSchemaArray(schema, 'anyOf')
-  if (oneOf.length > 0 || anyOf.length > 0) {
-    const variants = [...oneOf, ...anyOf]
-    return shortestMissingSet(variants.map((variant) => collectMissingRequiredFields(value, variant, path)))
+function collectSchemaValidationIssues(
+  value: unknown,
+  schema: unknown,
+  path: string = '',
+): SchemaValidationIssueSet {
+  if (!isPlainObject(schema)) return emptySchemaValidationIssues()
+
+  let issues = collectDirectSchemaValidationIssues(value, schema, path)
+  for (const branch of getSchemaArray(schema, 'allOf')) {
+    issues = mergeSchemaValidationIssues(issues, collectSchemaValidationIssues(value, branch, path))
   }
 
-  const allOf = getSchemaArray(schema, 'allOf')
-  const allOfMissing = allOf.flatMap((variant) => collectMissingRequiredFields(value, variant, path))
+  for (const key of ['oneOf', 'anyOf'] as const) {
+    const branches = getSchemaArray(schema, key)
+    if (branches.length === 0) continue
+    const branchIssues = branches.map((branch) => collectSchemaValidationIssues(value, branch, path))
+    const matchingBranches = branchIssues.filter(branch => schemaIssueCount(branch) === 0).length
+    if (key === 'oneOf' && matchingBranches > 1) {
+      issues.valueMismatches.push(`${displaySchemaPath(path)} (value matches multiple oneOf branches)`)
+    } else {
+      issues = mergeSchemaValidationIssues(issues, bestSchemaValidationIssues(branchIssues))
+    }
+  }
 
-  if (schemaExpectsArray(schema)) {
+  return uniqueSchemaValidationIssues(issues)
+}
+
+function collectDirectSchemaValidationIssues(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path: string,
+): SchemaValidationIssueSet {
+  let issues = emptySchemaValidationIssues()
+  const expectedTypes = expectedSchemaTypes(schema)
+  const actualType = jsonValueKind(value)
+  if (expectedTypes.length > 0 && !expectedTypes.some((type) => valueMatchesSchemaType(value, type))) {
+    issues.typeMismatches.push(
+      `${displaySchemaPath(path)} (expected ${expectedTypes.join(' or ')}, received ${actualType})`,
+    )
+  }
+
+  if (Object.prototype.hasOwnProperty.call(schema, 'const') && !jsonValuesEqual(value, schema.const)) {
+    issues.valueMismatches.push(`${displaySchemaPath(path)} (value does not match const)`)
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => jsonValuesEqual(value, candidate))) {
+    issues.valueMismatches.push(`${displaySchemaPath(path)} (value is not in enum)`)
+  }
+  issues.valueMismatches.push(...collectSchemaConstraintIssues(value, schema, path))
+
+  if (Array.isArray(value)) {
     const itemSchema = getSchemaProperty(schema, 'items')
-    if (!Array.isArray(value)) return uniqueStrings(allOfMissing)
-    return uniqueStrings([
-      ...allOfMissing,
-      ...value.flatMap((item, index) => collectMissingRequiredFields(item, itemSchema, `${path}[${index}]`)),
-    ])
+    if (itemSchema !== undefined) {
+      for (let index = 0; index < value.length; index += 1) {
+        issues = mergeSchemaValidationIssues(
+          issues,
+          collectSchemaValidationIssues(value[index], itemSchema, `${path}[${index}]`),
+        )
+      }
+    }
+    return issues
   }
+
+  if (!isPlainObject(value)) return issues
 
   const properties = getObjectSchemaProperties(schema)
   const required = getRequiredFields(schema)
-  if (!schemaExpectsObject(schema) && required.length === 0 && !properties) {
-    return uniqueStrings(allOfMissing)
-  }
-
-  if (!isPlainObject(value)) {
-    return uniqueStrings([...allOfMissing, ...required.map((field) => joinRequiredPath(path, field))])
-  }
-
-  const ownMissing = required
-    .filter((field) => !Object.prototype.hasOwnProperty.call(value, field))
-    .map((field) => joinRequiredPath(path, field))
-
-  const nestedMissing = properties
-    ? Object.entries(properties).flatMap(([field, propertySchema]) => {
-      if (!Object.prototype.hasOwnProperty.call(value, field)) return []
-      return collectMissingRequiredFields(value[field], propertySchema, joinRequiredPath(path, field))
-    })
-    : []
-
-  return uniqueStrings([...allOfMissing, ...ownMissing, ...nestedMissing])
-}
-
-function collectUnexpectedArgumentFields(value: unknown, schema: unknown, path: string = ''): string[] {
-  if (!isPlainObject(schema)) return []
-
-  const oneOf = getSchemaArray(schema, 'oneOf')
-  const anyOf = getSchemaArray(schema, 'anyOf')
-  if (oneOf.length > 0 || anyOf.length > 0) {
-    const variants = [...oneOf, ...anyOf]
-    return shortestIssueSet(variants.map((variant) => collectUnexpectedArgumentFields(value, variant, path)))
-  }
-
-  const allOf = getSchemaArray(schema, 'allOf')
-  const allOfUnexpected = allOf.flatMap((variant) => collectUnexpectedArgumentFields(value, variant, path))
-
-  if (schemaExpectsArray(schema)) {
-    const itemSchema = getSchemaProperty(schema, 'items')
-    if (!Array.isArray(value)) return uniqueStrings(allOfUnexpected)
-    return uniqueStrings([
-      ...allOfUnexpected,
-      ...value.flatMap((item, index) => collectUnexpectedArgumentFields(item, itemSchema, `${path}[${index}]`)),
-    ])
-  }
-
-  const properties = getObjectSchemaProperties(schema)
-  if (!isPlainObject(value)) return uniqueStrings(allOfUnexpected)
+  issues.missingRequired.push(
+    ...required
+      .filter((field) => !Object.prototype.hasOwnProperty.call(value, field))
+      .map((field) => joinRequiredPath(path, field)),
+  )
 
   const additionalProperties = getSchemaProperty(schema, 'additionalProperties')
   const patternProperties = getSchemaProperty(schema, 'patternProperties')
-  const unexpected = additionalProperties === false
-    ? Object.keys(value)
-      .filter((key) => !properties || !Object.prototype.hasOwnProperty.call(properties, key))
-      .filter((key) => !matchesPatternProperty(key, patternProperties))
-      .map((key) => joinRequiredPath(path, key))
-    : []
+  for (const [field, fieldValue] of Object.entries(value)) {
+    const fieldPath = joinRequiredPath(path, field)
+    const propertySchema = properties?.[field]
+    const patternSchemas = getMatchingPatternSchemas(field, patternProperties)
 
-  const nested = properties
-    ? Object.entries(properties).flatMap(([field, propertySchema]) => {
-      if (!Object.prototype.hasOwnProperty.call(value, field)) return []
-      return collectUnexpectedArgumentFields(value[field], propertySchema, joinRequiredPath(path, field))
-    })
-    : []
+    if (propertySchema !== undefined) {
+      issues = mergeSchemaValidationIssues(
+        issues,
+        collectSchemaValidationIssues(fieldValue, propertySchema, fieldPath),
+      )
+    }
+    for (const patternSchema of patternSchemas) {
+      issues = mergeSchemaValidationIssues(
+        issues,
+        collectSchemaValidationIssues(fieldValue, patternSchema, fieldPath),
+      )
+    }
 
-  // A schema can explicitly permit additional properties while still
-  // constraining their values with a nested schema. Unknown keys are valid in
-  // that case, but recurse so nested strict objects are checked as well.
-  const additionalSchema = isPlainObject(additionalProperties) ? additionalProperties : undefined
-  const additionalNested = additionalSchema
-    ? Object.keys(value)
-      .filter((key) => !properties || !Object.prototype.hasOwnProperty.call(properties, key))
-      .flatMap((key) => collectUnexpectedArgumentFields(value[key], additionalSchema, joinRequiredPath(path, key)))
-    : []
+    const declared = propertySchema !== undefined || patternSchemas.length > 0
+    if (!declared && additionalProperties === false) {
+      issues.unexpected.push(fieldPath)
+    } else if (!declared && isPlainObject(additionalProperties)) {
+      issues = mergeSchemaValidationIssues(
+        issues,
+        collectSchemaValidationIssues(fieldValue, additionalProperties, fieldPath),
+      )
+    }
+  }
 
-  return uniqueStrings([...allOfUnexpected, ...unexpected, ...nested, ...additionalNested])
+  return issues
 }
 
-function matchesPatternProperty(key: string, patternProperties: unknown): boolean {
-  if (!isPlainObject(patternProperties)) return false
+/**
+ * Check the finite-value JSON Schema constraints that are most commonly used
+ * by client tools.  This remains deliberately small and deterministic rather
+ * than attempting to become a general-purpose schema engine.
+ */
+function collectSchemaConstraintIssues(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path: string,
+): string[] {
+  const label = displaySchemaPath(path)
+  const mismatches: string[] = []
 
-  return Object.keys(patternProperties).some((pattern) => {
+  if (Array.isArray(value)) {
+    const minItems = nonNegativeIntegerSchemaValue(schema.minItems)
+    if (minItems !== undefined && value.length < minItems) {
+      mismatches.push(`${label} (array has ${value.length} items, minimum is ${minItems})`)
+    }
+
+    const maxItems = nonNegativeIntegerSchemaValue(schema.maxItems)
+    if (maxItems !== undefined && value.length > maxItems) {
+      mismatches.push(`${label} (array has ${value.length} items, maximum is ${maxItems})`)
+    }
+
+    if (schema.uniqueItems === true) {
+      outer: for (let left = 0; left < value.length; left += 1) {
+        for (let right = left + 1; right < value.length; right += 1) {
+          if (jsonValuesEqual(value[left], value[right])) {
+            mismatches.push(`${label} (array items must be unique)`)
+            break outer
+          }
+        }
+      }
+    }
+  }
+
+  if (typeof value === 'string') {
+    // JSON Schema string lengths are measured in Unicode code points, rather
+    // than UTF-16 code units, so astral characters count as one character.
+    const length = [...value].length
+    const minLength = nonNegativeIntegerSchemaValue(schema.minLength)
+    if (minLength !== undefined && length < minLength) {
+      mismatches.push(`${label} (string has length ${length}, minimum is ${minLength})`)
+    }
+
+    const maxLength = nonNegativeIntegerSchemaValue(schema.maxLength)
+    if (maxLength !== undefined && length > maxLength) {
+      mismatches.push(`${label} (string has length ${length}, maximum is ${maxLength})`)
+    }
+
+    if (typeof schema.pattern === 'string') {
+      try {
+        if (!new RegExp(schema.pattern).test(value)) {
+          mismatches.push(`${label} (string does not match pattern)`)
+        }
+      } catch {
+        // Ignore malformed provider-supplied patterns. Other schema rules
+        // remain enforceable without rejecting every otherwise valid call.
+      }
+    }
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const minimum = finiteSchemaNumber(schema.minimum)
+    const maximum = finiteSchemaNumber(schema.maximum)
+    const exclusiveMinimum = finiteSchemaNumber(schema.exclusiveMinimum)
+    const exclusiveMaximum = finiteSchemaNumber(schema.exclusiveMaximum)
+
+    if (exclusiveMinimum !== undefined && value <= exclusiveMinimum) {
+      mismatches.push(`${label} (number must be greater than ${exclusiveMinimum})`)
+    } else if (schema.exclusiveMinimum === true && minimum !== undefined && value <= minimum) {
+      mismatches.push(`${label} (number must be greater than ${minimum})`)
+    } else if (minimum !== undefined && value < minimum) {
+      mismatches.push(`${label} (number is below minimum ${minimum})`)
+    }
+
+    if (exclusiveMaximum !== undefined && value >= exclusiveMaximum) {
+      mismatches.push(`${label} (number must be less than ${exclusiveMaximum})`)
+    } else if (schema.exclusiveMaximum === true && maximum !== undefined && value >= maximum) {
+      mismatches.push(`${label} (number must be less than ${maximum})`)
+    } else if (maximum !== undefined && value > maximum) {
+      mismatches.push(`${label} (number is above maximum ${maximum})`)
+    }
+
+    const multipleOf = finiteSchemaNumber(schema.multipleOf)
+    if (multipleOf !== undefined && multipleOf > 0) {
+      const quotient = value / multipleOf
+      const nearestInteger = Math.round(quotient)
+      const tolerance = Number.EPSILON * Math.max(1, Math.abs(quotient)) * 8
+      if (Math.abs(quotient - nearestInteger) > tolerance) {
+        mismatches.push(`${label} (number is not a multiple of ${multipleOf})`)
+      }
+    }
+  }
+
+  if (isPlainObject(value)) {
+    const propertyCount = Object.keys(value).length
+    const minProperties = nonNegativeIntegerSchemaValue(schema.minProperties)
+    if (minProperties !== undefined && propertyCount < minProperties) {
+      mismatches.push(`${label} (object has ${propertyCount} properties, minimum is ${minProperties})`)
+    }
+
+    const maxProperties = nonNegativeIntegerSchemaValue(schema.maxProperties)
+    if (maxProperties !== undefined && propertyCount > maxProperties) {
+      mismatches.push(`${label} (object has ${propertyCount} properties, maximum is ${maxProperties})`)
+    }
+  }
+
+  return mismatches
+}
+
+function nonNegativeIntegerSchemaValue(value: unknown): number | undefined {
+  return typeof value === 'number'
+    && Number.isInteger(value)
+    && Number.isFinite(value)
+    && value >= 0
+    ? value
+    : undefined
+}
+
+function finiteSchemaNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function expectedSchemaTypes(schema: Record<string, unknown>): string[] {
+  const declared = typeof schema.type === 'string'
+    ? [schema.type]
+    : Array.isArray(schema.type)
+      ? schema.type.filter((type): type is string => typeof type === 'string')
+      : []
+  const inferred = declared.length > 0
+    ? declared
+    : schemaExpectsArray(schema)
+      ? ['array']
+      : schemaExpectsObject(schema)
+        ? ['object']
+        : []
+  if (inferred.length === 0) return []
+
+  return uniqueStrings([
+    ...inferred,
+    ...(schema.nullable === true && !inferred.includes('null') ? ['null'] : []),
+  ])
+}
+
+function valueMatchesSchemaType(value: unknown, type: string): boolean {
+  if (type === 'null') return value === null
+  if (type === 'array') return Array.isArray(value)
+  if (type === 'object') return isPlainObject(value)
+  if (type === 'string') return typeof value === 'string'
+  if (type === 'boolean') return typeof value === 'boolean'
+  if (type === 'number') return typeof value === 'number' && Number.isFinite(value)
+  if (type === 'integer') return typeof value === 'number' && Number.isInteger(value)
+  return true
+}
+
+function emptySchemaValidationIssues(): SchemaValidationIssueSet {
+  return { missingRequired: [], unexpected: [], typeMismatches: [], valueMismatches: [] }
+}
+
+function mergeSchemaValidationIssues(
+  left: SchemaValidationIssueSet,
+  right: SchemaValidationIssueSet,
+): SchemaValidationIssueSet {
+  return {
+    missingRequired: [...left.missingRequired, ...right.missingRequired],
+    unexpected: [...left.unexpected, ...right.unexpected],
+    typeMismatches: [...left.typeMismatches, ...right.typeMismatches],
+    valueMismatches: [...left.valueMismatches, ...right.valueMismatches],
+  }
+}
+
+function uniqueSchemaValidationIssues(issues: SchemaValidationIssueSet): SchemaValidationIssueSet {
+  return {
+    missingRequired: uniqueStrings(issues.missingRequired),
+    unexpected: uniqueStrings(issues.unexpected),
+    typeMismatches: uniqueStrings(issues.typeMismatches),
+    valueMismatches: uniqueStrings(issues.valueMismatches),
+  }
+}
+
+function bestSchemaValidationIssues(issueSets: SchemaValidationIssueSet[]): SchemaValidationIssueSet {
+  if (issueSets.length === 0) return emptySchemaValidationIssues()
+  return issueSets.reduce((best, candidate) => (
+    schemaIssueCount(candidate) < schemaIssueCount(best) ? candidate : best
+  ))
+}
+
+function schemaIssueCount(issues: SchemaValidationIssueSet): number {
+  return issues.missingRequired.length
+    + issues.unexpected.length
+    + issues.typeMismatches.length
+    + issues.valueMismatches.length
+}
+
+function displaySchemaPath(path: string): string {
+  return path || '$'
+}
+
+function jsonValueKind(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  if (isPlainObject(value)) return 'object'
+  if (typeof value === 'number' && Number.isInteger(value)) return 'integer'
+  return typeof value
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((item, index) => jsonValuesEqual(item, right[index]))
+  }
+
+  if (!isPlainObject(left) || !isPlainObject(right)) return false
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every(key => Object.prototype.hasOwnProperty.call(right, key)
+      && jsonValuesEqual(left[key], right[key]))
+}
+
+function getMatchingPatternSchemas(key: string, patternProperties: unknown): unknown[] {
+  if (!isPlainObject(patternProperties)) return []
+
+  return Object.entries(patternProperties).flatMap(([pattern, patternSchema]) => {
     try {
-      return new RegExp(pattern).test(key)
+      return new RegExp(pattern).test(key) ? [patternSchema] : []
     } catch {
       // Ignore malformed provider-supplied patterns. The rest of the schema
       // remains enforceable and the invalid pattern is not a reason to reject
       // every otherwise valid call.
-      return false
+      return []
     }
   })
 }
@@ -574,16 +909,6 @@ function matchesPatternProperty(key: string, patternProperties: unknown): boolea
 function getSchemaArray(schema: Record<string, unknown>, key: string): unknown[] {
   const value = schema[key]
   return Array.isArray(value) ? value : []
-}
-
-function shortestMissingSet(sets: string[][]): string[] {
-  if (sets.length === 0) return []
-  return sets.reduce((best, candidate) => candidate.length < best.length ? candidate : best)
-}
-
-function shortestIssueSet(sets: string[][]): string[] {
-  if (sets.length === 0) return []
-  return sets.reduce((best, candidate) => candidate.length < best.length ? candidate : best)
 }
 
 function getRequiredFields(schema: unknown): string[] {

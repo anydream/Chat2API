@@ -12,6 +12,7 @@ import { CustomProviderManager } from '../../../providers/custom'
 import { ProviderChecker } from '../../../providers/checker'
 import { getBuiltinProvider } from '../../../providers/builtin'
 import { mergeProviderModelCapabilities, parseProviderModelsResponse } from '../../../providers/modelSync'
+import { withQwenAiModelModeAliases } from '../../../providers/qwen-ai-model-mode'
 import AccountManager from '../../../store/accounts'
 import { storeManager } from '../../../store/store'
 import axios from 'axios'
@@ -304,7 +305,10 @@ router.post('/:id/models/update', async (ctx: Context) => {
       return
     }
 
-    const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
+    const parsedModels = parseProviderModelsResponse(response.data)
+    const { supportedModels, modelMappings, modelCapabilities } = providerId === 'qwen-ai'
+      ? withQwenAiModelModeAliases(parsedModels)
+      : parsedModels
     if (supportedModels.length === 0) {
       ctx.body = createSuccessResponse({
         success: false,

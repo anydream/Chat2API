@@ -75,7 +75,7 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
   const models = extractModelsPayload(responseData)
   const supportedModels: string[] = []
   const modelMappings: Record<string, string> = {}
-  const modelCapabilities: Record<string, { thinkingSkippable?: boolean }> = {}
+  const modelCapabilities: Record<string, ProviderModelCapability> = {}
 
   for (const model of models) {
     if (typeof model === 'string') {
@@ -89,6 +89,7 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
     }
 
     const candidate = model as {
+      [key: string]: unknown
       id?: unknown
       model_id?: unknown
       name?: unknown
@@ -105,8 +106,28 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
       modelMappings[modelName] = modelId
 
       const thinkingSkippable = readThinkingSkippable(candidate)
-      if (thinkingSkippable !== undefined) {
-        const capability = { thinkingSkippable }
+      const maxContextLength = readPositiveInteger(candidate, [
+        'max_context_length',
+        'maxContextLength',
+        'context_length',
+        'contextLength',
+      ])
+      const maxSummaryGenerationLength = readPositiveInteger(candidate, [
+        'max_summary_generation_length',
+        'maxSummaryGenerationLength',
+        'summary_generation_length',
+        'summaryGenerationLength',
+      ])
+      if (
+        thinkingSkippable !== undefined
+        || maxContextLength !== undefined
+        || maxSummaryGenerationLength !== undefined
+      ) {
+        const capability: ProviderModelCapability = {
+          ...(thinkingSkippable !== undefined ? { thinkingSkippable } : {}),
+          ...(maxContextLength !== undefined ? { maxContextLength } : {}),
+          ...(maxSummaryGenerationLength !== undefined ? { maxSummaryGenerationLength } : {}),
+        }
         modelCapabilities[modelName] = capability
         modelCapabilities[modelId] = capability
       }
@@ -114,6 +135,30 @@ export function parseProviderModelsResponse(responseData: unknown): ParsedProvid
   }
 
   return { supportedModels, modelMappings, modelCapabilities }
+}
+
+function readPositiveInteger(
+  model: { [key: string]: unknown; info?: unknown; meta?: unknown },
+  keys: string[],
+): number | undefined {
+  const values: unknown[] = []
+  for (const key of keys) values.push(model[key])
+  for (const container of [model.info, model.meta]) {
+    if (!container || typeof container !== 'object' || Array.isArray(container)) continue
+    const record = container as Record<string, unknown>
+    for (const key of keys) values.push(record[key])
+    for (const nestedName of ['capabilities', 'limits', 'context', 'meta', 'model_info']) {
+      const nested = record[nestedName]
+      if (!nested || typeof nested !== 'object' || Array.isArray(nested)) continue
+      const nestedRecord = nested as Record<string, unknown>
+      for (const key of keys) values.push(nestedRecord[key])
+    }
+  }
+  for (const value of values) {
+    const numeric = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN
+    if (Number.isSafeInteger(numeric) && numeric > 0) return numeric
+  }
+  return undefined
 }
 
 function readThinkingSkippable(model: {

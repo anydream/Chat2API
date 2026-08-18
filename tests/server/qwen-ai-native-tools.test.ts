@@ -113,11 +113,12 @@ test('tool argument validation catches missing required and strict unknown field
     {
       missingRequired: ['command'],
       unexpected: ['prompt'],
+      typeMismatches: [],
     },
   )
   assert.deepEqual(
     getToolArgumentValidationIssues({ command: 'Get-ChildItem' }, tool),
-    { missingRequired: [], unexpected: [] },
+    { missingRequired: [], unexpected: [], typeMismatches: [] },
   )
 })
 
@@ -133,6 +134,6 @@ test('tool argument validation preserves explicitly open additional properties',
 
   assert.deepEqual(
     getToolArgumentValidationIssues({ known: 'ok', dynamic: 1 }, tool),
-    { missingRequired: [], unexpected: [] },
+    { missingRequired: [], unexpected: [], typeMismatches: [] },
   )
 })

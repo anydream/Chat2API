@@ -15,22 +15,24 @@ test('forwarder does not retry cancellations or completed response timeouts', ()
   const source = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
 
   assert.match(source, /result\.status === 499/)
-  assert.match(source, /isQwenAiProvider && \(lastStatus === 403 \|\| lastStatus === 429 \|\| lastStatus === 504\)/)
-  assert.match(source, /status === 499[\s\S]*status === 403[\s\S]*status === 429[\s\S]*status === 504[\s\S]*\? false/)
+  assert.match(source, /lastStatus === 499[\s\S]*isQwenAiProvider && lastStatus === 504[\s\S]*\? false/)
   assert.match(source, /lastRetryable === false[\s\S]*lastStatus === 499/)
   assert.match(source, /if \(context\.signal\?\.aborted\) \{[\s\S]*lastAccountFault = undefined[\s\S]*if \(result\.status !== 499\) \{[\s\S]*lastStatus = 499/)
 })
 
-test('forwarder returns a provider 429 to the caller instead of internally requeueing it', () => {
+test('forwarder leaves ordinary Qwen account failover to the route instead of requeueing the same account', () => {
   const source = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
 
-  assert.match(source, /isQwenAiProvider && result\.status === 429/)
+  assert.match(source, /const maxRetries = QwenAiAdapter\.isQwenAiProvider\(provider\)[\s\S]*requestIntent === 'context_compaction'[\s\S]*\? 0[\s\S]*recoverManagedToolStream[\s\S]*qwenAiRetryCountFromEnv\(recoverManagedToolStream\)[\s\S]*: 0[\s\S]*: config\.retryCount/)
+  assert.match(source, /lastRetryScope = result\.retryScope/)
+  assert.match(source, /retryScope: lastRetryScope/)
 })
 
 test('forwarder retry backoff stops promptly when the client aborts', () => {
   const source = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
 
-  assert.match(source, /this\.delay\(5000, context\.signal\)/)
+  assert.match(source, /this\.delay\(\s*Math\.min\(nextRetryDelayMs, remainingBudgetMs\),\s*context\.signal,?\s*\)/)
+  assert.match(source, /if \(!delayCompleted\) \{[\s\S]*lastStatus = 499/)
   assert.match(source, /if \(!delayCompleted\)[\s\S]*lastStatus = 499[\s\S]*lastRetryable = false/)
   assert.match(source, /private delay\(ms: number, signal\?: AbortSignal\): Promise<boolean>/)
   assert.match(source, /signal\?\.addEventListener\('abort', onAbort, \{ once: true \}\)/)

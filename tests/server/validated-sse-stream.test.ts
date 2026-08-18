@@ -137,6 +137,7 @@ test('validated SSE buffering preserves controlled Qwen status and retry metadat
     { status: 403, code: 'qwen_ai_risk_control', message: 'risk control', retryable: false },
     { status: 429, code: 'qwen_ai_stream_error', message: 'rate limit', retryable: false },
     { status: 503, code: 'upstream_unavailable', message: 'upstream unavailable', retryable: true },
+    { status: 503, code: 'qwen_ai_upstream_busy', message: 'RGV587 请稍后重试', retryable: true },
   ]
 
   for (const item of cases) {

@@ -359,6 +359,14 @@ export class ConfigManager {
       }
     }
 
+    if (
+      config.qwenAiSessionMode !== undefined
+      && config.qwenAiSessionMode !== 'legacy'
+      && config.qwenAiSessionMode !== 'tool-call-binding'
+    ) {
+      errors.push('qwenAiSessionMode must be one of: legacy, tool-call-binding')
+    }
+
     if (config.toolCallingConfig) {
       const normalized = normalizeToolCallingConfig(config.toolCallingConfig)
       if (

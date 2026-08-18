@@ -216,6 +216,8 @@ test('Kimi K2.6 and K3 model mappings reach current web chat payloads', () => {
   assert.equal(normalizeProviderModelForMatch('kimi-k2.6'), 'Kimi-K2.6')
   assert.equal(normalizeProviderModelForMatch('k2d5'), 'Kimi-K2.6')
   assert.equal(normalizeProviderModelForMatch('k2d6'), 'Kimi-K2.6')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max-Preview[1m]'), 'Qwen3.8-Max-Preview')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max-Preview-thinking[1m]'), 'Qwen3.8-Max-Preview')
 
   const k2Payload = createKimiChatPayload({
     model: 'k2d5',
@@ -321,14 +323,20 @@ test('domestic Qwen models match the web chat model ids captured from HAR', () =
   assert.deepEqual(en.qwen.models, expectedMappings)
 })
 
-test('Qwen AI defaults keep only the filtered current web model set', () => {
+test('Qwen AI defaults prefer the configured stable model while retaining explicit compatibility mappings', () => {
   const expectedModels = [
-    'Qwen3.8-Max-Preview',
+    'Qwen3.8-Max',
+    'Qwen3.8-Max_Fast',
+    'Qwen3.8-Max_Auto',
+    'Qwen3.8-Max_Thinking',
     'Qwen3.7-Plus',
     'Qwen3.7-Max',
-    'Qwen3.6-Plus',
   ]
   const expectedMappings = {
+    'Qwen3.8-Max': 'qwen3.8-max',
+    'Qwen3.8-Max_Fast': 'qwen3.8-max',
+    'Qwen3.8-Max_Auto': 'qwen3.8-max',
+    'Qwen3.8-Max_Thinking': 'qwen3.8-max',
     'Qwen3.8-Max-Preview': 'qwen3.8-max-preview',
     'Qwen3.7-Plus': 'qwen3.7-plus',
     'Qwen3.7-Max': 'qwen3.7-max',
@@ -358,7 +366,8 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
   }
 
   const qwenAiAdapterSource = readFileSync(join(root, 'src/main/proxy/adapters/qwen-ai.ts'), 'utf8')
-  assert.match(qwenAiAdapterSource, /'qwen3\.8':\s*'qwen3\.8-max-preview'/)
+  assert.match(qwenAiAdapterSource, /'qwen3\.8':\s*'qwen3\.8-max'/)
+  assert.match(qwenAiAdapterSource, /'qwen3\.8-max-preview':\s*'qwen3\.8-max-preview'/)
   assert.match(qwenAiAdapterSource, /qwen:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /qwen3:\s*'qwen3\.7-max'/)
   assert.match(qwenAiAdapterSource, /'qwen3\.7':\s*'qwen3\.7-max'/)
@@ -369,6 +378,11 @@ test('Qwen AI defaults keep only the filtered current web model set', () => {
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3-vl':/)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen3-omni':/)
   assert.doesNotMatch(qwenAiAdapterSource, /'qwen2\.5':/)
+
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max_Fast'), 'Qwen3.8-Max')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max_Auto'), 'Qwen3.8-Max')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max_Thinking'), 'Qwen3.8-Max')
+  assert.equal(normalizeProviderModelForMatch('Qwen3.8-Max_TeF_AtT'), 'Qwen3.8-Max')
 })
 
 test('model capability metadata merges live values without inventing unknown fallbacks', () => {

@@ -4,10 +4,13 @@ import test from 'node:test'
 import { getToolStreamValidationFailure } from '../../src/main/proxy/toolCalling/streamValidationPolicy.ts'
 import type { ToolCallingPlan } from '../../src/main/proxy/toolCalling/types.ts'
 
-function plan(toolChoiceMode: ToolCallingPlan['toolChoiceMode']): ToolCallingPlan {
+function plan(
+  toolChoiceMode: ToolCallingPlan['toolChoiceMode'],
+  protocol: ToolCallingPlan['protocol'] = 'managed_xml',
+): ToolCallingPlan {
   return {
     mode: 'managed',
-    protocol: 'managed_xml',
+    protocol,
     clientAdapterId: 'standard-openai-tools',
     providerId: 'qwen-ai',
     tools: [{ name: 'workspace:read_file', parameters: {}, source: 'openai' }],
@@ -22,7 +25,7 @@ function plan(toolChoiceMode: ToolCallingPlan['toolChoiceMode']): ToolCallingPla
       providerId: 'qwen-ai',
       toolSource: 'openai',
       mode: 'managed',
-      protocol: 'managed_xml',
+      protocol,
       toolCount: 1,
       injected: true,
       reason: 'test',
@@ -40,6 +43,17 @@ test('optional tool calls tolerate a pending managed protocol block', () => {
       pendingToolProtocol: true,
     }),
     undefined,
+  )
+})
+
+test('optional Qwen Hermes calls reject a started malformed protocol block', () => {
+  assert.equal(
+    getToolStreamValidationFailure({
+      plan: plan('auto', 'qwen_hermes'),
+      emittedToolCall: false,
+      pendingToolProtocol: true,
+    })?.code,
+    'malformed_tool_call',
   )
 })
 

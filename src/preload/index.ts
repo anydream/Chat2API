@@ -17,6 +17,7 @@ import type {
   EffectiveModel,
   QwenAiGovernorConfig,
   QwenAiGovernorStatus,
+  ProviderModelCapability,
 } from '../shared/types'
 
 const proxyAPI = {
@@ -77,7 +78,7 @@ const providersAPI = {
     description?: string
     supportedModels?: string[]
     modelMappings?: Record<string, string>
-    modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
+    modelCapabilities?: Record<string, ProviderModelCapability>
     modelsApiEndpoint?: string
     modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]

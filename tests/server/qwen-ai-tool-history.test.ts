@@ -1,10 +1,19 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
+import OSS from 'ali-oss'
 
 import {
-  compactQwenAiTranscriptMessages,
   prepareQwenAiMultimodalMessage,
+  QwenAiFileUploader,
 } from '../../src/main/proxy/adapters/qwen-ai-files.ts'
+import { createManagedToolPromptMessage } from '../../src/main/proxy/toolCalling/managedPromptMetadata.ts'
+import {
+  decodeXml,
+  parseJsonValue,
+} from '../../src/main/proxy/toolCalling/protocols/shared.ts'
 
 function assistantToolCall(id: string, name: string, round: number) {
   return {
@@ -31,11 +40,61 @@ function toolResult(toolCallId: string, round: number) {
   }
 }
 
-function attribute(tag: string, name: string): string | undefined {
-  return tag.match(new RegExp(`${name}="([^"]+)"`))?.[1]
+type HermesCallMatch = {
+  index: number
+  raw: string
+  name: string
+  arguments: Record<string, unknown>
 }
 
-test('Qwen AI history gives repeated tool calls local IDs and preserves call/result pairing', async () => {
+type HermesResponseMatch = {
+  index: number
+  raw: string
+  content: string
+}
+
+function hermesCallMatches(content: string): HermesCallMatch[] {
+  return [...content.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)].map((match) => {
+    const body = match[1].trim()
+    if (body.startsWith('{')) {
+      const envelope = JSON.parse(body) as {
+        name: string
+        arguments: Record<string, unknown>
+      }
+      return {
+        index: match.index,
+        raw: match[0],
+        name: envelope.name,
+        arguments: envelope.arguments,
+      }
+    }
+
+    const functionMatch = /^<function=([^>]+)>\s*([\s\S]*?)\s*<\/function>$/.exec(body)
+    assert.ok(functionMatch, `Expected a canonical Qwen function block, received: ${body.slice(0, 120)}`)
+    const args: Record<string, unknown> = {}
+    for (const parameter of functionMatch[2].matchAll(
+      /<parameter=([^>]+)>\s*([\s\S]*?)\s*<\/parameter>/g,
+    )) {
+      args[decodeXml(parameter[1].trim())] = parseJsonValue(parameter[2])
+    }
+    return {
+      index: match.index,
+      raw: match[0],
+      name: decodeXml(functionMatch[1].trim()),
+      arguments: args,
+    }
+  })
+}
+
+function hermesResponseMatches(content: string): HermesResponseMatch[] {
+  return [...content.matchAll(/<tool_response>\n([\s\S]*?)\n<\/tool_response>/g)].map((match) => ({
+    index: match.index,
+    raw: match[0],
+    content: match[1],
+  }))
+}
+
+test('Qwen AI history preserves repeated Hermes call and result ordering', async () => {
   const messages = [
     { role: 'user' as const, content: 'request-1' },
     assistantToolCall('call_0', 'first_tool', 1),
@@ -53,30 +112,30 @@ test('Qwen AI history gives repeated tool calls local IDs and preserves call/res
 
   // No file parts are supplied, so the uploader is intentionally never used.
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const invokeTags = [...prepared.content.matchAll(/<\|CHAT2API\|invoke\b[^>]*>/g)].map((match) => match[0])
-  const resultTags = [...prepared.content.matchAll(/<\|CHAT2API\|tool_result\b[^>]*>[^]*?<\/\|CHAT2API\|tool_result>/g)].map((match) => match[0])
+  const callMatches = hermesCallMatches(prepared.content)
+  const responseMatches = hermesResponseMatches(prepared.content)
+  const expectedNames = ['first_tool', 'second_tool', 'third_tool', 'fourth_tool']
 
-  const expectedIds = ['call_0', 'call_0__2', 'call_0__3', 'call_0__2__2']
-  assert.deepEqual(
-    invokeTags.map((tag) => attribute(tag, 'tool_call_id')),
-    expectedIds,
-    'each historical assistant invoke must expose its local tool_call_id',
-  )
-  assert.deepEqual(
-    resultTags.map((tag) => attribute(tag, 'tool_call_id')),
-    expectedIds,
-    'each tool result must reference the corresponding local tool_call_id',
-  )
+  assert.deepEqual(callMatches.map((call) => call.name), expectedNames)
+  assert.deepEqual(callMatches.map((call) => call.arguments.round), [1, 2, 3, 4])
+  assert.deepEqual(responseMatches.map((response) => response.content), [
+    'result-1',
+    'result-2',
+    'result-3',
+    'result-4',
+  ])
 
-  for (const [index, id] of expectedIds.entries()) {
-    const invokePosition = prepared.content.indexOf(invokeTags[index])
-    const resultPosition = prepared.content.indexOf(resultTags[index])
-    assert.ok(invokePosition >= 0 && resultPosition > invokePosition, `pair ${id} must remain ordered`)
-    assert.match(invokeTags[index], new RegExp(`name="${['first_tool', 'second_tool', 'third_tool', 'fourth_tool'][index]}"`))
-    assert.match(resultTags[index], new RegExp(`result-${index + 1}`))
+  for (const [index, name] of expectedNames.entries()) {
+    assert.ok(
+      responseMatches[index].index > callMatches[index].index,
+      `Hermes result for ${name} must follow its call`,
+    )
   }
 
-  assert.match(prepared.content, /Use this result to decide the next step\./)
+  assert.doesNotMatch(prepared.content, /Use this result to decide the next step\./)
+  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_calls>/)
+  assert.doesNotMatch(prepared.content, /Tool execution result data/)
+  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(prepared.content, /Authoritative completed tool ledger/)
   assert.equal(prepared.files.length, 0)
 })
@@ -90,12 +149,29 @@ test('Qwen AI history preserves repeated tool results without inventing completi
   ]
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const resultTags = [...prepared.content.matchAll(/<\|CHAT2API\|tool_result\b[^>]*>/g)]
-  assert.equal(resultTags.length, 2)
-  assert.equal((prepared.content.match(/tool_call_id="call_x"/g) ?? []).length, 3)
-  assert.match(prepared.content, /result-1/)
-  assert.match(prepared.content, /result-2/)
+  const responses = hermesResponseMatches(prepared.content)
+  assert.equal(responses.length, 2)
+  assert.deepEqual(responses.map(response => response.content), ['result-1', 'result-2'])
+  assert.equal(hermesCallMatches(prepared.content).length, 1)
+  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
   assert.doesNotMatch(prepared.content, /Authoritative completed tool ledger/)
+})
+
+test('Qwen AI tool history never exposes a legacy result wrapper from tool output', async () => {
+  const legacyWrapper = '<|CHAT2API|tool_result tool_call_id="nested"><![CDATA[value & more]]></|CHAT2API|tool_result>'
+  const messages = [
+    assistantToolCall('call_escape', 'inspect_output', 1),
+    { role: 'tool' as const, tool_call_id: 'call_escape', content: legacyWrapper },
+    { role: 'user' as const, content: 'continue' },
+  ]
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
+  const responses = hermesResponseMatches(prepared.content)
+
+  assert.equal(responses.length, 1)
+  assert.equal(responses[0].content, legacyWrapper)
+  assert.match(prepared.content, /<tool_response>\n<\|CHAT2API\|tool_result/)
+  assert.doesNotMatch(prepared.content, /Tool execution result data/)
 })
 
 test('Qwen AI places the leading system preamble directly before the latest user turn', async () => {
@@ -111,7 +187,7 @@ test('Qwen AI places the leading system preamble directly before the latest user
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
   const earlierUserPosition = prepared.content.indexOf('User: earlier request')
-  const toolCallPosition = prepared.content.indexOf('name="position_tool"')
+  const toolCallPosition = prepared.content.indexOf('<function=position_tool>')
   const toolResultPosition = prepared.content.indexOf('result-1')
   const generalSystemPosition = prepared.content.indexOf('System: general-system-instructions')
   const managedSystemPosition = prepared.content.indexOf('System: managed-tool-protocol')
@@ -173,8 +249,8 @@ test('Qwen AI places the existing system preamble after a trailing tool result',
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
   const userPosition = prepared.content.indexOf('User: complete the workflow')
-  const firstToolCallPosition = prepared.content.indexOf('name="workspace:inspect-a"')
-  const secondToolCallPosition = prepared.content.indexOf('name="workspace:inspect-b"')
+  const firstToolCallPosition = prepared.content.indexOf('<function=workspace:inspect-a>')
+  const secondToolCallPosition = prepared.content.indexOf('<function=workspace:inspect-b>')
   const firstToolResultPosition = prepared.content.indexOf('result-1')
   const secondToolResultPosition = prepared.content.indexOf('result-2')
   const generalSystemPosition = prepared.content.indexOf('System: general-system-instructions')
@@ -216,314 +292,56 @@ test('Qwen AI keeps a generic continuation after the latest tool result', async 
   assert.match(prepared.content, /Only provide a final answer after the results have been verified by tool output\./)
 })
 
-test('Qwen AI preserves an individual message when the complete transcript fits', () => {
-  const content = `task-start ${'x'.repeat(200_000)} task-end`
-  const messages = [{ role: 'user' as const, content }]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 256_000,
-    toolResultMaxBytes: 24_000,
-    messageMaxBytes: 128_000,
-    maxFileParts: 32,
-  })
-
-  assert.equal(compacted[0].content, content)
-  assert.doesNotMatch(JSON.stringify(compacted), /Earlier conversation omitted|\.\.\. truncated/)
-})
-
-test('Qwen AI aggregate budget includes message-array separators', () => {
-  const messages = Array.from({ length: 1000 }, () => ({
-    role: 'user' as const,
-    content: 'x',
-  }))
-  const maxBytes = 29_500
-  assert.ok(Buffer.byteLength(JSON.stringify(messages), 'utf8') > maxBytes)
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes,
-    toolResultMaxBytes: 24_000,
-    messageMaxBytes: 128_000,
-    maxFileParts: 32,
-  })
-
-  assert.notEqual(compacted, messages)
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= maxBytes)
-})
-
-test('Qwen AI bounds large history while retaining the task, continuation, and failed tool pair', () => {
-  const oldResult = `old-result-start ${'x'.repeat(90000)} old-result-end`
-  const failedResult = `failed-result-start ${'y'.repeat(70000)} failed-result-end`
+test('Qwen AI preserves a transcript larger than 512 KiB without modifying caller history', async () => {
+  const firstMessage = `first-message-start ${'a'.repeat(180_000)} first-message-end`
+  const middleMessage = `middle-message-start ${'b'.repeat(180_000)} middle-message-end`
+  const latestMessage = `latest-message-start ${'c'.repeat(180_000)} latest-message-end`
+  const longToolArgument = `argument-start ${'d'.repeat(120_000)} argument-end`
+  const longToolResult = `result-start ${'e'.repeat(120_000)} result-end`
   const messages = [
-    { role: 'system' as const, content: 'system preamble' },
-    { role: 'user' as const, content: 'Create the requested image in the active project.' },
-    assistantToolCall('old-call', 'old_tool', 1),
-    toolResult('old-call', 1),
-    { role: 'tool' as const, tool_call_id: 'old-call', content: oldResult },
-    { role: 'user' as const, content: 'An unrelated middle request.' },
-    assistantToolCall('middle-call', 'middle_tool', 2),
-    toolResult('middle-call', 2),
-    { role: 'user' as const, content: 'Continue the active image task.' },
-    assistantToolCall('failed-call', 'image_tool', 3),
+    { role: 'user' as const, content: firstMessage },
+    { role: 'assistant' as const, content: middleMessage },
+    { role: 'user' as const, content: 'Run the large declared operation.' },
     {
-      role: 'tool' as const,
-      tool_call_id: 'failed-call',
-      is_error: true,
-      content: failedResult,
+      role: 'assistant' as const,
+      content: null,
+      tool_calls: [{
+        id: 'large-history-call',
+        type: 'function' as const,
+        function: {
+          name: 'large_history_tool',
+          arguments: JSON.stringify({ payload: longToolArgument }),
+        },
+      }],
     },
-    { role: 'user' as const, content: 'Continue the active task using the failed result and retry the operation.' },
+    { role: 'tool' as const, tool_call_id: 'large-history-call', content: longToolResult },
+    { role: 'user' as const, content: latestMessage },
   ]
   const snapshot = JSON.parse(JSON.stringify(messages))
 
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 12000,
-    toolResultMaxBytes: 2400,
-    messageMaxBytes: 3200,
-    maxFileParts: 4,
-  })
-  const serializedBytes = Buffer.byteLength(JSON.stringify(compacted), 'utf8')
+  assert.ok(Buffer.byteLength(JSON.stringify(messages), 'utf8') > 512 * 1024)
 
-  assert.ok(serializedBytes <= 12000, `compacted transcript is ${serializedBytes} bytes`)
-  assert.deepEqual(messages, snapshot, 'compaction must not mutate caller messages')
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
 
-  const compactedText = JSON.stringify(compacted)
-  assert.match(compactedText, /Create the requested image in the active project\./)
-  assert.match(compactedText, /Continue the active task using the failed result/)
-  assert.match(compactedText, /failed-call/)
-  assert.match(compactedText, /"is_error":true/)
-  assert.match(compactedText, /failed-result-(?:start|end)/)
-  assert.match(compactedText, /Earlier conversation omitted/)
+  assert.ok(prepared.content.includes(`User: ${firstMessage}`))
+  assert.ok(prepared.content.includes(`Assistant: ${middleMessage}`))
+  assert.ok(prepared.content.includes(`User: ${latestMessage}`))
 
-  const assistantIndex = compacted.findIndex(message => message.role === 'assistant'
-    && message.tool_calls?.some(call => call.id === 'failed-call'))
-  const resultIndex = compacted.findIndex(message => message.role === 'tool'
-    && message.tool_call_id === 'failed-call')
-  assert.ok(assistantIndex >= 0 && resultIndex > assistantIndex, 'failed tool call/result must remain paired')
+  const calls = hermesCallMatches(prepared.content)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'large_history_tool')
+  assert.equal(calls[0].arguments.payload, longToolArgument)
+
+  const responses = hermesResponseMatches(prepared.content)
+  assert.equal(responses.length, 1)
+  assert.equal(responses[0].content, longToolResult)
+  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
+
+  assert.doesNotMatch(prepared.content, /Earlier conversation omitted|\[\.\.\. truncated \.\.\.\]/)
+  assert.deepEqual(messages, snapshot, 'transcript preparation must not mutate caller messages')
 })
 
-test('Qwen AI bounds structural tool arguments when text compaction is exhausted', () => {
-  const oversizedArguments = JSON.stringify({ payload: 'x'.repeat(200_000) })
-  const messages = [
-    { role: 'user' as const, content: 'Keep this task active.' },
-    {
-      role: 'assistant' as const,
-      content: null,
-      tool_calls: [{
-        id: 'oversized-call',
-        type: 'function' as const,
-        function: {
-          name: 'write_image',
-          arguments: oversizedArguments,
-        },
-      }],
-    },
-    { role: 'tool' as const, tool_call_id: 'oversized-call', content: 'done' },
-    { role: 'user' as const, content: 'Continue the task.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 1000,
-    toolResultMaxBytes: 100,
-    messageMaxBytes: 100,
-    maxFileParts: 1,
-  })
-
-  const serializedBytes = Buffer.byteLength(JSON.stringify(compacted), 'utf8')
-  assert.ok(serializedBytes <= 1000, `compacted transcript is ${serializedBytes} bytes`)
-  const call = compacted.find(message => message.role === 'assistant')?.tool_calls?.[0]
-  assert.ok(call, 'the active tool call metadata should remain available')
-  assert.ok(call.function.arguments.length <= 100)
-  assert.deepEqual(messages[1].tool_calls?.[0].function.arguments, oversizedArguments)
-})
-
-test('Qwen AI drops an oversized tool call and its result together under a strict budget', () => {
-  const messages = [
-    { role: 'user' as const, content: 'Keep the workflow active.' },
-    {
-      role: 'assistant' as const,
-      content: 'x'.repeat(5000),
-      tool_calls: [{
-        id: 'pair-that-cannot-fit',
-        type: 'function' as const,
-        function: {
-          name: 'declared_tool',
-          arguments: JSON.stringify({ payload: 'y'.repeat(5000) }),
-        },
-      }],
-    },
-    { role: 'tool' as const, tool_call_id: 'pair-that-cannot-fit', content: 'tool result' },
-    { role: 'user' as const, content: 'Continue.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 300,
-    messageMaxBytes: 80,
-    toolResultMaxBytes: 80,
-    maxFileParts: 1,
-  })
-
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 300)
-  const retainedCallIds = compacted
-    .filter(message => message.role === 'assistant')
-    .flatMap(message => message.tool_calls || [])
-    .map(call => call.id)
-  const retainedResultIds = compacted
-    .filter(message => message.role === 'tool')
-    .map(message => message.tool_call_id)
-  assert.deepEqual(retainedResultIds, [], 'an omitted call must not leave an orphan result')
-  assert.deepEqual(retainedCallIds, [], 'the oversized call is omitted as a structural unit')
-})
-
-test('Qwen AI keeps exact tool IDs when a bounded call/result pair is retained', () => {
-  const id = `call-${'z'.repeat(180)}`
-  const toolName = `declared_tool_${'n'.repeat(180)}`
-  const messages = [
-    { role: 'user' as const, content: 'Run the operation.' },
-    {
-      role: 'assistant' as const,
-      content: null,
-      tool_calls: [{
-        id,
-        type: 'function' as const,
-        function: { name: toolName, arguments: JSON.stringify({ value: 'x'.repeat(1200) }) },
-      }],
-    },
-    { role: 'tool' as const, tool_call_id: id, content: 'done' },
-    { role: 'user' as const, content: 'Continue.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 3000,
-    messageMaxBytes: 256,
-    toolResultMaxBytes: 128,
-    maxFileParts: 1,
-  })
-  const retainedCall = compacted.find(message => message.role === 'assistant')?.tool_calls?.[0]
-  const retainedResult = compacted.find(message => message.role === 'tool')
-
-  assert.ok(retainedCall)
-  assert.ok(retainedResult)
-  assert.equal(retainedCall.id, id)
-  assert.equal(retainedCall.function.name, toolName)
-  assert.equal(retainedResult.tool_call_id, id)
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 3000)
-})
-
-test('Qwen AI never retains more duplicate-ID results than retained calls', () => {
-  const duplicateId = 'call-reused-by-client'
-  const messages = [
-    { role: 'user' as const, content: 'Run both operations.' },
-    {
-      role: 'assistant' as const,
-      content: null,
-      tool_calls: Array.from({ length: 8 }, (_, index) => ({
-        id: duplicateId,
-        type: 'function' as const,
-        function: {
-          name: 'declared_tool',
-          arguments: JSON.stringify({ index, payload: 'x'.repeat(400) }),
-        },
-      })),
-    },
-    ...Array.from({ length: 8 }, (_, index) => ({
-      role: 'tool' as const,
-      tool_call_id: duplicateId,
-      content: `result-${index}`,
-    })),
-    { role: 'user' as const, content: 'Continue.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 1200,
-    messageMaxBytes: 120,
-    toolResultMaxBytes: 80,
-    maxFileParts: 1,
-  })
-  const retainedCallCount = compacted
-    .filter(message => message.role === 'assistant')
-    .flatMap(message => message.tool_calls || [])
-    .filter(call => call.id === duplicateId)
-    .length
-  const retainedResultCount = compacted
-    .filter(message => message.role === 'tool' && message.tool_call_id === duplicateId)
-    .length
-
-  assert.ok(retainedCallCount < 8, 'the strict budget should remove at least one duplicate call')
-  assert.equal(retainedResultCount, retainedCallCount)
-  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 1200)
-})
-
-test('Qwen AI caps the rendered prompt after tool XML expansion', async () => {
-  const envNames = [
-    'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
-    'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
-  ]
-  const previous = new Map(envNames.map(name => [name, process.env[name]]))
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES = '5000'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES = '10000'
-  process.env.CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES = '10000'
-
-  try {
-    const toolCalls = Array.from({ length: 20 }, (_, index) => ({
-      id: `render-call-${index}`,
-      type: 'function' as const,
-      function: {
-        name: 'declared_tool',
-        arguments: JSON.stringify({ index, payload: 'x'.repeat(50) }),
-      },
-    }))
-    const prepared = await prepareQwenAiMultimodalMessage([
-      { role: 'user', content: 'Run the batch.' },
-      { role: 'assistant', content: null, tool_calls: toolCalls },
-      { role: 'user', content: 'Continue after the batch.' },
-    ], {} as any)
-
-    assert.ok(Buffer.byteLength(prepared.content, 'utf8') <= 5000)
-    if (prepared.content.includes('<|CHAT2API|tool_calls>')) {
-      assert.equal(
-        (prepared.content.match(/<\|CHAT2API\|tool_calls>/g) || []).length,
-        (prepared.content.match(/<\/\|CHAT2API\|tool_calls>/g) || []).length,
-      )
-    }
-  } finally {
-    for (const [name, value] of previous) {
-      if (value === undefined) delete process.env[name]
-      else process.env[name] = value
-    }
-  }
-})
-
-test('Qwen AI bounds oversized parallel tool-call arrays by the same transcript budget', () => {
-  const toolCalls = Array.from({ length: 1000 }, (_, index) => ({
-    id: `parallel-${index}`,
-    type: 'function' as const,
-    function: {
-      name: 'declared_tool',
-      arguments: JSON.stringify({ index, payload: 'x'.repeat(500) }),
-    },
-  }))
-  const messages = [
-    { role: 'user' as const, content: 'Run the active batch.' },
-    { role: 'assistant' as const, content: null, tool_calls: toolCalls },
-    { role: 'user' as const, content: 'Continue after the batch.' },
-  ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 10_000,
-    toolResultMaxBytes: 100,
-    messageMaxBytes: 100,
-    maxFileParts: 1,
-  })
-
-  const serializedBytes = Buffer.byteLength(JSON.stringify(compacted), 'utf8')
-  assert.ok(serializedBytes <= 10_000, `compacted transcript is ${serializedBytes} bytes`)
-  const retainedCalls = compacted.find(message => message.role === 'assistant')?.tool_calls ?? []
-  assert.ok(retainedCalls.length < toolCalls.length, 'oversized arrays must be bounded')
-  assert.ok(retainedCalls.length > 0, 'retain at least one active call when the budget allows it')
-  assert.equal(toolCalls.length, 1000, 'caller tool-call array must not be mutated')
-})
-
-test('Qwen AI deduplicates and bounds attachment uploads without mutating content', async () => {
+test('Qwen AI uploads every unique attachment once without mutating content', async () => {
   const parts = [
     { type: 'image_url' as const, image_url: { url: 'https://example.test/repeated.png' } },
     { type: 'image_url' as const, image_url: { url: 'https://example.test/repeated.png' } },
@@ -545,20 +363,29 @@ test('Qwen AI deduplicates and bounds attachment uploads without mutating conten
   const prepared = await prepareQwenAiMultimodalMessage(messages, uploader as any)
 
   assert.deepEqual(messages, snapshot, 'attachment preparation must not mutate caller messages')
-  assert.ok(uploadedSources.length <= 32)
-  assert.equal(new Set(uploadedSources).size, uploadedSources.length)
-  assert.equal(prepared.files.length, uploadedSources.length)
-  assert.equal(uploadedSources.at(-1), 'https://example.test/image-34.png')
+  assert.equal(uploadedSources.length, 36)
+  assert.equal(new Set(uploadedSources).size, 36)
+  assert.equal(
+    uploadedSources.filter(source => source === 'https://example.test/repeated.png').length,
+    1,
+  )
+  assert.deepEqual(uploadedSources, [
+    'https://example.test/repeated.png',
+    ...Array.from({ length: 35 }, (_, index) => `https://example.test/image-${index}.png`),
+  ])
+  assert.equal(prepared.files.length, 36)
 })
 
-test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the text budget', async () => {
+test('Qwen AI preserves all multimodal text while uploading attachment bytes separately', async () => {
   const systemInstruction = 'system-sentinel-4f9c2d'
   const activeText = 'active-user-sentinel-a81e37'
+  const earlierUserText = `earlier-user-sentinel ${'x'.repeat(5_000)}`
+  const earlierAssistantText = `earlier-assistant-sentinel ${'y'.repeat(5_000)}`
   const imageDataUrl = `data:image/png;base64,${'A'.repeat(600_000)}`
   const messages = [
     { role: 'system' as const, content: systemInstruction },
-    { role: 'user' as const, content: `earlier-user-sentinel ${'x'.repeat(5_000)}` },
-    { role: 'assistant' as const, content: `earlier-assistant-sentinel ${'y'.repeat(5_000)}` },
+    { role: 'user' as const, content: earlierUserText },
+    { role: 'assistant' as const, content: earlierAssistantText },
     {
       role: 'user' as const,
       content: [
@@ -569,32 +396,8 @@ test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the 
   ]
   const snapshot = JSON.parse(JSON.stringify(messages))
 
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 2_000,
-    toolResultMaxBytes: 500,
-    messageMaxBytes: 1_000,
-    maxFileParts: 4,
-  })
-
-  assert.ok(
-    compacted.some(message => message.role === 'system' && message.content === systemInstruction),
-    'the system instruction must survive image transcript compaction',
-  )
-  const activeTurn = compacted.find(message => (
-    message.role === 'user'
-    && Array.isArray(message.content)
-    && message.content.some(part => part.type === 'text' && part.text === activeText)
-  ))
-  assert.ok(activeTurn, 'the active user text must not be evicted by separately uploaded bytes')
-  assert.ok(
-    Array.isArray(activeTurn.content)
-      && activeTurn.content.some(part => part.type === 'image_url' && part.image_url?.url === imageDataUrl),
-    'the attachment reference must remain available to the uploader',
-  )
-  assert.deepEqual(messages, snapshot, 'transcript compaction must not mutate attachment content')
-
   const uploadedSources: string[] = []
-  const prepared = await prepareQwenAiMultimodalMessage(compacted, {
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
     uploadPart: async (part: any) => {
       uploadedSources.push(part.image_url.url)
       return { file: { id: 'uploaded-image-sentinel' } }
@@ -602,19 +405,42 @@ test('Qwen AI keeps the active multimodal turn when attachment bytes exceed the 
   } as any)
 
   assert.ok(prepared.content.includes(`System: ${systemInstruction}`))
+  assert.ok(prepared.content.includes(earlierUserText))
+  assert.ok(prepared.content.includes(earlierAssistantText))
   assert.ok(prepared.content.includes(activeText))
   assert.doesNotMatch(prepared.content, /data:image\/png;base64/)
   assert.deepEqual(uploadedSources, [imageDataUrl])
+  assert.deepEqual(messages, snapshot, 'multimodal preparation must not mutate caller messages')
 })
 
-test('Qwen AI excludes inline audio bytes from transcript budgeting', async () => {
+test('Qwen AI does not infer document transport from transcript byte size', async () => {
+  const longText = `LARGE_INLINE_SENTINEL:${'x'.repeat(180_000)}:LARGE_INLINE_END`
+  let uploads = 0
+  const prepared = await prepareQwenAiMultimodalMessage(
+    [{ role: 'user' as const, content: longText }],
+    {
+      uploadPart: async () => {
+        uploads += 1
+        return { file: { id: 'unexpected-upload' } }
+      },
+    } as any,
+  )
+
+  assert.equal(prepared.transport, 'inline')
+  assert.equal(uploads, 0)
+  assert.ok(prepared.content.includes(longText))
+})
+
+test('Qwen AI preserves all audio-turn text while uploading audio bytes separately', async () => {
   const systemInstruction = 'system-sentinel-73bd10'
   const activeText = 'active-user-sentinel-c6205a'
+  const earlierUserText = `earlier-user-sentinel ${'x'.repeat(5_000)}`
+  const earlierAssistantText = `earlier-assistant-sentinel ${'y'.repeat(5_000)}`
   const audioData = 'B'.repeat(600_000)
   const messages = [
     { role: 'system' as const, content: systemInstruction },
-    { role: 'user' as const, content: `earlier-user-sentinel ${'x'.repeat(5_000)}` },
-    { role: 'assistant' as const, content: `earlier-assistant-sentinel ${'y'.repeat(5_000)}` },
+    { role: 'user' as const, content: earlierUserText },
+    { role: 'assistant' as const, content: earlierAssistantText },
     {
       role: 'user' as const,
       content: [
@@ -623,31 +449,10 @@ test('Qwen AI excludes inline audio bytes from transcript budgeting', async () =
       ],
     },
   ]
-
-  const compacted = compactQwenAiTranscriptMessages(messages, {
-    maxBytes: 2_000,
-    toolResultMaxBytes: 500,
-    messageMaxBytes: 1_000,
-    maxFileParts: 2,
-  })
-
-  assert.ok(
-    compacted.some(message => message.role === 'system' && message.content === systemInstruction),
-    'the system instruction must survive audio transcript compaction',
-  )
-  const activeTurn = compacted.find(message => (
-    message.role === 'user'
-    && Array.isArray(message.content)
-    && message.content.some(part => part.type === 'text' && part.text === activeText)
-  ))
-  assert.ok(activeTurn)
-  assert.ok(
-    Array.isArray(activeTurn.content)
-      && activeTurn.content.some(part => part.type === 'input_audio' && part.input_audio?.data === audioData),
-  )
+  const snapshot = JSON.parse(JSON.stringify(messages))
 
   const uploadedSources: string[] = []
-  const prepared = await prepareQwenAiMultimodalMessage(compacted, {
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
     uploadPart: async (part: any) => {
       uploadedSources.push(part.input_audio.data)
       return { file: { id: 'uploaded-audio-sentinel' } }
@@ -655,9 +460,12 @@ test('Qwen AI excludes inline audio bytes from transcript budgeting', async () =
   } as any)
 
   assert.ok(prepared.content.includes(`System: ${systemInstruction}`))
+  assert.ok(prepared.content.includes(earlierUserText))
+  assert.ok(prepared.content.includes(earlierAssistantText))
   assert.ok(prepared.content.includes(activeText))
   assert.ok(!prepared.content.includes(audioData))
   assert.deepEqual(uploadedSources, [audioData])
+  assert.deepEqual(messages, snapshot, 'audio preparation must not mutate caller messages')
 })
 
 test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn', async () => {
@@ -677,10 +485,619 @@ test('Qwen AI keeps Anthropic-style user tool_result blocks in the active turn',
   ]
 
   const prepared = await prepareQwenAiMultimodalMessage(messages, {} as any)
-  const invokePosition = prepared.content.indexOf('tool_call_id="nested-call"')
+  const invokePosition = prepared.content.indexOf('<function=declared_tool>')
   const resultPosition = prepared.content.indexOf('nested failure')
+  const responses = hermesResponseMatches(prepared.content)
 
   assert.ok(invokePosition >= 0)
   assert.ok(resultPosition > invokePosition)
-  assert.match(prepared.content, /Tool execution failed \(is_error=true\)/)
+  assert.deepEqual(responses.map(response => response.content), ['nested failure'])
+  assert.doesNotMatch(prepared.content, /<\|CHAT2API\|tool_result/)
+})
+
+test('Qwen AI document transport uploads the complete converted transcript and keeps original attachments', async () => {
+  const longHistory = `long-history-start:${'x'.repeat(160_000)}:long-history-end`
+  const originalAttachmentUrl = 'data:text/plain;base64,b3JpZ2luYWwtYXR0YWNobWVudA=='
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'SYSTEM_SENTINEL\nTOOL_SCHEMA_SENTINEL: declared_dynamic_tool(input: string)',
+    },
+    { role: 'user' as const, content: longHistory },
+    assistantToolCall('document-call', 'declared_dynamic_tool', 7),
+    {
+      role: 'tool' as const,
+      tool_call_id: 'document-call',
+      content: 'TOOL_RESULT_SENTINEL',
+    },
+    {
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: 'FINAL_PENDING_TASK_SENTINEL' },
+        {
+          type: 'file' as const,
+          filename: 'original.txt',
+          mime_type: 'text/plain',
+          file_url: { url: originalAttachmentUrl },
+        },
+      ],
+    },
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: Array<{
+    part: any
+    evidenceQueryText: string
+    options: { includeEvidence?: boolean }
+  }> = []
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any, evidenceQueryText: string, options: { includeEvidence?: boolean }) => {
+      uploads.push({ part, evidenceQueryText, options })
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, { transport: 'document' })
+
+  assert.equal(uploads.length, 2, 'the original attachment and generated transcript must both be uploaded')
+  assert.equal(uploads[0].part.file_url.url, originalAttachmentUrl)
+  assert.match(uploads[1].part.filename, /^chat2api-conversation-[a-f0-9]{16}\.txt$/)
+  assert.ok(uploads.every(upload => upload.options.includeEvidence === false))
+  assert.ok(uploads.every(upload => upload.evidenceQueryText === prepared.content))
+
+  const transcriptUrl = uploads[1].part.file_url.url as string
+  const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
+  assert.match(transcript, /SYSTEM_SENTINEL/)
+  assert.match(transcript, /TOOL_SCHEMA_SENTINEL/)
+  assert.ok(transcript.includes(longHistory), 'the large history must be byte-for-byte present')
+  assert.match(transcript, /<function=declared_dynamic_tool>/)
+  assert.match(transcript, /TOOL_RESULT_SENTINEL/)
+  assert.match(transcript, /FINAL_PENDING_TASK_SENTINEL/)
+  assert.doesNotMatch(transcript, /Earlier conversation omitted|\[\.\.\. truncated \.\.\.\]/)
+
+  assert.ok(prepared.content.length < 700, 'the inline prompt must remain a short attachment instruction')
+  assert.match(prepared.content, /complete conversation transcript is attached/i)
+  assert.doesNotMatch(prepared.content, /long-history-start|TOOL_RESULT_SENTINEL/)
+  assert.equal(prepared.files.length, 2)
+  assert.equal(prepared.transport, 'document')
+  assert.ok(prepared.transcriptUtf8Bytes > prepared.inlineUtf8Bytes)
+  assert.deepEqual(messages, snapshot, 'document transport must not mutate caller messages')
+})
+
+test('Qwen AI managed document transport keeps protocol and active tool exchange inline', async () => {
+  const oldHistory = `OLD_HISTORY_START:${'x'.repeat(160_000)}:OLD_HISTORY_END`
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'ORDINARY_SYSTEM_CONTEXT_SENTINEL',
+    },
+    createManagedToolPromptMessage(
+      'FULL_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool","description":"FULL_TOOL_DESCRIPTION_SENTINEL"}</tools>',
+      {
+        content: 'COMPACT_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"declared_dynamic_tool"}</tools>',
+        referenceContent: 'FULL_TOOL_REFERENCE_SENTINEL\nFULL_TOOL_DESCRIPTION_SENTINEL',
+      },
+    ),
+    { role: 'user' as const, content: oldHistory },
+    { role: 'assistant' as const, content: 'Earlier work completed.' },
+    { role: 'user' as const, content: 'ACTIVE_REQUEST_IN_DOCUMENT' },
+    assistantToolCall('active-document-call', 'declared_dynamic_tool', 9),
+    {
+      role: 'tool' as const,
+      tool_call_id: 'active-document-call',
+      content: 'ACTIVE_TOOL_RESULT_SENTINEL',
+    },
+    { role: 'user' as const, content: 'ACTIVE_CONTINUATION_SENTINEL' },
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: any[] = []
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any, evidenceQueryText: string, options: { includeEvidence?: boolean }) => {
+      uploads.push({ part, evidenceQueryText, options })
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, {
+    transport: 'document',
+    managedToolCalling: true,
+    workflowContinuation: true,
+  })
+
+  assert.equal(uploads.length, 2)
+  const transcriptUpload = uploads.find(upload => /^chat2api-conversation-/.test(upload.part.filename))
+  const toolReferenceUpload = uploads.find(upload => /^chat2api-tool-reference-/.test(upload.part.filename))
+  assert.ok(transcriptUpload)
+  assert.ok(toolReferenceUpload)
+  const transcriptUrl = transcriptUpload.part.file_url.url as string
+  const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
+  const toolReferenceUrl = toolReferenceUpload.part.file_url.url as string
+  const toolReference = Buffer.from(toolReferenceUrl.split(',', 2)[1], 'base64').toString('utf8')
+  assert.match(transcript, /OLD_HISTORY_START/)
+  assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
+  assert.doesNotMatch(
+    transcript,
+    /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL|ACTIVE_REQUEST_IN_DOCUMENT|ACTIVE_TOOL_RESULT_SENTINEL|ACTIVE_CONTINUATION_SENTINEL/,
+  )
+  assert.match(toolReference, /FULL_TOOL_REFERENCE_SENTINEL/)
+  assert.match(toolReference, /FULL_TOOL_DESCRIPTION_SENTINEL/)
+
+  assert.match(prepared.content, /Conversation context is attached/i)
+  assert.match(prepared.content, /Complete tool definitions are attached/i)
+  assert.match(prepared.content, /COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.doesNotMatch(prepared.content, /FULL_MANAGED_PROTOCOL_SENTINEL|FULL_TOOL_DESCRIPTION_SENTINEL/)
+  assert.match(prepared.content, /"name":"declared_dynamic_tool"/)
+  assert.match(prepared.content, /ACTIVE_REQUEST_IN_DOCUMENT/)
+  assert.match(prepared.content, /ACTIVE_TOOL_RESULT_SENTINEL/)
+  assert.match(prepared.content, /ACTIVE_CONTINUATION_SENTINEL/)
+  assert.doesNotMatch(
+    prepared.content,
+    /OLD_HISTORY_START|OLD_HISTORY_END|ORDINARY_SYSTEM_CONTEXT_SENTINEL/,
+  )
+  assert.equal(prepared.transport, 'document')
+  assert.ok(prepared.inlineUtf8Bytes < prepared.transcriptUtf8Bytes)
+  assert.deepEqual(messages, snapshot, 'managed document transport must not mutate caller messages')
+})
+
+test('Qwen AI moves an oversized active Claude tool workflow into the complete transcript document', async () => {
+  const toolHistory = Array.from({ length: 94 }, (_, index) => [
+    assistantToolCall(`active-call-${index}`, 'read_file', index),
+    {
+      role: 'tool' as const,
+      tool_call_id: `active-call-${index}`,
+      content: `ACTIVE_RESULT_${index}:${'x'.repeat(1800)}:ACTIVE_RESULT_END_${index}`,
+    },
+  ]).flat()
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL',
+    },
+    createManagedToolPromptMessage(
+      `FULL_MANAGED_PROTOCOL_SENTINEL:${'schema'.repeat(20_000)}`,
+      {
+        content: 'COMPACT_MANAGED_PROTOCOL_SENTINEL\n<tools>{"name":"read_file"}</tools>',
+        referenceContent: 'FULL_TOOL_REFERENCE_SENTINEL',
+      },
+    ),
+    { role: 'user' as const, content: 'ORIGINAL_PENDING_TASK_SENTINEL' },
+    ...toolHistory,
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: any[] = []
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any, evidenceQueryText: string, options: { includeEvidence?: boolean }) => {
+      uploads.push({ part, evidenceQueryText, options })
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, {
+    transport: 'document',
+    managedToolCalling: true,
+    workflowContinuation: true,
+    requestMaxBytes: 90 * 1024,
+  })
+
+  assert.equal(prepared.transport, 'document')
+  assert.equal(prepared.managedDocumentMode, 'complete')
+  assert.ok(prepared.inlineUtf8Bytes < 90 * 1024)
+  assert.equal(uploads.length, 2)
+
+  const transcriptUpload = uploads.find(upload => /^chat2api-conversation-/.test(upload.part.filename))
+  const toolReferenceUpload = uploads.find(upload => /^chat2api-tool-reference-/.test(upload.part.filename))
+  assert.ok(transcriptUpload)
+  assert.ok(toolReferenceUpload)
+  const transcriptUrl = transcriptUpload.part.file_url.url as string
+  const transcript = Buffer.from(transcriptUrl.split(',', 2)[1], 'base64').toString('utf8')
+
+  assert.match(transcript, /ORDINARY_COMPLETE_DOCUMENT_SYSTEM_SENTINEL/)
+  assert.match(transcript, /ORIGINAL_PENDING_TASK_SENTINEL/)
+  assert.match(transcript, /ACTIVE_RESULT_0/)
+  assert.match(transcript, /ACTIVE_RESULT_93/)
+  assert.doesNotMatch(transcript, /FULL_MANAGED_PROTOCOL_SENTINEL|COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.match(prepared.content, /complete managed conversation transcript is attached/i)
+  assert.match(prepared.content, /COMPACT_MANAGED_PROTOCOL_SENTINEL/)
+  assert.doesNotMatch(prepared.content, /ORIGINAL_PENDING_TASK_SENTINEL|ACTIVE_RESULT_0|ACTIVE_RESULT_93/)
+  assert.deepEqual(messages, snapshot, 'complete document fallback must not mutate caller messages')
+})
+
+test('Qwen AI managed document retry changes a first-turn inline payload', async () => {
+  const archivedHistory = `ARCHIVED_USER_HISTORY:${'x'.repeat(160_000)}:ARCHIVED_HISTORY_END`
+  const userRequest = 'FIRST_TURN_REQUEST_SENTINEL'
+  const messages = [
+    {
+      role: 'system' as const,
+      content: 'ORDINARY_SYSTEM_CONTEXT_SENTINEL',
+    },
+    createManagedToolPromptMessage(
+      'HERMES_PROTOCOL_SENTINEL\n<tools>{"name":"read_file"}</tools>',
+    ),
+    { role: 'user' as const, content: archivedHistory },
+    { role: 'assistant' as const, content: 'ARCHIVED_ASSISTANT_RESPONSE_SENTINEL' },
+    { role: 'user' as const, content: userRequest },
+  ]
+  const snapshot = structuredClone(messages)
+  const uploads: any[] = []
+
+  const prepared = await prepareQwenAiMultimodalMessage(messages, {
+    uploadPart: async (part: any) => {
+      uploads.push(part)
+      return { file: { id: `uploaded-${uploads.length}`, filename: part.filename } }
+    },
+  } as any, {
+    transport: 'document',
+    managedToolCalling: true,
+  })
+
+  assert.equal(prepared.transport, 'document')
+  assert.equal(uploads.length, 1)
+  const transcriptUrl = uploads[0].file_url?.url || uploads[0].part?.file_url?.url
+  const transcript = Buffer.from(String(transcriptUrl).split(',', 2)[1], 'base64').toString('utf8')
+  assert.match(transcript, /ORDINARY_SYSTEM_CONTEXT_SENTINEL/)
+  assert.match(transcript, /ARCHIVED_USER_HISTORY/)
+  assert.match(transcript, /ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/)
+  assert.doesNotMatch(
+    transcript,
+    /HERMES_PROTOCOL_SENTINEL|FIRST_TURN_REQUEST_SENTINEL/,
+  )
+  assert.match(prepared.content, /HERMES_PROTOCOL_SENTINEL/)
+  assert.match(prepared.content, /User: FIRST_TURN_REQUEST_SENTINEL/)
+  assert.match(prepared.content, /Conversation context is attached/i)
+  assert.doesNotMatch(
+    prepared.content,
+    /ORDINARY_SYSTEM_CONTEXT_SENTINEL|ARCHIVED_USER_HISTORY|ARCHIVED_HISTORY_END|ARCHIVED_ASSISTANT_RESPONSE_SENTINEL/,
+  )
+  assert.ok(prepared.inlineUtf8Bytes < prepared.transcriptUtf8Bytes)
+  assert.deepEqual(messages, snapshot, 'managed first-turn document retry must not mutate caller messages')
+})
+
+test('Qwen AI content-hash cache reuses an in-memory transcript upload for the same account', async () => {
+  const temporaryDataDir = mkdtempSync(join(tmpdir(), 'chat2api-qwen-cache-'))
+  const previousDataDir = process.env.CHAT2API_DATA_DIR
+  process.env.CHAT2API_DATA_DIR = temporaryDataDir
+
+  try {
+    const uploader = new QwenAiFileUploader(
+      {} as any,
+      () => ({}),
+      undefined,
+      { providerId: 'qwen-ai-cache-test', accountId: 'account-cache-test' },
+    )
+    let physicalUploads = 0
+    ;(uploader as any).uploadResolvedFile = async (file: any) => {
+      physicalUploads += 1
+      return {
+        id: `physical-upload-${physicalUploads}`,
+        name: file.filename,
+        file: { id: `physical-upload-${physicalUploads}` },
+      }
+    }
+    const data = Buffer.from('stable complete transcript bytes', 'utf8').toString('base64')
+    const part = {
+      type: 'file' as const,
+      filename: 'conversation.txt',
+      mime_type: 'text/plain',
+      file_url: { url: `data:text/plain;base64,${data}` },
+    }
+
+    const first = await uploader.uploadPart(part, '', { includeEvidence: false })
+    const second = await uploader.uploadPart(part, '', { includeEvidence: false })
+
+    assert.equal(physicalUploads, 1)
+    assert.equal(first.file.file.id, second.file.file.id)
+    assert.notEqual(first.file.itemId, second.file.itemId)
+  } finally {
+    if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
+    else process.env.CHAT2API_DATA_DIR = previousDataDir
+    rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
+})
+
+test('Qwen AI file upload rejects an expired request deadline before physical upload starts', async () => {
+  const uploader = new QwenAiFileUploader({} as any, () => ({}))
+  let physicalUploads = 0
+  ;(uploader as any).uploadResolvedFile = async () => {
+    physicalUploads += 1
+    return { id: 'unexpected-upload' }
+  }
+
+  const data = Buffer.from('deadline fixture', 'utf8').toString('base64')
+  await assert.rejects(
+    uploader.uploadPart({
+      type: 'file',
+      filename: 'deadline.txt',
+      mime_type: 'text/plain',
+      file_url: { url: `data:text/plain;base64,${data}` },
+    }, '', {
+      includeEvidence: false,
+      deadlineAt: Date.now() - 1,
+    }),
+    (error: any) => {
+      assert.equal(error.status, 504)
+      assert.equal(error.code, 'qwen_ai_request_timeout')
+      assert.equal(error.retryable, false)
+      assert.equal(error.accountFault, false)
+      assert.equal(error.retryScope, undefined)
+      return true
+    },
+  )
+  assert.equal(physicalUploads, 0)
+})
+
+test('Qwen AI HTTP file download inherits the client signal and remaining request budget', async () => {
+  const temporaryDataDir = mkdtempSync(join(tmpdir(), 'chat2api-qwen-http-deadline-'))
+  const previousDataDir = process.env.CHAT2API_DATA_DIR
+  process.env.CHAT2API_DATA_DIR = temporaryDataDir
+  const controller = new AbortController()
+  const deadlineAt = Date.now() + 5_000
+  let requestOptions: any
+
+  try {
+    const uploader = new QwenAiFileUploader({
+      get: async (_url: string, options: any) => {
+        requestOptions = options
+        return {
+          status: 200,
+          headers: { 'content-type': 'image/png' },
+          data: Buffer.from('downloaded-image-bytes'),
+        }
+      },
+    } as any, () => ({}), undefined, {
+      providerId: 'qwen-ai-http-deadline-test',
+      accountId: 'qwen-ai-http-deadline-account',
+    })
+    ;(uploader as any).uploadResolvedFile = async (file: any) => ({
+      id: 'http-upload',
+      file: { id: 'http-upload' },
+      name: file.filename,
+    })
+
+    await uploader.uploadPart({
+      type: 'image_url',
+      image_url: { url: 'https://example.test/deadline-image.png' },
+    }, '', {
+      includeEvidence: false,
+      signal: controller.signal,
+      deadlineAt,
+    })
+
+    assert.equal(requestOptions.signal, controller.signal)
+    assert.ok(requestOptions.timeout >= 1)
+    assert.ok(requestOptions.timeout <= 5_000)
+  } finally {
+    if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
+    else process.env.CHAT2API_DATA_DIR = previousDataDir
+    rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
+})
+
+test('Qwen AI file upload rejects a response that returns after the absolute deadline', async () => {
+  let physicalUploads = 0
+  const uploader = new QwenAiFileUploader({
+    get: (_url: string, _options: any) => {
+      const blockedUntil = Date.now() + 50
+      while (Date.now() < blockedUntil) {
+        // Simulate an event-loop stall between dispatch and Axios resolution.
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: { 'content-type': 'image/png' },
+        data: Buffer.from('late-image-bytes'),
+      })
+    },
+  } as any, () => ({}))
+  ;(uploader as any).uploadResolvedFile = async () => {
+    physicalUploads += 1
+    return { id: 'unexpected-late-upload' }
+  }
+
+  await assert.rejects(
+    uploader.uploadPart({
+      type: 'image_url',
+      image_url: { url: 'https://example.test/late-image.png' },
+    }, '', {
+      includeEvidence: false,
+      deadlineAt: Date.now() + 20,
+    }),
+    (error: any) => error?.status === 504 && error?.code === 'qwen_ai_request_timeout',
+  )
+  assert.equal(physicalUploads, 0, 'a late download must not advance to STS or OSS')
+})
+
+test('Qwen AI shared upload lets one waiter abort without cancelling the physical upload', async () => {
+  const temporaryDataDir = mkdtempSync(join(tmpdir(), 'chat2api-qwen-waiter-abort-'))
+  const previousDataDir = process.env.CHAT2API_DATA_DIR
+  process.env.CHAT2API_DATA_DIR = temporaryDataDir
+  let finishPhysicalUpload!: (value: any) => void
+  const physicalUpload = new Promise<any>(resolve => {
+    finishPhysicalUpload = resolve
+  })
+
+  try {
+    const uploader = new QwenAiFileUploader(
+      {} as any,
+      () => ({}),
+      undefined,
+      { providerId: 'qwen-ai-shared-wait-test', accountId: 'shared-wait-account' },
+    )
+    let physicalUploads = 0
+    ;(uploader as any).uploadResolvedFile = async () => {
+      physicalUploads += 1
+      return physicalUpload
+    }
+    const data = Buffer.from('shared upload bytes', 'utf8').toString('base64')
+    const part = {
+      type: 'file' as const,
+      filename: 'shared.txt',
+      mime_type: 'text/plain',
+      file_url: { url: `data:text/plain;base64,${data}` },
+    }
+
+    const owner = uploader.uploadPart(part, '', { includeEvidence: false })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(physicalUploads, 1)
+
+    const waiterController = new AbortController()
+    const waiter = uploader.uploadPart(part, '', {
+      includeEvidence: false,
+      signal: waiterController.signal,
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    waiterController.abort()
+
+    await assert.rejects(waiter, (error: any) => {
+      assert.equal(error.name, 'AbortError')
+      assert.equal(error.code, 'ERR_CANCELED')
+      return true
+    })
+    assert.equal(physicalUploads, 1, 'the waiter must reuse rather than restart the upload')
+
+    finishPhysicalUpload({ id: 'shared-upload', file: { id: 'shared-upload' } })
+    const ownerResult = await owner
+    assert.equal(ownerResult.file.file.id, 'shared-upload')
+    assert.equal(physicalUploads, 1, 'waiter cancellation must not cancel the upload owner')
+  } finally {
+    if (previousDataDir === undefined) delete process.env.CHAT2API_DATA_DIR
+    else process.env.CHAT2API_DATA_DIR = previousDataDir
+    rmSync(temporaryDataDir, { recursive: true, force: true })
+  }
+})
+
+test('Qwen AI parse polling delay exits promptly when the client aborts', async () => {
+  let statusRequests = 0
+  const uploader = new QwenAiFileUploader({
+    post: async () => {
+      statusRequests += 1
+      return { status: 200, data: { status: 'processing' } }
+    },
+  } as any, () => ({}))
+  const controller = new AbortController()
+  const startedAt = Date.now()
+  const waiting = (uploader as any).waitForParse('parse-abort-file', {
+    signal: controller.signal,
+  })
+  setTimeout(() => controller.abort(), 20)
+
+  await assert.rejects(waiting, (error: any) => {
+    assert.equal(error.name, 'AbortError')
+    assert.equal(error.code, 'ERR_CANCELED')
+    assert.equal(error.retryScope, undefined)
+    return true
+  })
+  assert.ok(Date.now() - startedAt < 500, 'abort must interrupt the two-second poll delay')
+  assert.equal(statusRequests, 0)
+})
+
+test('Qwen AI parse-stage timeout requests account-neutral failover', async () => {
+  const previousInterval = process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS
+  const previousTimeout = process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS
+  process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS = '5'
+  process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS = '250'
+  let statusRequests = 0
+
+  try {
+    const fileId = 'parse-timeout-file'
+    const uploader = new QwenAiFileUploader({
+      post: async () => {
+        statusRequests += 1
+        return {
+          status: 200,
+          data: { data: { [fileId]: { status: 'running' } } },
+        }
+      },
+    } as any, () => ({}))
+    const startedAt = Date.now()
+
+    await assert.rejects((uploader as any).waitForParse(fileId), (error: any) => {
+      assert.equal(error.status, 504)
+      assert.equal(error.code, 'qwen_ai_file_parse_timeout')
+      assert.equal(error.retryable, false)
+      assert.equal(error.accountFault, false)
+      assert.equal(error.retryScope, 'next-account')
+      assert.match(error.message, /last status: running/)
+      return true
+    })
+
+    assert.ok(statusRequests > 0)
+    assert.ok(Date.now() - startedAt < 1_000)
+  } finally {
+    if (previousInterval === undefined) delete process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS
+    else process.env.QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS = previousInterval
+    if (previousTimeout === undefined) delete process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS
+    else process.env.QWEN_AI_FILE_PARSE_TIMEOUT_MS = previousTimeout
+  }
+})
+
+test('Qwen AI OSS upload cancels its dedicated client on client abort or deadline', async () => {
+  const originalPut = OSS.prototype.put
+  const originalCancel = (OSS.prototype as any).cancel
+  let putOptions: any
+  let cancelCalls = 0
+  OSS.prototype.put = ((_name: string, _data: any, options: any) => {
+    putOptions = options
+    return new Promise(() => {})
+  }) as any
+  ;(OSS.prototype as any).cancel = function () {
+    cancelCalls += 1
+  }
+
+  try {
+    const uploader = new QwenAiFileUploader({} as any, () => ({}))
+    const controller = new AbortController()
+    const upload = (uploader as any).uploadToOss({
+      data: Buffer.from('oss-abort-bytes'),
+      sizeBytes: 15,
+      filename: 'abort.txt',
+      mimeType: 'text/plain',
+      coarseType: 'file',
+      fileClass: 'document',
+    }, {
+      accessKeyId: 'fixture-access-key',
+      accessKeySecret: 'fixture-access-secret',
+      bucket: 'fixture-bucket',
+      region: 'oss-cn-hangzhou',
+      endpoint: 'https://oss-cn-hangzhou.aliyuncs.com',
+      fileId: 'fixture-file-id',
+      filePath: 'fixture/path.txt',
+      fileUrl: 'https://fixture-bucket.oss-cn-hangzhou.aliyuncs.com/fixture/path.txt',
+    }, {
+      signal: controller.signal,
+      deadlineAt: Date.now() + 5_000,
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    controller.abort()
+
+    await assert.rejects(upload, (error: any) => {
+      assert.equal(error.name, 'AbortError')
+      assert.equal(error.code, 'ERR_CANCELED')
+      return true
+    })
+    assert.equal(cancelCalls, 1)
+    assert.ok(putOptions.timeout >= 1 && putOptions.timeout <= 5_000)
+
+    const deadlineUpload = (uploader as any).uploadToOss({
+      data: Buffer.from('oss-deadline-bytes'),
+      sizeBytes: 18,
+      filename: 'deadline.txt',
+      mimeType: 'text/plain',
+      coarseType: 'file',
+      fileClass: 'document',
+    }, {
+      accessKeyId: 'fixture-access-key',
+      accessKeySecret: 'fixture-access-secret',
+      bucket: 'fixture-bucket',
+      region: 'oss-cn-hangzhou',
+      endpoint: 'https://oss-cn-hangzhou.aliyuncs.com',
+      fileId: 'fixture-deadline-file-id',
+      filePath: 'fixture/deadline.txt',
+      fileUrl: 'https://fixture-bucket.oss-cn-hangzhou.aliyuncs.com/fixture/deadline.txt',
+    }, {
+      deadlineAt: Date.now() + 20,
+    })
+    await assert.rejects(deadlineUpload, (error: any) => {
+      assert.equal(error.status, 504)
+      assert.equal(error.code, 'qwen_ai_request_timeout')
+      return true
+    })
+    assert.equal(cancelCalls, 2)
+  } finally {
+    OSS.prototype.put = originalPut
+    ;(OSS.prototype as any).cancel = originalCancel
+  }
 })

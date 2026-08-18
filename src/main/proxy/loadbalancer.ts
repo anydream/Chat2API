@@ -7,9 +7,31 @@ import { Account, Provider, LoadBalanceStrategy } from '../store/types'
 import { AccountSelection } from './types'
 import { storeManager } from '../store/store'
 import { normalizeProviderModelForMatch } from './adapters/providerModelOptions'
+import { hasQwenAiSessionCookie } from './adapters/qwen-ai-token-refresh'
 import { qwenAiRequestGovernor } from './qwenAiRequestGovernor'
 
 const LOAD_BALANCER_DEBUG = process.env.CHAT2API_LOAD_BALANCER_DEBUG === 'true'
+
+export interface AccountSelectionConstraints {
+  /** Keep one failover chain inside accounts with an established Qwen web session. */
+  qwenAiWebSessionTier?: 'complete'
+  /**
+   * A retained Qwen chat is valid only for its creating account. Let the
+   * governor queue that account instead of silently selecting another one.
+   */
+  allowQueuedQwenAiPreferredAccount?: boolean
+}
+
+type AccountFailureState = {
+  count: number
+  lastFailTime: number
+  cooldownUntil?: number
+  reason?: string
+}
+
+export type AccountFailureSnapshot = AccountFailureState & {
+  recoveryUntil?: number
+}
 
 function debugLoadBalancer(message: string): void {
   if (LOAD_BALANCER_DEBUG) console.log(message)
@@ -20,7 +42,7 @@ function debugLoadBalancer(message: string): void {
  */
 export class LoadBalancer {
   private roundRobinIndex: Map<string, number> = new Map()
-  private failedAccounts: Map<string, { count: number; lastFailTime: number; cooldownUntil?: number; reason?: string }> = new Map()
+  private failedAccounts: Map<string, AccountFailureState> = new Map()
   private static readonly FAIL_THRESHOLD = 1
   private static readonly RECOVERY_TIME = 60000 // 1 minute
   private static readonly QWEN_AI_RISK_COOLDOWN = 10 * 60 * 1000
@@ -34,7 +56,7 @@ export class LoadBalancer {
       count: current.count + 1,
       lastFailTime: Date.now(),
       cooldownUntil: current.cooldownUntil,
-      reason: current.reason,
+      reason: current.reason || 'request_failure',
     })
   }
 
@@ -64,19 +86,9 @@ export class LoadBalancer {
     this.failedAccounts.clear()
   }
 
-  getAccountFailureSnapshot(): Record<string, {
-    count: number
-    lastFailTime: number
-    cooldownUntil?: number
-    reason?: string
-  }> {
+  getAccountFailureSnapshot(): Record<string, AccountFailureSnapshot> {
     const now = Date.now()
-    const snapshot: Record<string, {
-      count: number
-      lastFailTime: number
-      cooldownUntil?: number
-      reason?: string
-    }> = {}
+    const snapshot: Record<string, AccountFailureSnapshot> = {}
 
     this.failedAccounts.forEach((failure, accountId) => {
       if (failure.cooldownUntil && failure.cooldownUntil <= now) {
@@ -89,7 +101,12 @@ export class LoadBalancer {
         return
       }
 
-      snapshot[accountId] = { ...failure }
+      snapshot[accountId] = {
+        ...failure,
+        ...(!failure.cooldownUntil
+          ? { recoveryUntil: failure.lastFailTime + LoadBalancer.RECOVERY_TIME }
+          : {}),
+      }
     })
 
     return snapshot
@@ -143,12 +160,31 @@ export class LoadBalancer {
     model: string,
     strategy: LoadBalanceStrategy = 'round-robin',
     preferredProviderId?: string,
-    preferredAccountId?: string
+    preferredAccountId?: string,
+    excludedAccountIds: ReadonlySet<string> = new Set(),
+    constraints: AccountSelectionConstraints = {},
   ): AccountSelection | null {
-    let candidates = this.getAvailableAccounts(model, preferredProviderId, true)
+    let candidates = this.getAvailableAccounts(
+      model,
+      preferredProviderId,
+      true,
+      excludedAccountIds,
+    )
+
+    if (constraints.qwenAiWebSessionTier === 'complete') {
+      candidates = candidates.filter(candidate => this.hasCompleteQwenAiWebSession(candidate))
+    }
 
     if (candidates.length === 0) {
-      candidates = this.getAvailableAccounts(model, preferredProviderId, false)
+      candidates = this.getAvailableAccounts(
+        model,
+        preferredProviderId,
+        false,
+        excludedAccountIds,
+      )
+      if (constraints.qwenAiWebSessionTier === 'complete') {
+        candidates = candidates.filter(candidate => this.hasCompleteQwenAiWebSession(candidate))
+      }
     }
 
     if (candidates.length === 0) {
@@ -157,8 +193,25 @@ export class LoadBalancer {
 
     if (preferredAccountId) {
       const preferred = candidates.find(c => c.account.id === preferredAccountId)
-      if (preferred && !this.isAccountInFailure(preferredAccountId)) {
+      if (
+        preferred
+        && !this.isAccountInFailure(preferredAccountId)
+        && (
+          !this.isQwenAiProvider(preferred.provider)
+          || constraints.allowQueuedQwenAiPreferredAccount === true
+          || qwenAiRequestGovernor.isAccountImmediatelyAvailable(preferredAccountId)
+        )
+      ) {
         return preferred
+      }
+    }
+
+    if (constraints.qwenAiWebSessionTier !== 'complete') {
+      const sessionReadyCandidates = candidates.filter(candidate => (
+        !this.hasIncompleteQwenAiWebSession(candidate)
+      ))
+      if (sessionReadyCandidates.length > 0) {
+        candidates = sessionReadyCandidates
       }
     }
 
@@ -187,7 +240,8 @@ export class LoadBalancer {
   private getAvailableAccounts(
     model: string,
     preferredProviderId?: string,
-    excludeFailed: boolean = false
+    excludeFailed: boolean = false,
+    excludedAccountIds: ReadonlySet<string> = new Set(),
   ): AccountSelection[] {
     const providers = storeManager.getProviders().filter(p => p.enabled)
     const candidates: AccountSelection[] = []
@@ -203,6 +257,7 @@ export class LoadBalancer {
 
       const accounts = storeManager.getAccountsByProviderId(provider.id, true)
         .filter(account => this.isAccountAvailable(account))
+        .filter(account => !excludedAccountIds.has(account.id))
         .filter(account => !this.isAccountInHardCooldown(account.id))
         .filter(account => !excludeFailed || !this.isAccountInFailure(account.id))
 
@@ -283,6 +338,22 @@ export class LoadBalancer {
 
   private isQwenAiProvider(provider: Provider): boolean {
     return provider.id === 'qwen-ai' || provider.apiEndpoint.includes('chat.qwen.ai')
+  }
+
+  hasCompleteQwenAiWebSession(candidate: AccountSelection): boolean {
+    if (!this.isQwenAiProvider(candidate.provider)) return false
+
+    const credentials = candidate.account.credentials || {}
+    const cookies = String(credentials.cookies || credentials.cookie || '').trim()
+    return hasQwenAiSessionCookie(cookies)
+  }
+
+  private hasIncompleteQwenAiWebSession(candidate: AccountSelection): boolean {
+    if (!this.isQwenAiProvider(candidate.provider)) return false
+
+    const credentials = candidate.account.credentials || {}
+    const cookies = String(credentials.cookies || credentials.cookie || '').trim()
+    return Boolean(cookies && !hasQwenAiSessionCookie(cookies))
   }
 
   /**

@@ -30,6 +30,8 @@ export type LoadBalanceStrategy = 'round-robin' | 'fill-first' | 'failover'
 
 export type Theme = 'light' | 'dark' | 'system'
 
+export type QwenAiSessionMode = 'legacy' | 'tool-call-binding'
+
 export interface QwenAiGovernorConfig {
   autoTuneEnabled: boolean
   autoTuneMaxConcurrent: number
@@ -54,6 +56,15 @@ export interface QwenAiGovernorEffectiveConfig extends QwenAiGovernorConfig {
   autoTuneReason: string
 }
 
+export interface QwenAiAccountFailoverRecord {
+  requestId?: string
+  status?: number
+  errorCode?: string
+  attempt: number
+  accountFault?: boolean
+  timestamp: number
+}
+
 export interface QwenAiGovernorAccountStatus {
   accountId: string
   accountName: string
@@ -70,14 +81,30 @@ export interface QwenAiGovernorAccountStatus {
   governorFailures: number
   loadBalancerCooldownUntil?: number
   loadBalancerCooldownInMs: number
+  loadBalancerRecoveryUntil?: number
+  loadBalancerRecoveryInMs: number
   loadBalancerReason?: string
   loadBalancerFailures: number
+  recentFailover?: QwenAiAccountFailoverRecord
+  /** Whether the stored cookies contain the Qwen Web session token used for routing. */
+  webSessionReady?: boolean
+  webSessionRepairable?: boolean
+  webSessionRepairState?: 'ready' | 'pending' | 'repairing' | 'backoff' | 'unrepairable'
+  webSessionNextAttemptAt?: number
 }
 
 export interface QwenAiGovernorStatus {
   config: QwenAiGovernorConfig
   effectiveConfig: QwenAiGovernorEffectiveConfig
   queueSize: number
+  /** Requests currently occupying slots, split by scheduler class. */
+  normalActiveRequests: number
+  compactionActiveRequests: number
+  normalQueuedRequests: number
+  compactionQueuedRequests: number
+  /** Effective compaction cap after reserving slots for normal traffic. */
+  compactionMaxConcurrent: number
+  normalReservedSlots: number
   activeRequests: number
   globalNextAvailableAt?: number
   globalNextAvailableInMs: number
@@ -85,8 +112,18 @@ export interface QwenAiGovernorStatus {
   globalCooldownInMs: number
   globalCooldownReason?: string
   globalFailures: number
+  globalRecoveryProbeActive: boolean
+  globalRecoveryProbeAccountId?: string
+  globalRecoveryNextAt?: number
+  globalRecoveryNextInMs: number
   recentRiskEvents: number
   recentRiskAccounts: number
+  sessionRepair?: {
+    running: boolean
+    inFlightAccountId?: string
+    nextRunAt?: number
+    globalPauseUntil?: number
+  }
   accounts: QwenAiGovernorAccountStatus[]
 }
 
@@ -114,6 +151,10 @@ export interface Account {
 export interface ProviderModelCapability {
   /** Whether the provider permits skipping its reasoning/thinking phase. */
   thinkingSkippable?: boolean
+  /** Maximum input context reported by the provider model catalogue. */
+  maxContextLength?: number
+  /** Maximum tokens reserved for a provider-generated context summary. */
+  maxSummaryGenerationLength?: number
 }
 
 export interface Provider {
@@ -177,6 +218,7 @@ export interface AppConfig {
   toolCallingConfig: ToolCallingConfig
   toolPromptConfig?: LegacyToolPromptConfig
   qwenAiGovernorConfig: QwenAiGovernorConfig
+  qwenAiSessionMode: QwenAiSessionMode
   managementApi: ManagementApiConfig
   contextManagement?: unknown
   language: 'zh-CN' | 'en-US'
@@ -445,6 +487,7 @@ export interface ConfigUpdateRequest {
   toolCallingConfig?: Partial<ToolCallingConfig>
   toolPromptConfig?: LegacyToolPromptConfig
   qwenAiGovernorConfig?: Partial<QwenAiGovernorConfig>
+  qwenAiSessionMode?: QwenAiSessionMode
   managementApi?: ManagementApiConfig
 }
 

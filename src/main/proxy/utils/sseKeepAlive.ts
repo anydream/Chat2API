@@ -1,6 +1,8 @@
 import { PassThrough } from 'stream'
 
 export const DEFAULT_SSE_KEEPALIVE_INTERVAL_MS = 15_000
+// A comment keeps the HTTP/SSE transport active without inventing a model
+// chunk, token, reasoning frame, or completion state.
 const KEEPALIVE_FRAME = Buffer.from(': keep-alive\n\n')
 
 /**
@@ -34,6 +36,11 @@ export class SseKeepAliveStream extends PassThrough {
     this.intervalMs = options.intervalMs ?? sseKeepAliveIntervalMsFromEnv()
 
     if (this.intervalMs > 0) {
+      // Put a protocol-neutral frame in the readable buffer immediately so
+      // Koa and protocol bridges can commit response headers without waiting
+      // for the first quiet-period timer. This is transport activity only and
+      // must never be interpreted as upstream model progress.
+      this.push(KEEPALIVE_FRAME)
       this.timer = setInterval(() => this.writeKeepAliveIfIdle(), this.intervalMs)
       this.timer.unref?.()
     }

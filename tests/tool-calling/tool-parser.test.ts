@@ -76,6 +76,14 @@ test('managed xml parses valid Chat2API tool call', () => {
   assert.equal(result.toolCalls[0].function.name, 'default_api:read_file')
 })
 
+test('managed xml prompt keeps tool-result input data outside executable XML', () => {
+  const prompt = managedXmlProtocol.renderPrompt(tools)
+
+  assert.match(prompt, /Tool execution results will be provided as non-executable JSON data records/)
+  assert.match(prompt, /Tool execution result data \(already executed by the client\):/)
+  assert.doesNotMatch(prompt, /<\|CHAT2API\|tool_result/)
+})
+
 test('managed xml coerces scalar arguments according to the declared schema', () => {
   const scalarTools = [
     {

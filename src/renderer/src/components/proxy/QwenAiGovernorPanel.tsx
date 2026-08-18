@@ -15,7 +15,11 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useToast } from '@/hooks/use-toast'
-import type { QwenAiGovernorConfig, QwenAiGovernorStatus } from '@/types/electron'
+import type {
+  QwenAiGovernorConfig,
+  QwenAiGovernorStatus,
+  QwenAiSessionMode,
+} from '@/types/electron'
 import { Gauge, RefreshCw, ShieldAlert, Snowflake, Trash2 } from 'lucide-react'
 
 type FormState = {
@@ -86,6 +90,10 @@ function formatDuration(ms: number): string {
   return `${seconds}s`
 }
 
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString()
+}
+
 function isPositiveInteger(value: string): boolean {
   const parsed = Number.parseInt(value, 10)
   return Number.isInteger(parsed) && parsed >= 0 && String(parsed) === value.trim()
@@ -96,8 +104,10 @@ export function QwenAiGovernorPanel() {
   const { toast } = useToast()
   const [status, setStatus] = useState<QwenAiGovernorStatus | null>(null)
   const [form, setForm] = useState<FormState | null>(null)
+  const [sessionMode, setSessionMode] = useState<QwenAiSessionMode>('tool-call-binding')
   const [isLoading, setIsLoading] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+  const [isSessionModeSaving, setIsSessionModeSaving] = useState(false)
   const lastSyncedFormRef = useRef<string | null>(null)
 
   const hasChanges = useMemo(() => {
@@ -109,8 +119,12 @@ export function QwenAiGovernorPanel() {
     if (!window.electronAPI?.qwenAiGovernor?.getStatus) return
     setIsLoading(true)
     try {
-      const nextStatus = await window.electronAPI.qwenAiGovernor.getStatus()
+      const [nextStatus, appConfig] = await Promise.all([
+        window.electronAPI.qwenAiGovernor.getStatus(),
+        window.electronAPI.config.get(),
+      ])
       setStatus(nextStatus)
+      setSessionMode(appConfig.qwenAiSessionMode === 'legacy' ? 'legacy' : 'tool-call-binding')
       if (nextStatus) {
         const nextForm = toFormState(nextStatus.config)
         const nextFormKey = JSON.stringify(nextForm)
@@ -201,6 +215,28 @@ export function QwenAiGovernorPanel() {
     await loadStatus({ preserveDirty: true })
   }
 
+  const handleSessionModeChange = async (enabled: boolean) => {
+    const nextMode: QwenAiSessionMode = enabled ? 'tool-call-binding' : 'legacy'
+    setIsSessionModeSaving(true)
+    try {
+      const saved = await window.electronAPI.config.update({ qwenAiSessionMode: nextMode })
+      if (!saved) throw new Error(t('proxy.configSaveFailed'))
+      setSessionMode(nextMode)
+      toast({
+        title: t('common.success'),
+        description: t('proxy.qwenGovernor.sessionModeSaved'),
+      })
+    } catch (error) {
+      toast({
+        title: t('common.error'),
+        description: error instanceof Error ? error.message : t('proxy.configSaveFailed'),
+        variant: 'destructive',
+      })
+    } finally {
+      setIsSessionModeSaving(false)
+    }
+  }
+
   const accounts = status?.accounts ?? []
   const cooledAccounts = accounts.filter(account =>
     account.governorCooldownInMs > 0 || account.loadBalancerCooldownInMs > 0,
@@ -222,6 +258,23 @@ export function QwenAiGovernorPanel() {
           <CardDescription>{t('proxy.qwenGovernor.description')}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
+          <div className="flex items-center justify-between gap-4 rounded-md border p-4">
+            <div className="min-w-0 space-y-1">
+              <Label htmlFor="qwen-tool-call-session-mode">
+                {t('proxy.qwenGovernor.sessionMode')}
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                {t(`proxy.qwenGovernor.sessionModeDesc.${sessionMode}`)}
+              </p>
+            </div>
+            <Switch
+              id="qwen-tool-call-session-mode"
+              checked={sessionMode === 'tool-call-binding'}
+              disabled={isLoading || isSessionModeSaving}
+              onCheckedChange={handleSessionModeChange}
+            />
+          </div>
+
           <div className="grid gap-4 md:grid-cols-4">
             <div className="rounded-md border p-4">
               <p className="text-sm text-muted-foreground">{t('proxy.qwenGovernor.queueSize')}</p>
@@ -414,12 +467,18 @@ export function QwenAiGovernorPanel() {
 
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
+          <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-2">
               <ShieldAlert className="h-5 w-5 text-primary" />
               <CardTitle>{t('proxy.qwenGovernor.accountStatus')}</CardTitle>
             </div>
-            <Button variant="outline" size="sm" onClick={handleClearAll} disabled={accounts.length === 0}>
+            <Button
+              variant="outline"
+              size="sm"
+              className="w-full justify-center sm:w-auto"
+              onClick={handleClearAll}
+              disabled={accounts.length === 0}
+            >
               <Trash2 className="mr-2 h-4 w-4" />
               {t('proxy.qwenGovernor.clearAllCooldowns')}
             </Button>
@@ -427,21 +486,26 @@ export function QwenAiGovernorPanel() {
           <CardDescription>{t('proxy.qwenGovernor.accountStatusDesc')}</CardDescription>
         </CardHeader>
         <CardContent>
-          <Table>
+          <div className="overflow-x-auto">
+          <Table className="min-w-[1380px]">
             <TableHeader>
               <TableRow>
                 <TableHead>{t('providers.accountName')}</TableHead>
                 <TableHead>{t('providers.status')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.webSession')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.queue')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.nextAvailable')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.priorityRecovery')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.failures')}</TableHead>
                 <TableHead>{t('proxy.qwenGovernor.reason')}</TableHead>
+                <TableHead>{t('proxy.qwenGovernor.recentFailover')}</TableHead>
                 <TableHead className="text-right">{t('common.actions')}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {accounts.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
+                  <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">
                     {t('proxy.qwenGovernor.noAccounts')}
                   </TableCell>
                 </TableRow>
@@ -450,7 +514,10 @@ export function QwenAiGovernorPanel() {
                   account.governorCooldownInMs > 0 ||
                   account.loadBalancerCooldownInMs > 0 ||
                   account.nextAvailableInMs > 0
-                const reason = account.governorCooldownReason || account.loadBalancerReason || '-'
+                const reasons = [account.governorCooldownReason, account.loadBalancerReason]
+                  .filter((reason): reason is string => Boolean(reason))
+                const canClear = isCooling || account.governorFailures > 0 || account.loadBalancerFailures > 0
+                const failover = account.recentFailover
 
                 return (
                   <TableRow key={account.accountId}>
@@ -464,6 +531,26 @@ export function QwenAiGovernorPanel() {
                       <Badge variant={account.status === 'active' ? 'default' : 'secondary'}>
                         {account.status}
                       </Badge>
+                    </TableCell>
+                    <TableCell>
+                      {account.webSessionRepairState ? (
+                        <div className="space-y-1">
+                          <Badge
+                            variant={account.webSessionRepairState === 'ready'
+                              ? 'default'
+                              : account.webSessionRepairState === 'unrepairable'
+                                ? 'destructive'
+                                : 'secondary'}
+                          >
+                            {t(`proxy.qwenGovernor.webSessionStates.${account.webSessionRepairState}`)}
+                          </Badge>
+                          {account.webSessionNextAttemptAt && account.webSessionNextAttemptAt > Date.now() ? (
+                            <p className="text-xs text-muted-foreground">
+                              {formatTimestamp(account.webSessionNextAttemptAt)}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : <span>-</span>}
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center gap-2">
@@ -480,14 +567,44 @@ export function QwenAiGovernorPanel() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <code className="text-xs">{reason}</code>
+                      <span>{formatDuration(account.loadBalancerRecoveryInMs)}</span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={account.loadBalancerFailures > 0 ? 'destructive' : 'secondary'}>
+                        {account.loadBalancerFailures}
+                      </Badge>
+                    </TableCell>
+                    <TableCell>
+                      {reasons.length > 0 ? (
+                        <div className="space-y-1">
+                          {reasons.map(reason => <code key={reason} className="block text-xs">{reason}</code>)}
+                        </div>
+                      ) : <span>-</span>}
+                    </TableCell>
+                    <TableCell>
+                      {failover ? (
+                        <div className="max-w-[260px] space-y-1 text-xs">
+                          <p>{formatTimestamp(failover.timestamp)}</p>
+                          <p>{t('proxy.qwenGovernor.attempt')}: {failover.attempt}</p>
+                          <p>{t('proxy.qwenGovernor.statusCode')}: {failover.status ?? '-'}</p>
+                          <p className="truncate" title={failover.errorCode}>{t('proxy.qwenGovernor.errorCode')}: {failover.errorCode || '-'}</p>
+                          <p className="truncate" title={failover.requestId}>{t('proxy.qwenGovernor.requestId')}: {failover.requestId || '-'}</p>
+                          <Badge variant="outline">
+                            {failover.accountFault === true
+                              ? t('proxy.qwenGovernor.accountFault')
+                              : failover.accountFault === false
+                                ? t('proxy.qwenGovernor.accountNeutral')
+                                : t('proxy.qwenGovernor.accountFaultUnknown')}
+                          </Badge>
+                        </div>
+                      ) : <span>-</span>}
                     </TableCell>
                     <TableCell className="text-right">
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={() => handleClearAccount(account.accountId)}
-                        disabled={!isCooling}
+                        disabled={!canClear}
                       >
                         {t('proxy.qwenGovernor.clearCooldown')}
                       </Button>
@@ -497,6 +614,7 @@ export function QwenAiGovernorPanel() {
               })}
             </TableBody>
           </Table>
+          </div>
         </CardContent>
       </Card>
     </div>

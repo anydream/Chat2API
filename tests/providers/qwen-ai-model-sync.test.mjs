@@ -47,6 +47,12 @@ test('Qwen AI defaults include the current anonymous international model set', (
   assert.match(storeTypesSource, /export \{ builtinProviders as BUILTIN_PROVIDERS \} from '\.\.\/providers\/builtin\/index\.ts'/)
 })
 
+test('Qwen AI dynamic model refreshes retain the three public mode aliases', () => {
+  assert.match(providerCheckerSource, /withQwenAiModelModeAliases/)
+  assert.match(ipcSource, /withQwenAiModelModeAliases/)
+  assert.match(managementProvidersSource, /withQwenAiModelModeAliases/)
+})
+
 test('Qwen AI model sync uses a shared parser that accepts v1 and v2 response envelopes', () => {
   assert.match(qwenAiSource, /modelsApiEndpoint:\s*'https:\/\/chat\.qwen\.ai\/api\/v2\/models\/'/)
   assert.match(ipcSource, /parseProviderModelsResponse/)

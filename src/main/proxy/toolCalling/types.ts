@@ -5,6 +5,7 @@ export type ToolProtocolId =
   | 'openai_chat'
   | 'managed_bracket'
   | 'managed_xml'
+  | 'qwen_hermes'
   | 'anthropic_tool_use'
   | 'codex_responses'
 
@@ -30,6 +31,7 @@ export interface NormalizedToolResult {
   toolCallId: string
   name?: string
   content: string
+  isError?: boolean
 }
 
 export interface ToolCallDiagnostics {

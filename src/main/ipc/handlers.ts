@@ -8,6 +8,7 @@ import { ProviderChecker } from '../providers/checker'
 import { CustomProviderManager } from '../providers/custom'
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
 import { mergeProviderModelCapabilities, parseProviderModelsResponse } from '../providers/modelSync'
+import { withQwenAiModelModeAliases } from '../providers/qwen-ai-model-mode'
 import { oauthManager } from '../oauth/manager'
 import { ProxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
@@ -25,7 +26,7 @@ import { PerplexityAdapter } from '../proxy/adapters/perplexity'
 import { QwenAdapter } from '../proxy/adapters/qwen'
 import { QwenAiAdapter } from '../proxy/adapters/qwen-ai'
 import { ZaiAdapter } from '../proxy/adapters/zai'
-import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig } from '../../shared/types'
+import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, ProviderModelCapability } from '../../shared/types'
 import type { SystemPrompt, SessionConfig, SessionRecord, ManagementApiConfig } from '../store/types'
 import type { ProviderType } from '../oauth/types'
 
@@ -48,6 +49,7 @@ const clearChatsHandlers: Record<string, (provider: Provider, account: Account) 
 export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Promise<void> {
   try {
     await storeManager.initialize()
+    await storeManager.syncDynamicBuiltinProviderModels()
   } catch (error) {
     console.error('[IPC] Failed to initialize storage:', error)
     
@@ -277,7 +279,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     description?: string
     supportedModels?: string[]
     modelMappings?: Record<string, string>
-    modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
+    modelCapabilities?: Record<string, ProviderModelCapability>
     modelsApiEndpoint?: string
     modelsApiHeaders?: Record<string, string>
     credentialFields?: CredentialField[]
@@ -351,7 +353,7 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     success: boolean
     supportedModels?: string[]
     modelMappings?: Record<string, string>
-    modelCapabilities?: Record<string, { thinkingSkippable?: boolean }>
+    modelCapabilities?: Record<string, ProviderModelCapability>
     error?: string
   }> => {
     try {
@@ -447,7 +449,10 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
         }
       }
 
-      const { supportedModels, modelMappings, modelCapabilities } = parseProviderModelsResponse(response.data)
+      const parsedModels = parseProviderModelsResponse(response.data)
+      const { supportedModels, modelMappings, modelCapabilities } = providerId === 'qwen-ai'
+        ? withQwenAiModelModeAliases(parsedModels)
+        : parsedModels
 
       if (supportedModels.length === 0) {
         return {

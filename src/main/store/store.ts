@@ -32,6 +32,7 @@ import {
   CustomModel,
   DEFAULT_REQUEST_LOG_CONFIG,
   normalizeQwenAiGovernorConfig,
+  normalizeQwenAiSessionMode,
   createDefaultModelMappings,
   normalizeModelMappingsWithDefaults,
   sanitizeDeepSeekModelOverrides,
@@ -251,6 +252,7 @@ class StoreManager {
       toolCallingConfig: normalizeToolCallingConfig(rawToolCallingConfig),
       toolPromptConfig: undefined,
       qwenAiGovernorConfig: normalizeQwenAiGovernorConfig(rawConfig.qwenAiGovernorConfig),
+      qwenAiSessionMode: normalizeQwenAiSessionMode(rawConfig.qwenAiSessionMode),
     }
   }
 
@@ -311,12 +313,26 @@ class StoreManager {
             }
           }
 
+          const preservesDynamicModelCatalogue = Boolean(builtinConfig.modelsApiEndpoint)
+          const supportedModels = preservesDynamicModelCatalogue
+            ? [...new Set([
+                ...(p.supportedModels || []),
+                ...(builtinConfig.supportedModels || []),
+              ])]
+            : builtinConfig.supportedModels
+          const modelMappings = preservesDynamicModelCatalogue
+            ? {
+                ...(builtinConfig.modelMappings || {}),
+                ...(p.modelMappings || {}),
+              }
+            : builtinConfig.modelMappings
+
           return { 
             ...p, 
             apiEndpoint: builtinConfig.apiEndpoint,
             chatPath: builtinConfig.chatPath,
-            supportedModels: builtinConfig.supportedModels,
-            modelMappings: builtinConfig.modelMappings,
+            supportedModels,
+            modelMappings,
             // Keep live capability metadata across restarts while retaining
             // only explicitly configured built-in capability fallbacks.
             modelCapabilities: mergeProviderModelCapabilities(
@@ -764,6 +780,53 @@ class StoreManager {
       ...updatedAccount,
       credentials: updates.credentials || this.decryptCredentials(accounts[index].credentials),
     }
+  }
+
+  /**
+   * Refresh model catalogues exposed by built-in providers. A failed network
+   * refresh leaves the last persisted catalogue untouched so startup remains
+   * usable while a provider endpoint is unavailable.
+   */
+  async syncDynamicBuiltinProviderModels(): Promise<void> {
+    this.ensureInitialized()
+    const dynamicProviders = this.getProviders().filter(provider => (
+      provider.type === 'builtin'
+      && provider.enabled
+      && Boolean(BUILTIN_PROVIDERS.find(builtin => (
+        builtin.id === provider.id && builtin.modelsApiEndpoint
+      )))
+    ))
+    if (dynamicProviders.length === 0) return
+
+    const { ProviderChecker } = await import('../providers/checker.ts')
+    await Promise.all(dynamicProviders.map(async provider => {
+      try {
+        const result = await ProviderChecker.fetchProviderModels(provider.id)
+        if (result.supportedModels.length === 0) {
+          throw new Error('provider returned an empty model catalogue')
+        }
+
+        const current = this.getProviderById(provider.id)
+        if (!current) return
+        this.updateProvider(provider.id, {
+          supportedModels: [...result.supportedModels],
+          modelMappings: { ...result.modelMappings },
+          modelCapabilities: mergeProviderModelCapabilities(
+            current.modelCapabilities,
+            result.modelCapabilities,
+          ),
+        })
+        console.info('[Store] Dynamic model catalogue synchronized', JSON.stringify({
+          providerId: provider.id,
+          modelsCount: result.supportedModels.length,
+        }))
+      } catch (error) {
+        console.warn('[Store] Dynamic model catalogue sync failed; keeping persisted models', JSON.stringify({
+          providerId: provider.id,
+          error: error instanceof Error ? error.message : String(error),
+        }))
+      }
+    }))
   }
 
   /**

@@ -6,12 +6,13 @@ import type { ToolCallingPlan } from './types.ts'
 export function buildToolCallingRuntimePlan(input: {
   requestId?: string
   providerId: string
+  providerProfileKey?: string
   actualModel?: string
   model?: string
   config: ToolCallingConfig
   clientRequest: NormalizedClientToolRequest
 }): ToolCallingPlan {
-  const profile = getProviderToolProfile(input.providerId)
+  const profile = getProviderToolProfile(input.providerProfileKey ?? input.providerId)
   const tools = input.clientRequest.tools
   const toolNames = new Set(tools.map((tool) => tool.name))
   const forcedName = input.clientRequest.toolChoice.forcedName

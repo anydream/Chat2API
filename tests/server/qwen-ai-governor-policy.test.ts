@@ -28,6 +28,20 @@ test('recovery skips only the per-account interval', () => {
   }), 16_000)
 })
 
+test('account failover can explicitly bypass aggregate pacing while preserving cooldowns', () => {
+  assert.equal(calculateQwenAiRequestReadyAt({
+    ...baseInput,
+    recoveryBypassAccountInterval: true,
+    recoveryBypassGlobalInterval: true,
+  }), 1_000)
+  assert.equal(calculateQwenAiRequestReadyAt({
+    ...baseInput,
+    recoveryBypassAccountInterval: true,
+    recoveryBypassGlobalInterval: true,
+    accountCooldownUntil: 301_000,
+  }), 301_000)
+})
+
 test('recovery still honors account cooldowns', () => {
   assert.equal(calculateQwenAiRequestReadyAt({
     ...baseInput,
@@ -51,7 +65,9 @@ const adaptiveBaseInput = {
   configuredMaxConcurrent: 3,
   configuredGlobalMinIntervalMs: 15_000,
   accountMinIntervalMs: 120_000,
+  accountCount: 100,
   recentRiskEvents: 0,
+  recentRiskAccountCount: 0,
 }
 
 test('adaptive Qwen AI limits scale conservatively with healthy accounts', () => {
@@ -87,16 +103,34 @@ test('adaptive Qwen AI limits retain the configured concurrency and interval flo
   assert.equal(result.autoTuneReason, 'healthy_accounts_100')
 })
 
-test('adaptive Qwen AI limits immediately slow down after a risk event', () => {
+test('isolated Qwen risk accounts do not collapse a large healthy pool', () => {
   const result = calculateQwenAiAdaptiveLimits({
     ...adaptiveBaseInput,
-    healthyAccountCount: 100,
-    recentRiskEvents: 1,
+    autoTuneMaxConcurrent: 4,
+    autoTuneMinGlobalIntervalMs: 8_000,
+    healthyAccountCount: 91,
+    recentRiskEvents: 20,
+    recentRiskAccountCount: 9,
   })
 
-  assert.equal(result.maxConcurrent, 1)
-  assert.equal(result.globalMinIntervalMs, 15_000)
-  assert.equal(result.autoTuneReason, 'recent_risk_events')
+  assert.equal(result.maxConcurrent, 4)
+  assert.equal(result.globalMinIntervalMs, 8_792)
+  assert.equal(result.autoTuneReason, 'risk_accounts_9_events_20_of_100')
+})
+
+test('widespread Qwen risk accounts proportionally reduce pool throughput', () => {
+  const result = calculateQwenAiAdaptiveLimits({
+    ...adaptiveBaseInput,
+    autoTuneMaxConcurrent: 4,
+    autoTuneMinGlobalIntervalMs: 8_000,
+    healthyAccountCount: 50,
+    recentRiskEvents: 80,
+    recentRiskAccountCount: 50,
+  })
+
+  assert.equal(result.maxConcurrent, 2)
+  assert.equal(result.globalMinIntervalMs, 16_000)
+  assert.equal(result.autoTuneReason, 'risk_accounts_50_events_80_of_100')
 })
 
 test('manual Qwen AI limits are not changed by the adaptive policy', () => {

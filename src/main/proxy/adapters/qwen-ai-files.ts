@@ -6,6 +6,10 @@ import mime from 'mime-types'
 import path from 'path'
 import type { ChatMessage, ChatMessageContent } from '../types.ts'
 import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import {
+  getManagedToolDocumentPrompt,
+  isManagedToolPromptMessage,
+} from '../toolCalling/managedPromptMetadata.ts'
 import { getRuntime } from '../../runtime/index.ts'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
@@ -19,22 +23,11 @@ const QWEN_AI_FILE_CACHE_TTL_MS = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_TTL
 const QWEN_AI_FILE_CACHE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_FILE_CACHE_MAX_ENTRIES', 512)
 const QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS = positiveIntegerFromEnv('QWEN_AI_DIRECT_UPLOAD_SESSION_TTL_MS', 60 * 60 * 1000)
 const QWEN_AI_DIRECT_FILE_MAX_ENTRIES = positiveIntegerFromEnv('QWEN_AI_DIRECT_FILE_MAX_ENTRIES', 512)
-const PARSE_POLL_INTERVAL_MS = 2000
-const PARSE_POLL_TIMEOUT_MS = 120000
 const DOCUMENT_EVIDENCE_MAX_TEXT_BYTES = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_TEXT_BYTES', 32 * 1024 * 1024)
 const DOCUMENT_EVIDENCE_MAX_TOTAL_CHARS = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_TOTAL_CHARS', 24000)
 const DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_PER_FILE_CHARS', 12000)
 const DOCUMENT_EVIDENCE_MAX_CANDIDATES = positiveIntegerFromEnv('QWEN_AI_DOCUMENT_EVIDENCE_MAX_CANDIDATES', 256)
 const DOCUMENT_EVIDENCE_SNIPPET_CHARS = 1600
-
-// Qwen receives the complete conversation as one user prompt. Keep the
-// provider request below common gateway body limits while retaining the active
-// workflow. Deployments can tune these values for a different upstream limit.
-const QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT = 512 * 1024
-const QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES_DEFAULT = 24 * 1024
-const QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES_DEFAULT = 128 * 1024
-const QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS_DEFAULT = 32
-const QWEN_AI_TRANSCRIPT_OMISSION_MARKER = '[Earlier conversation omitted to fit the provider context budget.]'
 
 export const QWEN_AI_DOCUMENT_EVIDENCE_MARKER = '[Attached document evidence]'
 
@@ -144,6 +137,8 @@ interface NormalizedInputFile {
   data?: Buffer
   localPath?: string
   localMtimeMs?: number
+  /** Stable identity for in-memory or downloaded content. */
+  contentHash?: string
   sizeBytes: number
   filename: string
   mimeType: string
@@ -167,6 +162,32 @@ interface QwenStsInfo {
 export interface PreparedQwenAiMessage {
   content: string
   files: any[]
+  transport: QwenAiMessageTransport
+  managedDocumentMode?: QwenAiManagedDocumentMode
+  transcriptUtf8Bytes: number
+  inlineUtf8Bytes: number
+}
+
+export type QwenAiMessageTransport = 'inline' | 'document'
+export type QwenAiManagedDocumentMode = 'hybrid' | 'complete'
+
+export interface QwenAiFileOperationOptions {
+  signal?: AbortSignal
+  deadlineAt?: number
+}
+
+export interface PrepareQwenAiMultimodalMessageOptions extends QwenAiFileOperationOptions {
+  transport?: QwenAiMessageTransport
+  managedToolCalling?: boolean
+  workflowContinuation?: boolean
+  /** Force the managed document layout. Undefined starts hybrid and escalates when needed. */
+  managedDocumentMode?: QwenAiManagedDocumentMode
+  /** Target for automatic document offload. Zero disables automatic offload. */
+  requestMaxBytes?: number
+}
+
+export interface QwenAiFileUploadPartOptions extends QwenAiFileOperationOptions {
+  includeEvidence?: boolean
 }
 
 interface QwenAiDocumentEvidence {
@@ -191,8 +212,9 @@ interface QwenAiFileCacheRecord {
   key: string
   providerId: string
   accountId: string
-  localPath: string
-  localMtimeMs: number
+  localPath?: string
+  localMtimeMs?: number
+  contentHash?: string
   sizeBytes: number
   filename: string
   mimeType: string
@@ -324,6 +346,14 @@ function positiveIntegerFromEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
 }
 
+function qwenAiFileParsePollIntervalMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_POLL_INTERVAL_MS', 2000)
+}
+
+function qwenAiFileParseTimeoutMsFromEnv(): number {
+  return positiveIntegerFromEnv('QWEN_AI_FILE_PARSE_TIMEOUT_MS', 120000)
+}
+
 function boundedPositiveIntegerFromEnv(name: string, fallback: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, positiveIntegerFromEnv(name, fallback)))
 }
@@ -336,8 +366,181 @@ function uuid(): string {
   })
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+type QwenAiFileOperationError = Error & {
+  status?: number
+  code?: string
+  retryable?: boolean
+  accountFault?: boolean
+  retryScope?: 'next-account'
+}
+
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+function operationDeadlineAt(options: QwenAiFileOperationOptions): number | undefined {
+  return Number.isFinite(options.deadlineAt) ? options.deadlineAt : undefined
+}
+
+function createQwenAiFileDeadlineError(): QwenAiFileOperationError {
+  const error = new Error('Qwen AI request deadline exceeded during file processing.') as QwenAiFileOperationError
+  error.status = 504
+  error.code = 'qwen_ai_request_timeout'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiFileAbortError(): QwenAiFileOperationError {
+  const error = new Error('Qwen AI file processing was cancelled by the client.') as QwenAiFileOperationError
+  error.name = 'AbortError'
+  error.status = 499
+  error.code = 'ERR_CANCELED'
+  error.retryable = false
+  error.accountFault = false
+  return error
+}
+
+function createQwenAiFileParseTimeoutError(
+  timeoutMs: number,
+  lastStatus: string,
+): QwenAiFileOperationError {
+  const statusDetail = lastStatus ? ` (last status: ${lastStatus})` : ''
+  const error = new Error(
+    `Qwen AI file parse timed out after ${timeoutMs}ms${statusDetail}`,
+  ) as QwenAiFileOperationError
+  error.status = 504
+  error.code = 'qwen_ai_file_parse_timeout'
+  error.retryable = false
+  error.accountFault = false
+  error.retryScope = 'next-account'
+  return error
+}
+
+function throwIfQwenAiFileOperationStopped(options: QwenAiFileOperationOptions): void {
+  if (options.signal?.aborted) {
+    throw createQwenAiFileAbortError()
+  }
+
+  const deadlineAt = operationDeadlineAt(options)
+  if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+    throw createQwenAiFileDeadlineError()
+  }
+}
+
+function normalizeQwenAiFileOperationError(
+  error: unknown,
+  options: QwenAiFileOperationOptions,
+): unknown {
+  if ((error as QwenAiFileOperationError | undefined)?.code === 'qwen_ai_request_timeout') {
+    return error
+  }
+  if ((error as QwenAiFileOperationError | undefined)?.code === 'ERR_CANCELED') {
+    return error
+  }
+  if (options.signal?.aborted) {
+    return createQwenAiFileAbortError()
+  }
+  const deadlineAt = operationDeadlineAt(options)
+  if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+    return createQwenAiFileDeadlineError()
+  }
+  return error
+}
+
+function qwenAiFileOperationTimeout(
+  configuredTimeoutMs: number,
+  options: QwenAiFileOperationOptions,
+): number {
+  throwIfQwenAiFileOperationStopped(options)
+  const safeConfiguredTimeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+    ? Math.max(1, Math.floor(configuredTimeoutMs))
+    : 1
+  const deadlineAt = operationDeadlineAt(options)
+  if (deadlineAt === undefined) {
+    return safeConfiguredTimeoutMs
+  }
+  return Math.max(1, Math.min(safeConfiguredTimeoutMs, deadlineAt - Date.now()))
+}
+
+function waitForQwenAiFileOperation<T>(
+  operation: Promise<T>,
+  options: QwenAiFileOperationOptions,
+  cancelOperation?: () => void,
+): Promise<T> {
+  try {
+    throwIfQwenAiFileOperationStopped(options)
+  } catch (error) {
+    cancelOperation?.()
+    return Promise.reject(error)
+  }
+
+  const deadlineAt = operationDeadlineAt(options)
+  if (!options.signal && deadlineAt === undefined) {
+    return operation
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    let deadlineTimer: NodeJS.Timeout | undefined
+
+    const cleanup = () => {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer)
+        deadlineTimer = undefined
+      }
+      options.signal?.removeEventListener('abort', onAbort)
+    }
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      callback()
+    }
+    const cancel = () => {
+      try {
+        cancelOperation?.()
+      } catch {
+        // The structured cancellation error remains authoritative.
+      }
+    }
+    const onAbort = () => {
+      cancel()
+      finish(() => reject(createQwenAiFileAbortError()))
+    }
+    const scheduleDeadline = () => {
+      if (deadlineAt === undefined || settled) return
+      const remainingMs = deadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        cancel()
+        finish(() => reject(createQwenAiFileDeadlineError()))
+        return
+      }
+      deadlineTimer = setTimeout(scheduleDeadline, Math.min(MAX_TIMER_DELAY_MS, remainingMs))
+    }
+
+    options.signal?.addEventListener('abort', onAbort, { once: true })
+    scheduleDeadline()
+    operation.then(
+      value => {
+        try {
+          throwIfQwenAiFileOperationStopped(options)
+          finish(() => resolve(value))
+        } catch (error) {
+          finish(() => reject(error))
+        }
+      },
+      error => finish(() => reject(normalizeQwenAiFileOperationError(error, options))),
+    )
+  })
+}
+
+function delay(ms: number, options: QwenAiFileOperationOptions = {}): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  const operation = new Promise<void>(resolve => {
+    timer = setTimeout(resolve, Math.max(0, Math.min(MAX_TIMER_DELAY_MS, ms)))
+  })
+  return waitForQwenAiFileOperation(operation, options, () => {
+    if (timer) clearTimeout(timer)
+  })
 }
 
 function elapsedSeconds(startTime: number): string {
@@ -412,9 +615,24 @@ class QwenAiFileCache {
   private loaded = false
 
   createKey(scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile): string | null {
-    if (!QWEN_AI_FILE_CACHE_ENABLED || !file.localPath || file.localMtimeMs === undefined) {
+    if (!QWEN_AI_FILE_CACHE_ENABLED) {
       return null
     }
+
+    if (file.contentHash) {
+      return JSON.stringify([
+        'qwen-ai-file-cache-content-v1',
+        scope.providerId,
+        scope.accountId,
+        file.contentHash,
+        file.sizeBytes,
+        normalizeMimeType(file.mimeType),
+        file.coarseType,
+        file.fileClass,
+      ])
+    }
+
+    if (!file.localPath || file.localMtimeMs === undefined) return null
 
     return JSON.stringify([
       'qwen-ai-file-cache-v1',
@@ -438,11 +656,16 @@ class QwenAiFileCache {
     }
 
     const expired = Date.now() - record.createdAt > QWEN_AI_FILE_CACHE_TTL_MS
+    const sourceChanged = file.contentHash
+      ? record.contentHash !== file.contentHash
+      : !file.localPath
+        || file.localMtimeMs === undefined
+        || record.localPath !== path.resolve(file.localPath)
+        || record.localMtimeMs !== file.localMtimeMs
     const changed =
       record.providerId !== scope.providerId ||
       record.accountId !== scope.accountId ||
-      record.localPath !== path.resolve(file.localPath || '') ||
-      record.localMtimeMs !== file.localMtimeMs ||
+      sourceChanged ||
       record.sizeBytes !== file.sizeBytes ||
       normalizeMimeType(record.mimeType) !== normalizeMimeType(file.mimeType) ||
       record.coarseType !== file.coarseType ||
@@ -460,7 +683,7 @@ class QwenAiFileCache {
   }
 
   set(key: string, scope: Required<QwenAiFileCacheScope>, file: NormalizedInputFile, fileItem: any): void {
-    if (!file.localPath || file.localMtimeMs === undefined) {
+    if (!file.contentHash && (!file.localPath || file.localMtimeMs === undefined)) {
       return
     }
 
@@ -471,8 +694,9 @@ class QwenAiFileCache {
       key,
       providerId: scope.providerId,
       accountId: scope.accountId,
-      localPath: path.resolve(file.localPath),
+      localPath: file.localPath ? path.resolve(file.localPath) : undefined,
       localMtimeMs: file.localMtimeMs,
+      contentHash: file.contentHash,
       sizeBytes: file.sizeBytes,
       filename: file.filename,
       mimeType: file.mimeType,
@@ -667,18 +891,26 @@ class QwenAiFileCache {
 class QwenAiFileUploadCoordinator {
   private readonly pending = new Map<string, Promise<any>>()
 
-  async run(key: string, operation: () => Promise<any>): Promise<any> {
-    const existing = this.pending.get(key)
-    if (existing) {
+  async run(
+    key: string,
+    operation: () => Promise<any>,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<any> {
+    let sharedOperation = this.pending.get(key)
+    if (sharedOperation) {
       console.log('[QwenAI][File] cache wait for in-flight upload')
-      return existing
+      // A late waiter owns only its wait. Cancelling it must not cancel the
+      // physical upload already owned by the first caller.
+      return waitForQwenAiFileOperation(sharedOperation, options)
     }
 
-    const promise = operation().finally(() => {
-      this.pending.delete(key)
+    sharedOperation = Promise.resolve().then(operation).finally(() => {
+      if (this.pending.get(key) === sharedOperation) {
+        this.pending.delete(key)
+      }
     })
-    this.pending.set(key, promise)
-    return promise
+    this.pending.set(key, sharedOperation)
+    return waitForQwenAiFileOperation(sharedOperation, options)
   }
 }
 
@@ -901,6 +1133,7 @@ function extractDataUrl(
 
   return {
     data,
+    contentHash: createHash('sha256').update(data).digest('hex'),
     sizeBytes: data.length,
     filename: safeFilename,
     mimeType,
@@ -909,21 +1142,23 @@ function extractDataUrl(
 }
 
 function extractInputAudio(part: ChatMessageContent): NormalizedInputFile {
-  const data = part.input_audio?.data
-  if (!data) {
+  const encodedData = part.input_audio?.data
+  if (!encodedData) {
     throw new Error('Missing data for input_audio content part')
   }
 
-  const parsedData = parseDataUrlPayload(data)
+  const parsedData = parseDataUrlPayload(encodedData)
   const mimeType = normalizeAudioMimeType(part.input_audio?.format, part.mime_type || parsedData.mimeType)
   const filename = ensureExtension(
     sanitizeFilename(part.filename || `input-audio-${uuid()}`),
     mimeType,
   )
 
+  const data = Buffer.from(parsedData.base64, 'base64')
   return {
-    data: Buffer.from(parsedData.base64, 'base64'),
-    sizeBytes: Buffer.byteLength(parsedData.base64, 'base64'),
+    data,
+    contentHash: createHash('sha256').update(data).digest('hex'),
+    sizeBytes: data.length,
     filename,
     mimeType,
     coarseType: 'audio',
@@ -1001,23 +1236,6 @@ function textFromUnknownContent(value: unknown): string {
     .join('')
 }
 
-function boundUnknownToolResultContent(value: unknown, maxBytes: number): unknown {
-  if (typeof value === 'string') {
-    return truncateQwenTranscriptText(value, maxBytes)
-  }
-  if (!Array.isArray(value)) return value
-
-  let remainingBytes = Math.max(0, maxBytes)
-  return value.map(part => {
-    if (!isObjectRecord(part) || qwenContentPartType(part) !== 'text' || typeof part.text !== 'string') {
-      return part
-    }
-    const text = truncateQwenTranscriptText(part.text, remainingBytes)
-    remainingBytes = Math.max(0, remainingBytes - Buffer.byteLength(text, 'utf8'))
-    return { ...part, text }
-  })
-}
-
 function extractNestedQwenToolResults(content: ChatMessage['content']): QwenNestedToolResult[] {
   if (!Array.isArray(content)) return []
 
@@ -1060,17 +1278,13 @@ function qwenFilePartIdentity(part: ChatMessageContent): string | undefined {
   ])
 }
 
-function limitAndDeduplicateQwenFileParts(
-  parts: ChatMessageContent[],
-  maxFileParts: number,
-): ChatMessageContent[] {
-  const limit = Math.max(1, Math.floor(maxFileParts))
+function deduplicateQwenFileParts(parts: ChatMessageContent[]): ChatMessageContent[] {
   const seen = new Set<string>()
   const retained: ChatMessageContent[] = []
 
-  // Keep the most recent unique attachments so an old repeated file cannot
-  // consume the active request's attachment slots.
-  for (let index = parts.length - 1; index >= 0 && retained.length < limit; index -= 1) {
+  // Identical sources need only one upload, but do not impose a proxy-owned
+  // attachment count limit on the caller's request.
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
     const part = parts[index]
     const identity = qwenFilePartIdentity(part)
     if (identity && seen.has(identity)) continue
@@ -1101,39 +1315,6 @@ function nextLocalToolCallId(rawId: string, usedIds: Set<string>, fallbackIndex:
   return localId
 }
 
-export interface QwenAiTranscriptBudget {
-  maxBytes: number
-  toolResultMaxBytes: number
-  messageMaxBytes: number
-  maxFileParts: number
-}
-
-export function getQwenAiTranscriptBudget(): QwenAiTranscriptBudget {
-  return {
-    maxBytes: positiveIntegerFromEnv(
-      'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_BYTES',
-      QWEN_AI_TRANSCRIPT_MAX_BYTES_DEFAULT,
-    ),
-    toolResultMaxBytes: positiveIntegerFromEnv(
-      'CHAT2API_QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES',
-      QWEN_AI_TRANSCRIPT_TOOL_RESULT_MAX_BYTES_DEFAULT,
-    ),
-    messageMaxBytes: positiveIntegerFromEnv(
-      'CHAT2API_QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES',
-      QWEN_AI_TRANSCRIPT_MESSAGE_MAX_BYTES_DEFAULT,
-    ),
-    maxFileParts: positiveIntegerFromEnv(
-      'CHAT2API_QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS',
-      QWEN_AI_TRANSCRIPT_MAX_FILE_PARTS_DEFAULT,
-    ),
-  }
-}
-
-type IndexedQwenMessage = {
-  message: ChatMessage
-  index: number
-}
-
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
 }
@@ -1145,11 +1326,7 @@ function qwenContentPartType(value: unknown): string | undefined {
   return value.type
 }
 
-/**
- * Anthropic bridges can represent a tool result as either role=tool or a
- * role=user content block. Treat both forms as part of the surrounding turn
- * so trimming never separates an assistant tool call from its result.
- */
+/** Anthropic bridges can represent a tool result in either supported form. */
 function isQwenToolResultMessage(message: ChatMessage): boolean {
   if (message.role === 'tool' || Boolean(message.tool_call_id)) return true
   if (!Array.isArray(message.content)) return false
@@ -1159,593 +1336,9 @@ function isQwenToolResultMessage(message: ChatMessage): boolean {
   ))
 }
 
-function isQwenUserTurnMessage(message: ChatMessage): boolean {
-  return message.role === 'user' && !isQwenToolResultMessage(message)
-}
-
-function utf8Prefix(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value, 'utf8')
-  let end = Math.min(bytes.length, Math.max(0, maxBytes))
-  while (end > 0) {
-    const result = bytes.subarray(0, end).toString('utf8')
-    // A partial multi-byte sequence is decoded as U+FFFD, whose encoded size
-    // differs from the source slice. Move the boundary back until it is valid.
-    if (Buffer.byteLength(result, 'utf8') === end) {
-      return result
-    }
-    end -= 1
-  }
-  return ''
-}
-
-function utf8Suffix(value: string, maxBytes: number): string {
-  const bytes = Buffer.from(value, 'utf8')
-  let start = Math.max(0, bytes.length - Math.max(0, maxBytes))
-  while (start < bytes.length) {
-    const result = bytes.subarray(start).toString('utf8')
-    if (Buffer.byteLength(result, 'utf8') === bytes.length - start) {
-      return result
-    }
-    start += 1
-  }
-  return ''
-}
-
-function truncateQwenTranscriptText(value: string, maxBytes: number): string {
-  const totalBytes = Buffer.byteLength(value, 'utf8')
-  if (totalBytes <= maxBytes) return value
-  if (maxBytes <= 0) return ''
-
-  const marker = '\n[... truncated ...]\n'
-  const markerBytes = Buffer.byteLength(marker, 'utf8')
-  if (markerBytes >= maxBytes) return utf8Prefix(value, maxBytes)
-
-  const available = maxBytes - markerBytes
-  const headBytes = Math.ceil(available * 0.6)
-  const tailBytes = available - headBytes
-  return `${utf8Prefix(value, headBytes)}${marker}${utf8Suffix(value, tailBytes)}`
-}
-
-function boundQwenMessageContent(
-  message: ChatMessage,
-  messageMaxBytes: number,
-  toolResultMaxBytes: number,
-): ChatMessage['content'] {
-  const isToolResult = isQwenToolResultMessage(message)
-  const limit = Math.max(0, isToolResult ? toolResultMaxBytes : messageMaxBytes)
-  const content = message.content
-
-  if (typeof content === 'string') {
-    return truncateQwenTranscriptText(content, limit)
-  }
-
-  if (!Array.isArray(content)) return content
-
-  let remainingBytes = limit
-  return content.map(part => {
-    if (!isObjectRecord(part)) return part
-
-    const partType = qwenContentPartType(part)
-
-    if (partType === 'text' && typeof part.text === 'string') {
-      const text = truncateQwenTranscriptText(part.text, remainingBytes)
-      remainingBytes = Math.max(0, remainingBytes - Buffer.byteLength(text, 'utf8'))
-      return {
-        ...part,
-        text,
-      }
-    }
-
-    // Preserve nested Anthropic tool_result text when a bridge has not
-    // normalized it to role=tool yet.
-    if (partType === 'tool_result' && 'content' in part) {
-      const nestedLimit = Math.min(toolResultMaxBytes, remainingBytes)
-      const nestedContent = boundUnknownToolResultContent(part.content, nestedLimit)
-      const nestedTextBytes = Buffer.byteLength(textFromUnknownContent(nestedContent), 'utf8')
-      remainingBytes = Math.max(0, remainingBytes - nestedTextBytes)
-      return {
-        ...part,
-        content: nestedContent,
-      }
-    }
-
-    return { ...part }
-  }) as ChatMessage['content']
-}
-
-/**
- * Tool arguments are structural transcript data rather than message text, so
- * they need an explicit bound as well. Keep oversized arguments valid JSON
- * when possible; a partial JSON fragment would otherwise make the next Qwen
- * prompt look like a malformed tool call.
- */
-function boundQwenToolArguments(value: unknown, maxBytes: number): string {
-  const text = typeof value === 'string' ? value : String(value ?? '')
-  const limit = Math.max(0, maxBytes)
-  if (Buffer.byteLength(text, 'utf8') <= limit) return text
-  if (limit < 2) return ''
-
-  const truncated = truncateQwenTranscriptText(text, limit)
-  try {
-    JSON.parse(truncated)
-    return truncated
-  } catch {
-    return '{}'
-  }
-}
-
-function serializedQwenBytes(value: unknown): number {
-  try {
-    return Buffer.byteLength(JSON.stringify(value) || '', 'utf8')
-  } catch {
-    return 0
-  }
-}
-
-const QWEN_TRANSCRIPT_FILE_PART_TYPES = new Set([
-  'image_url',
-  'file',
-  'input_audio',
-  'video_url',
-])
-
-/**
- * File payloads are uploaded separately and are never rendered into Qwen's
- * text prompt. Project them to their structural type for transcript budgeting
- * so a large data URL cannot evict the active user turn that references it.
- */
-function qwenTranscriptBudgetContent(content: ChatMessage['content']): unknown {
-  if (!Array.isArray(content)) return content
-
-  return content.map(part => {
-    const partType = qwenContentPartType(part)
-    if (!partType || !QWEN_TRANSCRIPT_FILE_PART_TYPES.has(partType)) return part
-    return { type: partType }
-  })
-}
-
-function qwenTranscriptBudgetMessage(message: ChatMessage): unknown {
-  return {
-    ...message,
-    content: qwenTranscriptBudgetContent(message.content),
-  }
-}
-
-/**
- * Bound the complete tool-call array, not only each argument string. A
- * request can contain many small parallel calls whose JSON keys alone would
- * exceed the provider budget. Preserve the newest calls first because they
- * belong to the active workflow; older calls are already represented by the
- * surrounding transcript/result history.
- */
-function boundQwenToolCalls(
-  toolCalls: NonNullable<ChatMessage['tool_calls']>,
-  maxBytes: number,
-): NonNullable<ChatMessage['tool_calls']> {
-  const limit = Math.max(0, maxBytes)
-  if (toolCalls.length === 0 || limit === 0) return []
-
-  const boundAtScale = (scale: number) => toolCalls.map(toolCall => {
-    const fieldLimit = Math.floor(limit * scale)
-    return {
-      ...toolCall,
-      // IDs are the join key for assistant calls and tool results. Never
-      // truncate them independently: an over-sized call is dropped as a unit
-      // below instead of creating an unmatchable result.
-      id: toolCall.id || '',
-      function: {
-        ...toolCall.function,
-        // The declared name is a protocol join key just like the call ID.
-        // Preserve it exactly or omit the complete call below when its
-        // structural metadata cannot fit the aggregate budget.
-        name: toolCall.function.name || '',
-        arguments: boundQwenToolArguments(toolCall.function.arguments, fieldLimit),
-      },
-    }
-  })
-
-  // Start by preserving all calls, then progressively reduce their fields.
-  for (const scale of [1, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
-    const candidate = boundAtScale(scale)
-    if (serializedQwenBytes(candidate) <= limit) return candidate
-  }
-
-  // Even empty fields have a JSON structural cost. Keep as many newest calls
-  // as can fit, and omit the rest rather than leaking an unbounded array. IDs
-  // remain byte-for-byte exact so their corresponding results can be retained.
-  const minimal = boundAtScale(0)
-  const retained: typeof minimal = []
-  for (let index = minimal.length - 1; index >= 0; index -= 1) {
-    const next = [minimal[index], ...retained]
-    if (serializedQwenBytes(next) > limit) continue
-    retained.unshift(minimal[index])
-  }
-  return retained
-}
-
-function boundQwenMessage(
-  message: ChatMessage,
-  budget: Pick<QwenAiTranscriptBudget, 'messageMaxBytes' | 'toolResultMaxBytes'> & {
-    aggregateMaxBytes?: number
-  },
-): ChatMessage {
-  const boundedContent = boundQwenMessageContent(message, budget.messageMaxBytes, budget.toolResultMaxBytes)
-  const contentBytes = serializedQwenBytes(qwenTranscriptBudgetContent(boundedContent))
-  const metadataLimit = Math.max(0, budget.messageMaxBytes)
-  const boundedMetadata = {
-    ...message,
-    ...(typeof message.name === 'string'
-      ? { name: message.name }
-      : {}),
-    ...(typeof message.tool_call_id === 'string'
-      ? { tool_call_id: message.tool_call_id }
-      : {}),
-    content: undefined,
-    tool_calls: undefined,
-  }
-  const messageOverhead = serializedQwenBytes(boundedMetadata)
-  // messageMaxBytes primarily bounds prose/tool-result payloads. Tool-call
-  // arrays are structural workflow state and may need the aggregate budget to
-  // keep at least one valid call; the final aggregate fit pass still enforces
-  // the hard request limit.
-  const structuralBudget = Math.max(
-    budget.messageMaxBytes,
-    budget.aggregateMaxBytes ?? budget.messageMaxBytes,
-  )
-  const toolCallBudget = Math.max(0, structuralBudget - contentBytes - messageOverhead)
-  const boundedToolCalls = message.tool_calls
-    ? boundQwenToolCalls(message.tool_calls, toolCallBudget)
-    : undefined
-  return {
-    ...message,
-    ...(typeof message.name === 'string'
-      ? { name: message.name }
-      : {}),
-    ...(typeof message.tool_call_id === 'string'
-      ? { tool_call_id: message.tool_call_id }
-      : {}),
-    content: boundedContent,
-    tool_calls: boundedToolCalls && boundedToolCalls.length > 0 ? boundedToolCalls : undefined,
-  }
-}
-
-function estimateQwenMessageBytes(message: ChatMessage): number {
-  try {
-    const serialized = JSON.stringify(qwenTranscriptBudgetMessage(message))
-    return Buffer.byteLength(serialized || '', 'utf8')
-  } catch {
-    return Buffer.byteLength(String(message.content || ''), 'utf8')
-  }
-}
-
-function estimateQwenMessagesBytes(messages: ChatMessage[]): number {
-  try {
-    return Buffer.byteLength(JSON.stringify(messages.map(qwenTranscriptBudgetMessage)) || '', 'utf8')
-  } catch {
-    // Keep the fallback conservative by including the array delimiters and
-    // separators that a per-message sum would otherwise omit.
-    return 2
-      + Math.max(0, messages.length - 1)
-      + messages.reduce((total, message) => total + estimateQwenMessageBytes(message), 0)
-  }
-}
-
-function collectQwenTurns(messages: ChatMessage[]): IndexedQwenMessage[][] {
-  const turns: IndexedQwenMessage[][] = []
-  let current: IndexedQwenMessage[] = []
-
-  messages.forEach((message, index) => {
-    if (message.role === 'system') return
-
-    const currentHasResponse = current.some(item => !isQwenUserTurnMessage(item.message))
-    if (isQwenUserTurnMessage(message) && current.length > 0 && currentHasResponse) {
-      turns.push(current)
-      current = []
-    }
-    current.push({ message, index })
-  })
-
-  if (current.length > 0) turns.push(current)
-  return turns
-}
-
-/**
- * Remove tool results whose assistant call was discarded by compaction. The
- * provider-side transcript uses the raw OpenAI id as its join key, so keeping
- * an orphan result (or independently truncating either id) makes the next
- * workflow turn ambiguous. Repeated calls/results with the same raw id remain
- * valid and are intentionally retained as a queue.
- */
-function retainQwenToolCallPairs(messages: ChatMessage[]): ChatMessage[] {
-  const unmatchedCallCounts = new Map<string, number>()
-
-  const addCall = (rawId: string) => {
-    unmatchedCallCounts.set(rawId, (unmatchedCallCounts.get(rawId) || 0) + 1)
-  }
-
-  const consumeCall = (rawId: unknown): boolean => {
-    if (typeof rawId !== 'string' || !rawId) return true
-    const remaining = unmatchedCallCounts.get(rawId) || 0
-    if (remaining <= 0) return false
-    if (remaining === 1) unmatchedCallCounts.delete(rawId)
-    else unmatchedCallCounts.set(rawId, remaining - 1)
-    return true
-  }
-
-  return messages.flatMap(message => {
-    if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
-      for (const call of message.tool_calls) {
-        if (typeof call.id === 'string' && call.id) addCall(call.id)
-      }
-      return [message]
-    }
-
-    if (message.role === 'tool') {
-      // Consume one retained call per result. A Set would let one surviving
-      // duplicate raw ID keep arbitrarily many results after sibling calls
-      // were removed by compaction.
-      if (!consumeCall(message.tool_call_id)) return []
-      return [message]
-    }
-
-    if (message.role !== 'user' || !Array.isArray(message.content)) {
-      return [message]
-    }
-
-    const filteredContent = message.content.filter(part => {
-      if (qwenContentPartType(part) !== 'tool_result' || !isObjectRecord(part)) return true
-      const rawId = part.tool_call_id ?? part.tool_use_id
-      return consumeCall(rawId)
-    })
-
-    if (filteredContent.length === message.content.length) return [message]
-    if (filteredContent.length === 0) return []
-    return [{ ...message, content: filteredContent }]
-  })
-}
-
-/** Reduce parallel calls before dropping their containing workflow turn. */
-function trimQwenToolCallsForBudget(messages: ChatMessage[], maxBytes: number): ChatMessage[] {
-  let candidate = messages
-  while (candidate.length > 0 && estimateQwenMessagesBytes(candidate) > maxBytes) {
-    const assistantIndex = candidate.findIndex(message => (
-      message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
-    ))
-    if (assistantIndex < 0) return candidate
-
-    const assistant = candidate[assistantIndex]
-    const calls = assistant.tool_calls || []
-    const removeCount = Math.max(1, Math.ceil(calls.length / 2))
-    const remainingCalls = calls.slice(removeCount)
-    candidate = candidate.map((message, index) => {
-      if (index !== assistantIndex) return message
-      return {
-        ...message,
-        tool_calls: remainingCalls.length > 0 ? remainingCalls : undefined,
-      }
-    })
-    candidate = retainQwenToolCallPairs(candidate)
-  }
-  return candidate
-}
-
-/**
- * Apply a final serialized-message budget. A configured budget can be smaller
- * than the JSON representation of one message (or even the empty array), so
- * the only strict result in that case is an empty transcript. Whole turns are
- * removed before individual messages to avoid separating call/result pairs.
- */
-function fitQwenMessagesToByteBudget(
-  messages: ChatMessage[],
-  budget: QwenAiTranscriptBudget,
-): ChatMessage[] {
-  if (budget.maxBytes < 2) return []
-
-  let candidate = retainQwenToolCallPairs(messages)
-  candidate = trimQwenToolCallsForBudget(candidate, budget.maxBytes)
-  if (estimateQwenMessagesBytes(candidate) <= budget.maxBytes) return candidate
-
-  // First reduce text and arguments while preserving exact tool ids.
-  for (const scale of [0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
-    candidate = retainQwenToolCallPairs(candidate.map(message => boundQwenMessage(message, {
-      messageMaxBytes: Math.floor(budget.messageMaxBytes * scale),
-      toolResultMaxBytes: Math.floor(budget.toolResultMaxBytes * scale),
-      aggregateMaxBytes: budget.maxBytes,
-    })))
-    candidate = trimQwenToolCallsForBudget(candidate, budget.maxBytes)
-    if (estimateQwenMessagesBytes(candidate) <= budget.maxBytes) return candidate
-  }
-
-  // Remove oldest complete turns first. System preambles are removed last so
-  // a normal-sized budget still keeps the deployment's protocol instructions.
-  while (candidate.length > 0 && estimateQwenMessagesBytes(candidate) > budget.maxBytes) {
-    const turns = collectQwenTurns(candidate)
-    if (turns.length > 0) {
-      const drop = new Set(turns[0].map(item => item.index))
-      candidate = candidate.filter((_, index) => !drop.has(index))
-    } else {
-      candidate = candidate.slice(1)
-    }
-    candidate = retainQwenToolCallPairs(candidate)
-  }
-
-  return estimateQwenMessagesBytes(candidate) <= budget.maxBytes ? candidate : []
-}
-
-function addQwenTurnToSelection(
-  selected: Set<number>,
-  turn: IndexedQwenMessage[],
-): void {
-  for (const item of turn) selected.add(item.index)
-}
-
-function selectedQwenMessages(
-  messages: ChatMessage[],
-  bounded: ChatMessage[],
-  selected: Set<number>,
-): ChatMessage[] {
-  return messages
-    .map((_, index) => index)
-    .filter(index => selected.has(index))
-    .map(index => bounded[index])
-}
-
-function turnHasRealUserMessage(turn: IndexedQwenMessage[]): boolean {
-  return turn.some(item => isQwenUserTurnMessage(item.message))
-}
-
-function insertQwenOmissionMarker(messages: ChatMessage[]): ChatMessage[] {
-  const firstNonSystem = messages.findIndex(message => message.role !== 'system')
-  const insertionIndex = firstNonSystem < 0 ? messages.length : firstNonSystem
-  return [
-    ...messages.slice(0, insertionIndex),
-    { role: 'system', content: QWEN_AI_TRANSCRIPT_OMISSION_MARKER },
-    ...messages.slice(insertionIndex),
-  ]
-}
-
-/**
- * Re-bound selected messages until their serialized representation fits the
- * provider budget. Text is reduced first; structural tool fields are reduced
- * only when their aggregate representation would otherwise exceed the cap.
- */
-function shrinkQwenMessagesToBudget(
-  messages: ChatMessage[],
-  budget: QwenAiTranscriptBudget,
-): ChatMessage[] {
-  if (estimateQwenMessagesBytes(messages) <= budget.maxBytes) {
-    return retainQwenToolCallPairs(messages)
-  }
-
-  const scales = [0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0]
-  let candidate = messages
-  for (const scale of scales) {
-    const messageMaxBytes = Math.floor(budget.messageMaxBytes * scale)
-    const toolResultMaxBytes = Math.floor(budget.toolResultMaxBytes * scale)
-    candidate = messages.map(message => boundQwenMessage(message, {
-      messageMaxBytes,
-      toolResultMaxBytes,
-      aggregateMaxBytes: budget.maxBytes,
-    }))
-    if (estimateQwenMessagesBytes(candidate) <= budget.maxBytes) {
-      return candidate
-    }
-  }
-
-  // Clear any remaining content after all proportional bounds are exhausted,
-  // then remove complete turns until the serialized aggregate is truly within
-  // the configured limit. This can return [] for an impossible tiny budget.
-  return fitQwenMessagesToByteBudget(candidate, budget)
-}
-
-/**
- * Bound Qwen's one-prompt transcript without changing the caller's messages.
- * System messages, the first real user turn (task anchor), and the latest two
- * complete turns are mandatory. The latest-two rule keeps a real task together
- * with an internally appended workflow continuation without depending on any
- * provider/client-specific prompt text. Older turns are admitted newest-first
- * only while the configured byte budget permits them.
- */
-export function compactQwenAiTranscriptMessages(
-  messages: ChatMessage[],
-  overrides: Partial<QwenAiTranscriptBudget> = {},
-): ChatMessage[] {
-  if (messages.length === 0) return messages
-
-  const configured = getQwenAiTranscriptBudget()
-  const budget: QwenAiTranscriptBudget = {
-    maxBytes: Math.max(1, overrides.maxBytes ?? configured.maxBytes),
-    toolResultMaxBytes: Math.max(1, overrides.toolResultMaxBytes ?? configured.toolResultMaxBytes),
-    messageMaxBytes: Math.max(1, overrides.messageMaxBytes ?? configured.messageMaxBytes),
-    maxFileParts: Math.max(1, overrides.maxFileParts ?? configured.maxFileParts),
-  }
-  const originalBytes = estimateQwenMessagesBytes(messages)
-  // Per-message limits are fallback tools for an over-budget transcript, not
-  // independent rewriting rules. Preserve every caller message byte-for-byte
-  // whenever the complete request already fits the provider budget.
-  if (originalBytes <= budget.maxBytes) {
-    return messages
-  }
-
-  const turns = collectQwenTurns(messages)
-  const bounded = messages.map(message => boundQwenMessage(message, {
-    ...budget,
-    aggregateMaxBytes: budget.maxBytes,
-  }))
-  const systemIndices = messages
-    .map((message, index) => message.role === 'system' ? index : -1)
-    .filter(index => index >= 0)
-  const selected = new Set<number>(systemIndices)
-  const mandatoryTurnIndexes = new Set<number>()
-  const anchorTurnIndex = turns.findIndex(turnHasRealUserMessage)
-  const activeTurnIndex = turns.length - 1
-  const previousTurnIndex = turns.length - 2
-
-  for (const turnIndex of [anchorTurnIndex, previousTurnIndex, activeTurnIndex]) {
-    if (turnIndex < 0 || turnIndex >= turns.length || mandatoryTurnIndexes.has(turnIndex)) {
-      continue
-    }
-    mandatoryTurnIndexes.add(turnIndex)
-    addQwenTurnToSelection(selected, turns[turnIndex])
-  }
-
-  const selectedBytes = (): number => estimateQwenMessagesBytes(
-    messages
-      .map((_, index) => index)
-      .filter(index => selected.has(index))
-      .map(index => bounded[index]),
-  )
-
-  // Admit older complete turns from newest to oldest. A turn is always added
-  // as a unit, preventing orphaned tool results or calls.
-  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
-    if (mandatoryTurnIndexes.has(turnIndex)) continue
-    const turn = turns[turnIndex]
-    const turnBytes = turn.reduce((total, item) => total + estimateQwenMessageBytes(bounded[item.index]), 0)
-    if (selectedBytes() + turnBytes > budget.maxBytes) continue
-    addQwenTurnToSelection(selected, turn)
-  }
-
-  let selectedMessages = selectedQwenMessages(messages, bounded, selected)
-  const droppedMessages = selected.size < messages.length
-  const selectedOriginalBytes = estimateQwenMessagesBytes(
-    messages.filter((_, index) => selected.has(index)),
-  )
-  const boundedBytes = estimateQwenMessagesBytes(selectedMessages)
-  const textWasBound = boundedBytes < selectedOriginalBytes
-  const needsCompaction = droppedMessages || textWasBound || boundedBytes > budget.maxBytes
-  if (needsCompaction) {
-    // If the marker itself would exceed the budget, discard optional turns
-    // first while retaining the anchor and latest workflow turns as a unit.
-    selectedMessages = insertQwenOmissionMarker(selectedMessages)
-    if (estimateQwenMessagesBytes(selectedMessages) > budget.maxBytes) {
-      for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
-        if (mandatoryTurnIndexes.has(turnIndex)) continue
-        for (const item of turns[turnIndex]) selected.delete(item.index)
-        selectedMessages = insertQwenOmissionMarker(selectedQwenMessages(messages, bounded, selected))
-        if (estimateQwenMessagesBytes(selectedMessages) <= budget.maxBytes) break
-      }
-    }
-  }
-
-  selectedMessages = shrinkQwenMessagesToBudget(selectedMessages, budget)
-  selectedMessages = fitQwenMessagesToByteBudget(selectedMessages, budget)
-
-  if (needsCompaction) {
-    console.warn('[QwenAI] Compacted transcript for provider context budget', JSON.stringify({
-      originalMessages: messages.length,
-      retainedMessages: selectedMessages.length,
-      originalBytes,
-      retainedBytes: estimateQwenMessagesBytes(selectedMessages),
-      maxBytes: budget.maxBytes,
-    }))
-  }
-  return selectedMessages
-}
-
 function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
   const transcriptMessages = messages
-  const toolProfile = getProviderToolProfile('qwen')
+  const toolProfile = getProviderToolProfile('qwen-ai')
   const transcriptParts: string[] = []
   const fileParts: ChatMessageContent[] = []
   const usedLocalToolCallIds = new Set<string>()
@@ -1783,17 +1376,11 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
     const pending = pendingLocalIds.get(rawToolCallId) ?? []
     const localId = pending[0] ?? rawToolCallId
     pendingLocalIds.set(rawToolCallId, pending.slice(1))
-    const toolResultContent = isError
-      ? `Tool execution failed (is_error=true):\n${resultText}`
-      : resultText
-    transcriptParts.push([
-      `Tool result for ${localId} (already executed by the client):`,
-      toolProfile.formatToolResult({
-        toolCallId: localId,
-        content: toolResultContent,
-      }),
-      'Use this result to decide the next step.',
-    ].join('\n'))
+    transcriptParts.push(toolProfile.formatToolResult({
+      toolCallId: localId,
+      content: resultText,
+      isError,
+    }))
   }
 
   for (let messageIndex = 0; messageIndex < transcriptMessages.length; messageIndex += 1) {
@@ -1868,42 +1455,119 @@ function renderQwenAiTranscript(messages: ChatMessage[]): { content: string; fil
     transcriptParts.push(...systemPreamble)
   }
 
-  const filePartLimit = getQwenAiTranscriptBudget().maxFileParts
-
   return {
     content: transcriptParts.join('\n\n'),
-    fileParts: limitAndDeduplicateQwenFileParts(fileParts, filePartLimit),
+    fileParts: deduplicateQwenFileParts(fileParts),
   }
 }
 
-/**
- * Build the provider prompt and enforce the same byte budget after role/tool
- * rendering. XML tool wrappers are larger than their OpenAI JSON source, so a
- * message-level cap alone cannot guarantee the actual Qwen content limit.
- * Re-render progressively smaller, structurally valid histories; if even the
- * smallest valid history cannot fit, send an empty prompt rather than a
- * truncated XML document.
- */
 function buildQwenAiTranscript(messages: ChatMessage[]): { content: string; fileParts: ChatMessageContent[] } {
-  const budget = getQwenAiTranscriptBudget()
-  const initialMessages = compactQwenAiTranscriptMessages(messages)
-  let prepared = renderQwenAiTranscript(initialMessages)
-  if (Buffer.byteLength(prepared.content, 'utf8') <= budget.maxBytes) {
-    return prepared
+  return renderQwenAiTranscript(messages)
+}
+
+function partitionQwenAiManagedMessages(
+  messages: ChatMessage[],
+  workflowContinuation: boolean,
+  documentMode: QwenAiManagedDocumentMode,
+): {
+  archiveMessages: ChatMessage[]
+  activeMessages: ChatMessage[]
+  toolReferenceContents: string[]
+} {
+  let leadingSystemCount = 0
+  while (messages[leadingSystemCount]?.role === 'system') {
+    leadingSystemCount += 1
   }
 
-  for (const scale of [0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0]) {
-    const candidateMessages = compactQwenAiTranscriptMessages(messages, {
-      ...budget,
-      maxBytes: Math.floor(budget.maxBytes * scale),
-    })
-    prepared = renderQwenAiTranscript(candidateMessages)
-    if (Buffer.byteLength(prepared.content, 'utf8') <= budget.maxBytes) {
-      return prepared
+  const leadingSystemMessages = messages.slice(0, leadingSystemCount)
+  const managedPromptMessages = leadingSystemMessages.filter(isManagedToolPromptMessage)
+  const toolReferenceContents: string[] = []
+  const inlineManagedPromptMessages = managedPromptMessages.map((message) => {
+    const documentPrompt = getManagedToolDocumentPrompt(message)
+    if (!documentPrompt) return message
+
+    toolReferenceContents.push(documentPrompt.referenceContent)
+    return { ...message, content: documentPrompt.content }
+  })
+  const ordinarySystemMessages = leadingSystemMessages.filter(message => (
+    !isManagedToolPromptMessage(message)
+  ))
+
+  if (documentMode === 'complete') {
+    return {
+      archiveMessages: [
+        ...ordinarySystemMessages,
+        ...messages.slice(leadingSystemCount),
+      ],
+      activeMessages: inlineManagedPromptMessages,
+      toolReferenceContents,
     }
   }
 
-  return { content: '', fileParts: [] }
+  let activeStartIndex = messages.length
+  for (let index = messages.length - 1; index >= leadingSystemCount; index -= 1) {
+    const message = messages[index]
+    if (message.role === 'user' && !isQwenToolResultMessage(message)) {
+      activeStartIndex = index
+      break
+    }
+  }
+
+  if (workflowContinuation) {
+    let includedToolExchange = false
+    for (let index = activeStartIndex - 1; index >= leadingSystemCount; index -= 1) {
+      const message = messages[index]
+      const isAssistantToolCall = message.role === 'assistant'
+        && Boolean(message.tool_calls?.length)
+      if (isQwenToolResultMessage(message) || isAssistantToolCall) {
+        activeStartIndex = index
+        includedToolExchange = true
+        continue
+      }
+      if (
+        includedToolExchange
+        && message.role === 'user'
+        && !isQwenToolResultMessage(message)
+      ) {
+        activeStartIndex = index
+      }
+      break
+    }
+  }
+
+  const archiveMessages = [
+    ...ordinarySystemMessages,
+    ...messages.slice(leadingSystemCount, activeStartIndex),
+  ]
+  const activeMessages = [
+    ...inlineManagedPromptMessages,
+    ...messages.slice(activeStartIndex),
+  ]
+  return { archiveMessages, activeMessages, toolReferenceContents }
+}
+
+function renderQwenAiManagedDocumentContext(
+  messages: ChatMessage[],
+  documentMode: QwenAiManagedDocumentMode,
+): string {
+  const activeContext = renderQwenAiTranscript(messages).content
+  if (!activeContext) return ''
+
+  const label = documentMode === 'complete'
+    ? 'Managed tool control'
+    : 'Active managed tool context'
+  return [
+    documentMode === 'complete'
+      ? 'Follow this inline managed-tool control and use the attached transcript for the complete conversation and current task.'
+      : 'Follow this inline control context and use the attached transcript for the archived conversation context.',
+    `[${label}]`,
+    activeContext,
+    `[/${label}]`,
+  ].join('\n')
+}
+
+function qwenAiJsonStringUtf8Bytes(content: string): number {
+  return Buffer.byteLength(JSON.stringify(content), 'utf8')
 }
 
 function validateSupportedParts(content: ChatMessageContent[]): void {
@@ -2387,24 +2051,6 @@ function renderDocumentEvidence(evidences: QwenAiDocumentEvidence[]): string {
   ].join('\n')
 }
 
-function combineQwenTranscriptAndEvidence(
-  transcript: string,
-  evidence: string,
-  maxBytes: number,
-): string {
-  if (!evidence) return transcript
-
-  const separator = '\n\n'
-  const availableEvidenceBytes = maxBytes
-    - Buffer.byteLength(transcript, 'utf8')
-    - Buffer.byteLength(separator, 'utf8')
-  if (availableEvidenceBytes <= 0) {
-    return transcript
-  }
-
-  return `${transcript}${separator}${truncateQwenTranscriptText(evidence, availableEvidenceBytes)}`
-}
-
 export class QwenAiFileUploader {
   private readonly axiosInstance: AxiosInstance
   private readonly getHeaders: HeaderFactory
@@ -2423,7 +2069,12 @@ export class QwenAiFileUploader {
     this.cacheScope = safeCacheScope(cacheScope)
   }
 
-  async uploadPart(part: ChatMessageContent, evidenceQueryText = ''): Promise<UploadedQwenAiPart> {
+  async uploadPart(
+    part: ChatMessageContent,
+    evidenceQueryText = '',
+    options: QwenAiFileUploadPartOptions = {},
+  ): Promise<UploadedQwenAiPart> {
+    throwIfQwenAiFileOperationStopped(options)
     const startedAt = Date.now()
     console.log(`[QwenAI][File] resolve start type=${part.type}`)
     const directUrl = part.type === 'input_audio' ? '' : extractPartUrl(part)
@@ -2441,40 +2092,58 @@ export class QwenAiFileUploader {
         )
       }
       console.log(`[QwenAI][File] direct cache hit filename="${directRecord.filename}" bytes=${directRecord.sizeBytes} account=${this.cacheScope.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+      throwIfQwenAiFileOperationStopped(options)
       return { file: cloneJson(directRecord.file) }
     }
 
-    const file = await this.resolveFile(part)
+    const file = await this.resolveFile(part, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] resolve done seconds=${elapsedSeconds(startedAt)} filename="${file.filename}" bytes=${file.sizeBytes} mime=${file.mimeType} local=${file.localPath ? 'yes' : 'no'}`)
 
     if (file.sizeBytes > MAX_FILE_SIZE) {
       throw new Error(`Qwen AI file upload exceeds ${MAX_FILE_SIZE} bytes: ${file.filename}`)
     }
 
-    const evidence = createDocumentEvidence(file, evidenceQueryText)
+    const evidence = options.includeEvidence === false
+      ? undefined
+      : createDocumentEvidence(file, evidenceQueryText)
+    throwIfQwenAiFileOperationStopped(options)
     const cacheKey = qwenAiFileCache.createKey(this.cacheScope, file)
     if (cacheKey) {
       const cached = qwenAiFileCache.get(cacheKey, this.cacheScope, file)
       if (cached) {
         console.log(`[QwenAI][File] cache hit filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId} totalSeconds=${elapsedSeconds(startedAt)}`)
+        throwIfQwenAiFileOperationStopped(options)
         return { file: cached, evidence }
       }
       console.log(`[QwenAI][File] cache miss filename="${file.filename}" bytes=${file.sizeBytes} account=${this.cacheScope.accountId}`)
-      const uploadedFile = await qwenAiFileUploadCoordinator.run(cacheKey, () => this.uploadResolvedFile(file, startedAt))
+      const uploadedFile = await qwenAiFileUploadCoordinator.run(
+        cacheKey,
+        () => this.uploadResolvedFile(file, startedAt, options),
+        options,
+      )
+      throwIfQwenAiFileOperationStopped(options)
       qwenAiFileCache.set(cacheKey, this.cacheScope, file, uploadedFile)
+      throwIfQwenAiFileOperationStopped(options)
       return {
         file: cloneCachedQwenFileItem(uploadedFile, file),
         evidence,
       }
     }
 
+    const uploadedFile = await this.uploadResolvedFile(file, startedAt, options)
+    throwIfQwenAiFileOperationStopped(options)
     return {
-      file: await this.uploadResolvedFile(file, startedAt),
+      file: uploadedFile,
       evidence,
     }
   }
 
-  async startDirectUpload(input: QwenAiDirectUploadInput): Promise<QwenAiDirectUploadStartResult> {
+  async startDirectUpload(
+    input: QwenAiDirectUploadInput,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<QwenAiDirectUploadStartResult> {
+    throwIfQwenAiFileOperationStopped(options)
     pruneQwenAiDirectUploadSessions()
     const startedAt = Date.now()
     const file = normalizeDirectUploadInput(input)
@@ -2495,7 +2164,8 @@ export class QwenAiFileUploader {
 
     const stsStartedAt = Date.now()
     console.log(`[QwenAI][File] direct sts start filename="${file.filename}" bytes=${file.sizeBytes} type=${file.coarseType}`)
-    const sts = await this.requestSts(file)
+    const sts = await this.requestSts(file, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] direct sts done seconds=${elapsedSeconds(stsStartedAt)} fileId=${sts.fileId}`)
 
     const sessionId = uuid()
@@ -2510,6 +2180,12 @@ export class QwenAiFileUploader {
       createdAt: Date.now(),
       expiresAt,
     })
+    try {
+      throwIfQwenAiFileOperationStopped(options)
+    } catch (error) {
+      qwenAiDirectUploadSessions.delete(sessionId)
+      throw error
+    }
 
     const multipartParams = qwenOssDirectMultipartParams(file.sizeBytes)
     return {
@@ -2551,7 +2227,11 @@ export class QwenAiFileUploader {
     }
   }
 
-  async completeDirectUpload(sessionId: string): Promise<any> {
+  async completeDirectUpload(
+    sessionId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<any> {
+    throwIfQwenAiFileOperationStopped(options)
     pruneQwenAiDirectUploadSessions()
     const session = qwenAiDirectUploadSessions.get(sessionId)
     if (!session) {
@@ -2562,10 +2242,11 @@ export class QwenAiFileUploader {
     if (session.file.fileClass === 'document') {
       const parseStartedAt = Date.now()
       console.log(`[QwenAI][File] direct parse start fileId=${session.sts.fileId}`)
-      await this.parseDocument(session.sts.fileId)
+      await this.parseDocument(session.sts.fileId, options)
       console.log(`[QwenAI][File] direct parse done seconds=${elapsedSeconds(parseStartedAt)} fileId=${session.sts.fileId}`)
     }
 
+    throwIfQwenAiFileOperationStopped(options)
     const fileItem = createQwenFileItem(session.file, session.sts)
     const record = qwenAiFileCache.setDirect(
       { providerId: session.providerId, accountId: session.accountId },
@@ -2574,36 +2255,51 @@ export class QwenAiFileUploader {
       fileItem,
     )
     qwenAiDirectUploadSessions.delete(sessionId)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] direct upload complete totalSeconds=${elapsedSeconds(startedAt)} filename="${session.file.filename}" bytes=${session.file.sizeBytes} fileId=${session.sts.fileId}`)
     return qwenAiDirectPublicFile(record)
   }
 
-  private async uploadResolvedFile(file: NormalizedInputFile, startedAt: number): Promise<any> {
+  private async uploadResolvedFile(
+    file: NormalizedInputFile,
+    startedAt: number,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<any> {
+    throwIfQwenAiFileOperationStopped(options)
     const stsStartedAt = Date.now()
     console.log(`[QwenAI][File] sts start filename="${file.filename}" bytes=${file.sizeBytes} type=${file.coarseType}`)
-    const sts = await this.requestSts(file)
+    const sts = await this.requestSts(file, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] sts done seconds=${elapsedSeconds(stsStartedAt)} fileId=${sts.fileId}`)
 
     const ossStartedAt = Date.now()
     console.log(`[QwenAI][File] oss upload start filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
-    await this.uploadToOss(file, sts)
+    await this.uploadToOss(file, sts, options)
+    throwIfQwenAiFileOperationStopped(options)
     console.log(`[QwenAI][File] oss upload done seconds=${elapsedSeconds(ossStartedAt)} filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
 
     if (file.fileClass === 'document') {
       const parseStartedAt = Date.now()
       console.log(`[QwenAI][File] parse start fileId=${sts.fileId}`)
-      await this.parseDocument(sts.fileId)
+      await this.parseDocument(sts.fileId, options)
       console.log(`[QwenAI][File] parse done seconds=${elapsedSeconds(parseStartedAt)} fileId=${sts.fileId}`)
     }
 
+    throwIfQwenAiFileOperationStopped(options)
     const fileItem = createQwenFileItem(file, sts)
     console.log(`[QwenAI][File] upload complete totalSeconds=${elapsedSeconds(startedAt)} filename="${file.filename}" bytes=${file.sizeBytes} fileId=${sts.fileId}`)
     return fileItem
   }
 
-  private async resolveFile(part: ChatMessageContent): Promise<NormalizedInputFile> {
+  private async resolveFile(
+    part: ChatMessageContent,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<NormalizedInputFile> {
+    throwIfQwenAiFileOperationStopped(options)
     if (part.type === 'input_audio') {
-      return extractInputAudio(part)
+      const file = extractInputAudio(part)
+      throwIfQwenAiFileOperationStopped(options)
+      return file
     }
 
     const url = extractPartUrl(part)
@@ -2611,24 +2307,33 @@ export class QwenAiFileUploader {
     const explicitMimeType = part.mime_type
 
     if (isChat2ApiFileUrl(url)) {
-      return extractLocalFile(part)
+      const file = extractLocalFile(part)
+      throwIfQwenAiFileOperationStopped(options)
+      return file
     }
 
     if (isDataUrl(url)) {
-      return extractDataUrl(url, explicitFilename, explicitMimeType, part.type)
+      const file = extractDataUrl(url, explicitFilename, explicitMimeType, part.type)
+      throwIfQwenAiFileOperationStopped(options)
+      return file
     }
 
     if (!isHttpUrl(url)) {
       throw new Error(`Unsupported Qwen AI file URL scheme for ${part.type}`)
     }
 
-    const response = await this.axiosInstance.get(url, {
-      responseType: 'arraybuffer',
-      maxContentLength: MAX_FILE_SIZE,
-      maxBodyLength: MAX_FILE_SIZE,
-      timeout: 60000,
-      validateStatus: () => true,
-    })
+    const response = await waitForQwenAiFileOperation(
+      this.axiosInstance.get(url, {
+        responseType: 'arraybuffer',
+        maxContentLength: MAX_FILE_SIZE,
+        maxBodyLength: MAX_FILE_SIZE,
+        timeout: qwenAiFileOperationTimeout(60000, options),
+        signal: options.signal,
+        validateStatus: () => true,
+      }),
+      options,
+    )
+    throwIfQwenAiFileOperationStopped(options)
 
     if (response.status >= 400) {
       throw new Error(`Failed to download Qwen AI input file: HTTP ${response.status}`)
@@ -2640,9 +2345,11 @@ export class QwenAiFileUploader {
     const safeFilename = ensureExtension(filename, mimeType)
     const classification = classifyFile(String(mimeType), part.type)
 
+    const data = Buffer.from(response.data)
     return {
-      data: Buffer.from(response.data),
-      sizeBytes: Buffer.byteLength(response.data),
+      data,
+      contentHash: createHash('sha256').update(data).digest('hex'),
+      sizeBytes: data.length,
       filename: safeFilename,
       mimeType: String(mimeType),
       sourceUrl: url,
@@ -2650,7 +2357,11 @@ export class QwenAiFileUploader {
     }
   }
 
-  private async requestSts(file: NormalizedInputFile): Promise<QwenStsInfo> {
+  private async requestSts(
+    file: NormalizedInputFile,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<QwenStsInfo> {
+    throwIfQwenAiFileOperationStopped(options)
     const response = await this.postJson(
       `${QWEN_AI_BASE}/api/v2/files/getstsToken`,
       {
@@ -2663,8 +2374,10 @@ export class QwenAiFileUploader {
         timeout: 30000,
         validateStatus: () => true,
       }),
+      options,
     )
 
+    throwIfQwenAiFileOperationStopped(options)
     if (response.status >= 400) {
       throw new Error(`Qwen AI upload STS request failed: HTTP ${response.status}`)
     }
@@ -2672,13 +2385,18 @@ export class QwenAiFileUploader {
     return normalizeStsResponse(response.data)
   }
 
-  private async uploadToOss(file: NormalizedInputFile, sts: QwenStsInfo): Promise<void> {
+  private async uploadToOss(
+    file: NormalizedInputFile,
+    sts: QwenStsInfo,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<void> {
+    throwIfQwenAiFileOperationStopped(options)
     const refreshOptions = sts.securityToken
       ? {
           refreshSTSToken: async () => {
             const refreshStartedAt = Date.now()
             console.log(`[QwenAI][File] sts refresh start filename="${file.filename}"`)
-            const refreshed = await this.requestSts(file)
+            const refreshed = await this.requestSts(file, options)
             if (!refreshed.securityToken) {
               throw new Error('Qwen AI refreshed upload STS response is missing its security token')
             }
@@ -2695,6 +2413,7 @@ export class QwenAiFileUploader {
           refreshSTSTokenInterval: OSS_STS_REFRESH_INTERVAL_MS,
         }
       : {}
+    const uploadTimeoutMs = qwenAiFileOperationTimeout(OSS_UPLOAD_TIMEOUT_MS, options)
     const client = new OSS({
       accessKeyId: sts.accessKeyId,
       accessKeySecret: sts.accessKeySecret,
@@ -2703,7 +2422,7 @@ export class QwenAiFileUploader {
       region: sts.region,
       endpoint: sts.endpoint,
       authorizationV4: true,
-      timeout: OSS_UPLOAD_TIMEOUT_MS,
+      timeout: uploadTimeoutMs,
       retryMax: OSS_UPLOAD_RETRY_MAX,
       ...refreshOptions,
     } as any)
@@ -2712,7 +2431,7 @@ export class QwenAiFileUploader {
       headers: {
         'Content-Type': file.mimeType,
       },
-      timeout: OSS_UPLOAD_TIMEOUT_MS,
+      timeout: uploadTimeoutMs,
       mime: file.mimeType,
     } as any
 
@@ -2721,19 +2440,31 @@ export class QwenAiFileUploader {
       throw new Error(`Qwen AI input file has no upload source: ${file.filename}`)
     }
 
-    if (file.sizeBytes < OSS_SINGLE_PUT_MAX_BYTES) {
-      await client.put(sts.filePath, uploadSource, uploadOptions)
-      return
-    }
+    const upload = Promise.resolve().then(async () => {
+      if (file.sizeBytes < OSS_SINGLE_PUT_MAX_BYTES) {
+        await client.put(sts.filePath, uploadSource, uploadOptions)
+        return
+      }
 
-    const multipartParams = qwenOssMultipartParams(file.sizeBytes)
-    await client.multipartUpload(sts.filePath, uploadSource, {
-      ...uploadOptions,
-      ...multipartParams,
+      const multipartParams = qwenOssMultipartParams(file.sizeBytes)
+      await client.multipartUpload(sts.filePath, uploadSource, {
+        ...uploadOptions,
+        ...multipartParams,
+      })
     })
+    await waitForQwenAiFileOperation(upload, options, () => {
+      if (typeof (client as any).cancel === 'function') {
+        ;(client as any).cancel()
+      }
+    })
+    throwIfQwenAiFileOperationStopped(options)
   }
 
-  private async parseDocument(fileId: string): Promise<void> {
+  private async parseDocument(
+    fileId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<void> {
+    throwIfQwenAiFileOperationStopped(options)
     const parseResponse = await this.postJson(
       `${QWEN_AI_BASE}/api/v2/files/parse`,
       { file_id: fileId },
@@ -2742,32 +2473,50 @@ export class QwenAiFileUploader {
         timeout: 30000,
         validateStatus: () => true,
       }),
+      options,
     )
 
+    throwIfQwenAiFileOperationStopped(options)
     if (parseResponse.status >= 400) {
       throw new Error(`Qwen AI file parse request failed: HTTP ${parseResponse.status}`)
     }
 
-    await this.waitForParse(fileId)
+    await this.waitForParse(fileId, options)
   }
 
-  private async waitForParse(fileId: string): Promise<void> {
-    const deadline = Date.now() + PARSE_POLL_TIMEOUT_MS
+  private async waitForParse(
+    fileId: string,
+    options: QwenAiFileOperationOptions = {},
+  ): Promise<void> {
+    throwIfQwenAiFileOperationStopped(options)
+    const parsePollIntervalMs = qwenAiFileParsePollIntervalMsFromEnv()
+    const parseTimeoutMs = qwenAiFileParseTimeoutMsFromEnv()
+    const parseDeadlineAt = Date.now() + parseTimeoutMs
+    const requestDeadlineAt = operationDeadlineAt(options)
+    const pollingDeadlineAt = requestDeadlineAt === undefined
+      ? parseDeadlineAt
+      : Math.min(parseDeadlineAt, requestDeadlineAt)
     let lastStatus = ''
 
-    while (Date.now() < deadline) {
-      await delay(PARSE_POLL_INTERVAL_MS)
+    while (Date.now() < pollingDeadlineAt) {
+      const waitMs = Math.min(parsePollIntervalMs, pollingDeadlineAt - Date.now())
+      await delay(waitMs, options)
+      throwIfQwenAiFileOperationStopped(options)
+      if (Date.now() >= pollingDeadlineAt) break
 
       const response: AxiosResponse = await this.postJson(
         `${QWEN_AI_BASE}/api/v2/files/parse/status`,
         { file_id_list: [fileId] },
         () => ({
           headers: this.getHeaders(),
-          timeout: 30000,
+          timeout: Math.max(1, Math.min(30000, pollingDeadlineAt - Date.now())),
           validateStatus: () => true,
         }),
+        options,
       )
 
+      throwIfQwenAiFileOperationStopped(options)
+      if (Date.now() >= pollingDeadlineAt) break
       if (response.status >= 400) {
         throw new Error(`Qwen AI file parse status request failed: HTTP ${response.status}`)
       }
@@ -2789,38 +2538,186 @@ export class QwenAiFileUploader {
       }
     }
 
-    throw new Error(
-      `Qwen AI file parse timed out after ${PARSE_POLL_TIMEOUT_MS}ms${lastStatus ? ` (last status: ${lastStatus})` : ''}`,
-    )
+    throwIfQwenAiFileOperationStopped(options)
+    throw createQwenAiFileParseTimeoutError(parseTimeoutMs, lastStatus)
   }
 
   private async postJson(
     url: string,
     payload: unknown,
     createOptions: () => Record<string, any>,
+    options: QwenAiFileOperationOptions = {},
   ): Promise<AxiosResponse> {
-    if (this.postWithRefreshRetry) {
-      return this.postWithRefreshRetry(url, payload, createOptions)
+    throwIfQwenAiFileOperationStopped(options)
+    const createOperationOptions = () => {
+      throwIfQwenAiFileOperationStopped(options)
+      const requestOptions = createOptions()
+      const configuredTimeout = Number(requestOptions.timeout)
+      return {
+        ...requestOptions,
+        ...(Number.isFinite(configuredTimeout) && configuredTimeout > 0
+          ? { timeout: qwenAiFileOperationTimeout(configuredTimeout, options) }
+          : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
+      }
     }
 
-    return this.axiosInstance.post(url, payload, createOptions())
+    const operation = this.postWithRefreshRetry
+      ? this.postWithRefreshRetry(url, payload, createOperationOptions)
+      : this.axiosInstance.post(url, payload, createOperationOptions())
+    const response = await waitForQwenAiFileOperation(operation, options)
+    throwIfQwenAiFileOperationStopped(options)
+    return response
   }
+}
+
+function createQwenAiTextDocument(prefix: string, content: string): ChatMessageContent {
+  const data = Buffer.from(content, 'utf8')
+  const contentHash = createHash('sha256').update(data).digest('hex')
+  return {
+    type: 'file',
+    filename: `${prefix}-${contentHash.slice(0, 16)}.txt`,
+    mime_type: 'text/plain',
+    file_url: {
+      url: `data:text/plain;base64,${data.toString('base64')}`,
+    },
+  }
+}
+
+function createQwenAiTranscriptDocument(content: string): ChatMessageContent {
+  return createQwenAiTextDocument('chat2api-conversation', content)
+}
+
+function createQwenAiToolReferenceDocument(content: string): ChatMessageContent {
+  return createQwenAiTextDocument('chat2api-tool-reference', content)
+}
+
+function qwenAiTranscriptDocumentInstruction(filename: string): string {
+  return [
+    `The complete conversation transcript is attached as ${filename}.`,
+    'Read the attachment in full and treat it as the authoritative conversation context.',
+    'Preserve every role, system instruction, tool declaration, tool call, tool result, and original attachment, then continue the final pending user task.',
+  ].join(' ')
+}
+
+function qwenAiEarlierTranscriptDocumentInstruction(filename: string): string {
+  return [
+    `Conversation context is attached as ${filename}.`,
+    'Read it first, then follow the active managed-tool protocol and current turn context provided inline below.',
+  ].join(' ')
+}
+
+function qwenAiCompleteManagedTranscriptDocumentInstruction(filename: string): string {
+  return [
+    `The complete managed conversation transcript is attached as ${filename}.`,
+    'Read it in full and treat its final event as the current workflow state, including the pending user task and every completed tool result.',
+    'Use the inline managed-tool control for any next tool call, and do not repeat work already completed in the transcript.',
+  ].join(' ')
+}
+
+function qwenAiToolReferenceDocumentInstruction(filename: string): string {
+  return [
+    `Complete tool definitions are attached as ${filename}.`,
+    'The inline tool catalog is optimized for routing and argument construction; consult the attachment whenever additional tool semantics or schema annotations are needed.',
+  ].join(' ')
 }
 
 export async function prepareQwenAiMultimodalMessage(
   messages: ChatMessage[],
   uploader: QwenAiFileUploader,
+  options: PrepareQwenAiMultimodalMessageOptions = {},
 ): Promise<PreparedQwenAiMessage> {
+  throwIfQwenAiFileOperationStopped(options)
   const { content: userContent, fileParts } = buildQwenAiTranscript(messages)
-  const uniqueFileParts = limitAndDeduplicateQwenFileParts(
-    fileParts,
-    getQwenAiTranscriptBudget().maxFileParts,
-  )
+  const uniqueFileParts = deduplicateQwenFileParts(fileParts)
+  const transcriptUtf8Bytes = qwenAiJsonStringUtf8Bytes(userContent)
+  const requestedTransport = options.transport ?? 'inline'
+  const requestMaxBytes = Math.max(0, Math.floor(options.requestMaxBytes ?? 0))
+  const shouldUseDocument = requestedTransport === 'document'
+    || (requestMaxBytes > 0 && transcriptUtf8Bytes > requestMaxBytes)
+  let generatedDocuments: ChatMessageContent[] = []
+  let inlineContent = userContent
+  let managedDocumentMode: QwenAiManagedDocumentMode | undefined
+
+  if (shouldUseDocument && options.managedToolCalling) {
+    const buildManagedDocument = (documentMode: QwenAiManagedDocumentMode): {
+      documents: ChatMessageContent[]
+      content: string
+    } => {
+      const { archiveMessages, activeMessages, toolReferenceContents } = partitionQwenAiManagedMessages(
+        messages,
+        options.workflowContinuation === true,
+        documentMode,
+      )
+      const activeContext = renderQwenAiManagedDocumentContext(activeMessages, documentMode)
+      const archiveContent = renderQwenAiTranscript(archiveMessages).content
+      const documents: ChatMessageContent[] = []
+      const inlineInstructions: string[] = []
+      if (archiveContent) {
+        const transcriptDocument = createQwenAiTranscriptDocument(archiveContent)
+        documents.push(transcriptDocument)
+        inlineInstructions.push(
+          documentMode === 'complete'
+            ? qwenAiCompleteManagedTranscriptDocumentInstruction(
+                transcriptDocument.filename || 'the attached transcript',
+              )
+            : qwenAiEarlierTranscriptDocumentInstruction(
+                transcriptDocument.filename || 'the attached transcript',
+              ),
+        )
+      }
+      if (toolReferenceContents.length > 0) {
+        const toolReferenceDocument = createQwenAiToolReferenceDocument(
+          toolReferenceContents.join('\n\n'),
+        )
+        documents.push(toolReferenceDocument)
+        inlineInstructions.push(
+          qwenAiToolReferenceDocumentInstruction(
+            toolReferenceDocument.filename || 'the attached tool reference',
+          ),
+        )
+      }
+      return {
+        documents,
+        content: [...inlineInstructions, activeContext].filter(Boolean).join('\n\n'),
+      }
+    }
+
+    managedDocumentMode = options.managedDocumentMode ?? 'hybrid'
+    let managedDocument = buildManagedDocument(managedDocumentMode)
+    if (
+      options.managedDocumentMode === undefined
+      && requestMaxBytes > 0
+      && qwenAiJsonStringUtf8Bytes(managedDocument.content) > requestMaxBytes
+    ) {
+      managedDocumentMode = 'complete'
+      managedDocument = buildManagedDocument(managedDocumentMode)
+    }
+    generatedDocuments = managedDocument.documents
+    inlineContent = managedDocument.content
+  } else if (shouldUseDocument) {
+    const transcriptDocument = createQwenAiTranscriptDocument(userContent)
+    generatedDocuments.push(transcriptDocument)
+    inlineContent = qwenAiTranscriptDocumentInstruction(
+      transcriptDocument.filename || 'the attached transcript',
+    )
+  }
+
+  const transport: QwenAiMessageTransport = generatedDocuments.length > 0 ? 'document' : 'inline'
+  const uploadedParts = [...uniqueFileParts, ...generatedDocuments]
 
   const files: any[] = []
   const evidences: QwenAiDocumentEvidence[] = []
-  for (const part of uniqueFileParts) {
-    const uploaded = await uploader.uploadPart(part, userContent)
+  for (const part of uploadedParts) {
+    throwIfQwenAiFileOperationStopped(options)
+    const uploaded = await uploader.uploadPart(part, inlineContent, {
+      // This transport exists specifically to avoid re-sending the large
+      // transcript inline. Qwen still receives every source attachment.
+      includeEvidence: transport !== 'document',
+      signal: options.signal,
+      deadlineAt: options.deadlineAt,
+    })
+    throwIfQwenAiFileOperationStopped(options)
     files.push(uploaded.file)
     if (uploaded.evidence) {
       evidences.push(uploaded.evidence)
@@ -2828,19 +2725,18 @@ export async function prepareQwenAiMultimodalMessage(
   }
 
   const documentEvidence = renderDocumentEvidence(evidences)
+  throwIfQwenAiFileOperationStopped(options)
   const content = documentEvidence
-    ? `${userContent}\n\n${documentEvidence}`
-    : userContent
-  const boundedContent = documentEvidence
-    ? combineQwenTranscriptAndEvidence(
-        userContent,
-        documentEvidence,
-        getQwenAiTranscriptBudget().maxBytes,
-      )
-    : content
+    ? `${inlineContent}\n\n${documentEvidence}`
+    : inlineContent
+  throwIfQwenAiFileOperationStopped(options)
 
   return {
-    content: boundedContent,
+    content,
     files,
+    transport,
+    managedDocumentMode,
+    transcriptUtf8Bytes,
+    inlineUtf8Bytes: qwenAiJsonStringUtf8Bytes(content),
   }
 }

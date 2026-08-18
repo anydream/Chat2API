@@ -43,7 +43,8 @@ export function isToolResultMessage(message: ChatMessage): boolean {
 /**
  * Validate the protocol boundary that opens a new model turn after client tool
  * execution. Results must form the trailing batch and match every ID in the
- * immediately preceding call batch exactly once.
+ * preceding call batch exactly once. A protocol bridge may split assistant
+ * text from its tool calls and place that text between the call and result.
  */
 export function hasTrailingMatchedToolResultBatch(messages: ChatMessage[]): boolean {
   const lastIndex = messages.length - 1
@@ -54,7 +55,15 @@ export function hasTrailingMatchedToolResultBatch(messages: ChatMessage[]): bool
     batchStartIndex -= 1
   }
 
-  const callMessage = messages[batchStartIndex - 1]
+  let callMessageIndex = batchStartIndex - 1
+  while (
+    callMessageIndex >= 0
+    && isStrictAssistantTextOnlyMessage(messages[callMessageIndex])
+  ) {
+    callMessageIndex -= 1
+  }
+
+  const callMessage = messages[callMessageIndex]
   if (!callMessage) return false
   const callIds = getStrictManagedToolCallIds(callMessage)
   if (!callIds || callIds.length === 0) return false
@@ -74,6 +83,32 @@ export function hasTrailingMatchedToolResultBatch(messages: ChatMessage[]): bool
   if (resultIds.length !== callIds.length) return false
   const callIdSet = new Set(callIds)
   return resultIds.every(resultId => callIdSet.has(resultId))
+}
+
+function isStrictAssistantTextOnlyMessage(message: ChatMessage): boolean {
+  if (message.role !== 'assistant') return false
+  const candidate = message as ChatMessage & {
+    function_call?: unknown
+    tool_calls?: unknown
+    tool_call_id?: unknown
+  }
+  if (
+    candidate.function_call !== undefined
+    || candidate.tool_calls !== undefined
+    || candidate.tool_call_id !== undefined
+  ) {
+    return false
+  }
+
+  if (typeof message.content === 'string') return true
+  if (!Array.isArray(message.content) || message.content.length === 0) return false
+  return message.content.every((part) => (
+    Boolean(part)
+    && typeof part === 'object'
+    && !Array.isArray(part)
+    && (part as { type?: unknown }).type === 'text'
+    && typeof (part as { text?: unknown }).text === 'string'
+  ))
 }
 
 function getStrictManagedToolCallIds(message: ChatMessage): string[] | undefined {

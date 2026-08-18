@@ -27,8 +27,14 @@ param(
   [ValidateRange(1, 65535)]
   [int]$Chat2ApiPort = 18080,
 
+  [ValidateNotNullOrEmpty()]
+  [string]$Chat2ApiHost = '127.0.0.1',
+
   [ValidateRange(1, 65535)]
   [int]$LiteLlmPort = 4000,
+
+  [ValidateNotNullOrEmpty()]
+  [string]$LiteLlmHost = '127.0.0.1',
 
   [string]$ConfigPath = (Join-Path $env:LOCALAPPDATA 'Chat2API\native\supervisor-config.clixml'),
 
@@ -193,7 +199,19 @@ function Set-OwnerOnlyAcl {
   Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-if ($Chat2ApiPort -eq $LiteLlmPort) {
+function New-HttpUrl {
+  param(
+    [Parameter(Mandatory = $true)][string]$Host,
+    [Parameter(Mandatory = $true)][int]$Port,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  $builder = [UriBuilder]::new('http', $Host, $Port)
+  $builder.Path = $Path
+  return $builder.Uri.AbsoluteUri.TrimEnd('/')
+}
+
+if ($Chat2ApiHost.Equals($LiteLlmHost, [StringComparison]::OrdinalIgnoreCase) -and $Chat2ApiPort -eq $LiteLlmPort) {
   throw 'Chat2API and LiteLLM must use different ports.'
 }
 
@@ -209,7 +227,7 @@ $dockerExecutable = Get-DockerExecutable
 $chatEnvironment = Select-Environment `
   -Source (Get-ContainerEnvironment -DockerExecutable $dockerExecutable -ContainerName $Chat2ApiContainer) `
   -NamePattern '^(CHAT2API_|QWEN_AI_)'
-$chatEnvironment['CHAT2API_HOST'] = '127.0.0.1'
+$chatEnvironment['CHAT2API_HOST'] = $Chat2ApiHost
 $chatEnvironment['CHAT2API_PORT'] = [string]$Chat2ApiPort
 $chatEnvironment['CHAT2API_DATA_DIR'] = $chatData
 $chatEnvironment['NODE_ENV'] = 'production'
@@ -217,7 +235,11 @@ $chatEnvironment['NODE_ENV'] = 'production'
 $liteEnvironment = Select-Environment `
   -Source (Get-ContainerEnvironment -DockerExecutable $dockerExecutable -ContainerName $LiteLlmContainer) `
   -NamePattern '^(LITELLM_|CHAT2API_API_KEY$|REQUEST_TIMEOUT$)'
-$liteEnvironment['CHAT2API_BASE_URL'] = "http://127.0.0.1:${Chat2ApiPort}/v1"
+$chatBaseUrl = New-HttpUrl -Host $Chat2ApiHost -Port $Chat2ApiPort -Path '/'
+$chatHealthUrl = New-HttpUrl -Host $Chat2ApiHost -Port $Chat2ApiPort -Path '/health'
+$liteHealthUrl = New-HttpUrl -Host $LiteLlmHost -Port $LiteLlmPort -Path '/health/liveliness'
+$liteEnvironment['CHAT2API_BASE_URL'] = "$chatBaseUrl/v1"
+$liteEnvironment['CHAT2API_HEALTH_URL'] = $chatHealthUrl
 
 $resolvedLogDirectory = [IO.Path]::GetFullPath($LogDirectory)
 New-Item -ItemType Directory -Path $resolvedLogDirectory -Force | Out-Null
@@ -228,7 +250,9 @@ $services = @(
     Executable = $nodeExecutable
     CommandLineArguments = Join-NativeArguments -Value @($chatEntryPoint)
     WorkingDirectory = $chatSource
-    HealthUrl = "http://127.0.0.1:${Chat2ApiPort}/health"
+    HealthUrl = $chatHealthUrl
+    DependsOn = @()
+    DependencyHealthUrls = @()
     Environment = Protect-Environment -Environment $chatEnvironment
     StdOutPath = Join-Path $resolvedLogDirectory 'chat2api.out.log'
     StdErrPath = Join-Path $resolvedLogDirectory 'chat2api.err.log'
@@ -243,14 +267,19 @@ $services = @(
       '--config',
       $liteConfig,
       '--host',
-      '127.0.0.1',
+      $LiteLlmHost,
       '--port',
       [string]$LiteLlmPort,
       '--num_workers',
       '1'
     )
     WorkingDirectory = (Split-Path -Parent $liteConfig)
-    HealthUrl = "http://127.0.0.1:${LiteLlmPort}/health/liveliness"
+    HealthUrl = $liteHealthUrl
+    DependsOn = @('chat2api')
+    # Keep an explicit URL prerequisite as well as the named dependency. This
+    # lets the supervisor detect a stale/standalone LiteLLM config that was
+    # generated before both processes were managed together.
+    DependencyHealthUrls = @($chatHealthUrl)
     Environment = Protect-Environment -Environment $liteEnvironment
     StdOutPath = Join-Path $resolvedLogDirectory 'litellm.out.log'
     StdErrPath = Join-Path $resolvedLogDirectory 'litellm.err.log'
@@ -261,7 +290,7 @@ $services = @(
 )
 
 $config = [pscustomobject]@{
-  SchemaVersion = 1
+  SchemaVersion = 2
   GeneratedAt = [DateTimeOffset]::Now
   Services = $services
 }

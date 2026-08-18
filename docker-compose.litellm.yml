@@ -25,10 +25,11 @@ services:
       CHAT2API_BASE_URL: "${CHAT2API_BASE_URL:-http://host.docker.internal:8080/v1}"
       CHAT2API_API_KEY: "${CHAT2API_API_KEY:-sk-chat2api-local}"
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-litellm-local}"
-      LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-true}"
+      LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES: "${LITELLM_USE_CHAT_COMPLETIONS_URL_FOR_ANTHROPIC_MESSAGES:-false}"
       # cancel_on_disconnect is enabled in the mounted LiteLLM configuration.
       # LiteLLM applies this to outer connect/read waits. Streaming activity
-      # refreshes that budget; Chat2API separately enforces meaningful idle.
+      # refreshes that budget; Chat2API separately enforces meaningful idle
+      # and the cumulative Qwen request deadline.
       REQUEST_TIMEOUT: "${LITELLM_REQUEST_TIMEOUT:-900}"
       # Anthropic ping events keep downstream byte-idle watchdogs alive while
       # the translated upstream stream is temporarily quiet. Zero disables it.
@@ -45,7 +46,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2)"
+        - "import os, urllib.parse, urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2); target=urllib.parse.urlsplit(os.environ['CHAT2API_BASE_URL']); health=target._replace(path='/health', query='', fragment='').geturl(); urllib.request.urlopen(health, timeout=2)"
       interval: 10s
       timeout: 3s
       retries: 12

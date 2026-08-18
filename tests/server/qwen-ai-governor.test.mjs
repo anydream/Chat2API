@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 import ts from 'typescript'
+import { isQwenAiAccountFault } from '../../src/main/proxy/qwenAiAccountPolicy.ts'
 
 function deferred() {
   let resolve
@@ -15,7 +16,7 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}) {
+function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}, accountPool = {}) {
   const source = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
   const output = ts.transpileModule(source, {
     compilerOptions: {
@@ -34,12 +35,14 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
         ...configOverrides,
       },
     }),
-    getProviders: () => [],
-    getAccounts: () => [],
+    getProviders: () => accountPool.providers || [],
+    getAccounts: () => accountPool.accounts || [],
   }
   const calculateQwenAiRequestReadyAt = input => Math.max(
     input.accountActive ? Number.POSITIVE_INFINITY : 0,
-    input.lastGlobalStartAt + input.globalMinIntervalMs,
+    input.recoveryBypassGlobalInterval
+      ? input.lastGlobalStartAt
+      : input.lastGlobalStartAt + input.globalMinIntervalMs,
     input.recoveryBypassAccountInterval ? 0 : input.accountNextAvailableAt,
     input.accountCooldownUntil,
   )
@@ -62,6 +65,7 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
     if (specifier === './qwenAiGovernorPolicy') {
       return { calculateQwenAiAdaptiveLimits, calculateQwenAiRequestReadyAt, parseQwenAiRetryAfterMs }
     }
+    if (specifier === './qwenAiAccountPolicy') return { isQwenAiAccountFault }
     throw new Error(`Unexpected governor test import: ${specifier}`)
   }
 
@@ -80,6 +84,35 @@ function loadGovernorForRuntimeTest(queueTimeoutMs = 1_000, configOverrides = {}
   return module.exports.QwenAiRequestGovernor
 }
 
+function loadLoadBalancerForRuntimeTest(storeOverrides = {}) {
+  const source = fs.readFileSync('src/main/proxy/loadbalancer.ts', 'utf8')
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  const module = { exports: {} }
+  const storeManager = { ...storeOverrides }
+  const testRequire = specifier => {
+    if (specifier === '../store/store') return { storeManager }
+    if (specifier === './adapters/providerModelOptions') {
+      return { normalizeProviderModelForMatch: value => value }
+    }
+    if (specifier === './adapters/qwen-ai-token-refresh') {
+      return { hasQwenAiSessionCookie: cookies => /(?:^|;\s*)token=[^;]+/.test(cookies || '') }
+    }
+    if (specifier === './qwenAiRequestGovernor') {
+      return { qwenAiRequestGovernor: { isAccountImmediatelyAvailable: () => true } }
+    }
+    if (specifier === '../store/types' || specifier === './types') return {}
+    throw new Error(`Unexpected load-balancer test import: ${specifier}`)
+  }
+
+  new Function('require', 'module', 'exports', output)(testRequire, module, module.exports)
+  return module.exports.LoadBalancer
+}
+
 test('Qwen AI requests are routed through a per-provider governor', () => {
   const forwarderSource = fs.readFileSync('src/main/proxy/forwarder.ts', 'utf8')
   const governorSource = fs.readFileSync('src/main/proxy/qwenAiRequestGovernor.ts', 'utf8')
@@ -90,8 +123,10 @@ test('Qwen AI requests are routed through a per-provider governor', () => {
 
   assert.match(forwarderSource, /qwenAiRequestGovernor/)
   assert.match(forwarderSource, /qwenAiRequestGovernor\.run\(account\.id/)
-  assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context\)/)
+  assert.match(forwarderSource, /this\.forwardQwenAi\(request, account, provider, actualModel, startTime, context, \{[\s\S]*requestTimeoutMs: options\.qwenAiRequestTimeoutMs/)
   assert.match(forwarderSource, /signal: context\.signal/)
+  assert.match(forwarderSource, /deadlineAt: options\.qwenAiRequestDeadlineAt/)
+  assert.match(forwarderSource, /deadlineAt: options\.requestDeadlineAt/)
   assert.match(forwarderSource, /CHAT2API_QWEN_AI_RETRY_COUNT/)
   assert.match(forwarderSource, /QwenAiAdapter\.isQwenAiProvider\(provider\)[\s\S]*qwenAiRetryCountFromEnv\(recoverManagedToolStream\)/)
   assert.match(forwarderSource, /previousRecoveryHint === 'managed_tool_stream_validation'/)
@@ -234,6 +269,34 @@ test('Qwen AI governor keeps an active slot occupied until an aborted operation 
   assert.equal(secondStarted, true)
 })
 
+test('Qwen AI governor can delay an active abort result until the operation settles', async () => {
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  const controller = new AbortController()
+  const started = deferred()
+  const upstream = deferred()
+  let returned = false
+
+  const pending = governor.run('account-1', () => {
+    started.resolve()
+    return upstream.promise
+  }, {
+    signal: controller.signal,
+    waitForActiveSettlementOnAbort: true,
+  })
+  pending.then(() => { returned = true })
+
+  await started.promise
+  controller.abort()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(returned, false)
+
+  upstream.resolve({ success: true, status: 200 })
+  const result = await pending
+  assert.equal(result.status, 499)
+  assert.equal(returned, true)
+})
+
 test('Qwen AI governor preserves cancellation when a global circuit opens', async () => {
   const Governor = loadGovernorForRuntimeTest(3_000)
   const governor = new Governor()
@@ -287,6 +350,9 @@ test('Qwen AI governor returns a runtime 429 after the queue deadline', { timeou
   assert.equal(queuedRequestStarted, false)
   assert.equal(result.status, 429)
   assert.equal(result.retryable, true)
+  assert.equal(result.errorCode, 'qwen_ai_queue_timeout')
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, 'next-account')
   assert.equal(result.headers?.['Retry-After'], '1')
   assert.match(result.error, /waited in queue for more than 1s/)
   assert.ok(waitedMs >= 900, `queue deadline fired too early: ${waitedMs}ms`)
@@ -294,6 +360,148 @@ test('Qwen AI governor returns a runtime 429 after the queue deadline', { timeou
   assert.equal(getEventListeners(queuedController.signal, 'abort').length, 0)
 
   activeResult.resolve({ success: true, status: 200, body: {} })
+  await activePromise
+})
+
+test('Qwen AI governor returns 504 when an absolute request deadline expires while pending', { timeout: 5_000 }, async (t) => {
+  const Governor = loadGovernorForRuntimeTest(1_000)
+  const governor = new Governor()
+  const activeStarted = deferred()
+  const activeResult = deferred()
+  const activePromise = governor.run('account-1', () => {
+    activeStarted.resolve()
+    return activeResult.promise
+  })
+  t.after(() => activeResult.resolve({ success: true, status: 200, body: {} }))
+  await activeStarted.promise
+
+  const queuedController = new AbortController()
+  let queuedRequestStarted = false
+  const queuedAt = Date.now()
+  const result = await governor.run('account-2', async () => {
+    queuedRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  }, {
+    signal: queuedController.signal,
+    deadlineAt: queuedAt + 100,
+  })
+  const waitedMs = Date.now() - queuedAt
+
+  assert.equal(queuedRequestStarted, false)
+  assert.equal(result.status, 504)
+  assert.equal(result.errorCode, 'qwen_ai_request_timeout')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, undefined)
+  assert.equal(result.headers, undefined)
+  assert.match(result.error, /cumulative request deadline/)
+  assert.ok(waitedMs >= 50, `request deadline fired too early: ${waitedMs}ms`)
+  assert.ok(waitedMs < 750, `request deadline fired too late: ${waitedMs}ms`)
+  assert.equal(getEventListeners(queuedController.signal, 'abort').length, 0)
+
+  activeResult.resolve({ success: true, status: 200, body: {} })
+  await activePromise
+})
+
+test('Qwen AI immediate compaction admission never enters the shared queue', async () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+  })
+  const governor = new Governor()
+  const activeStarted = deferred()
+  const activeResult = deferred()
+  const activePromise = governor.run('normal-1', () => {
+    activeStarted.resolve()
+    return activeResult.promise
+  }, { requestClass: 'normal' })
+  await activeStarted.promise
+
+  const startedAt = Date.now()
+  const result = await governor.run('compaction-1', async () => ({
+    success: true,
+    status: 200,
+  }), {
+    requestClass: 'context_compaction',
+    allowQueue: false,
+  })
+
+  assert.ok(Date.now() - startedAt < 250)
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'qwen_ai_compaction_admission_deferred')
+  assert.equal(result.retryable, true)
+  assert.equal(result.accountFault, false)
+  assert.equal(governor.getStatus([], []).queueSize, 0)
+
+  activeResult.resolve({ success: true, status: 200, body: {} })
+  await activePromise
+})
+
+test('Qwen AI governor keeps a normal request slot available while compaction is active', async () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 3,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+  })
+  const governor = new Governor()
+  const compactionReleases = [deferred(), deferred()]
+  const compactionStarted = []
+
+  const compactionPromises = compactionReleases.map((release, index) => governor.run(
+    `compaction-${index + 1}`,
+    async () => {
+      compactionStarted.push(index + 1)
+      await release.promise
+      return { success: true, status: 200 }
+    },
+    { requestClass: 'context_compaction' },
+  ))
+
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(compactionStarted.sort(), [1, 2])
+  assert.equal(governor.getStatus([], []).compactionActiveRequests, 2)
+
+  let normalStarted = false
+  const normal = governor.run('normal-1', async () => {
+    normalStarted = true
+    return { success: true, status: 200 }
+  }, { requestClass: 'normal' })
+
+  const normalResult = await normal
+  assert.equal(normalStarted, true)
+  assert.equal(normalResult.success, true)
+
+  compactionReleases.forEach(release => release.resolve())
+  await Promise.all(compactionPromises)
+})
+
+test('Qwen AI governor keeps compaction queue timeouts local to the compaction request', { timeout: 5_000 }, async () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+  })
+  const governor = new Governor()
+  const activeStarted = deferred()
+  const activeResult = deferred()
+  const activePromise = governor.run('normal-1', () => {
+    activeStarted.resolve()
+    return activeResult.promise
+  }, { requestClass: 'normal' })
+  await activeStarted.promise
+
+  const result = await governor.run('compaction-1', async () => ({
+    success: true,
+    status: 200,
+  }), { requestClass: 'context_compaction' })
+
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'qwen_ai_queue_timeout')
+  assert.equal(result.retryScope, undefined)
+  assert.equal(result.accountFault, false)
+
+  activeResult.resolve({ success: true, status: 200 })
   await activePromise
 })
 
@@ -346,6 +554,42 @@ test('Qwen AI managed-tool recovery is not blocked by the provider failure coold
   assert.equal(recovery.success, true)
 })
 
+test('Qwen AI account failover may bypass aggregate pacing only when explicitly requested', async () => {
+  const Governor = loadGovernorForRuntimeTest(3_000, {
+    maxConcurrent: 2,
+    globalMinIntervalMs: 250,
+    accountMinIntervalMs: 0,
+  })
+  const governor = new Governor()
+  const firstStarted = deferred()
+  const releaseFirst = deferred()
+  const first = governor.run('account-1', async () => {
+    firstStarted.resolve()
+    await releaseFirst.promise
+    return { success: true, status: 200 }
+  })
+  await firstStarted.promise
+
+  let ordinaryStarted = false
+  const ordinary = governor.run('account-2', async () => {
+    ordinaryStarted = true
+    return { success: true, status: 200 }
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(ordinaryStarted, false)
+
+  let recoveryStarted = false
+  const recovery = governor.run('account-3', async () => {
+    recoveryStarted = true
+    return { success: true, status: 200 }
+  }, { recoveryBypassGlobalInterval: true })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(recoveryStarted, true)
+
+  releaseFirst.resolve()
+  await Promise.all([first, ordinary, recovery])
+})
+
 test('Qwen AI governor logs queue and active timings per request attempt', async () => {
   const Governor = loadGovernorForRuntimeTest()
   const governor = new Governor()
@@ -396,6 +640,7 @@ test('Qwen AI deferred stream risk failures are reported back to the governor', 
     error: 'FAIL_SYS_USER_VALIDATE RGV587 challenge',
     errorCode: 'qwen_ai_risk_control',
     retryable: false,
+    accountFault: true,
   })
 
   const status = governor.getStatus(
@@ -404,6 +649,42 @@ test('Qwen AI deferred stream risk failures are reported back to the governor', 
   )
   assert.ok(status.accounts[0].governorCooldownInMs > 4_000)
   assert.equal(status.accounts[0].governorCooldownReason, 'qwen_ai_risk_control')
+})
+
+test('context compaction risk cools accounts without opening the ordinary global circuit', () => {
+  const accounts = Array.from({ length: 10 }, (_, index) => ({
+    id: `account-${index + 1}`,
+    name: `Account ${index + 1}`,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    riskCooldownMs: 5_000,
+    maxRiskCooldownMs: 5_000,
+    globalRiskCooldownMs: 20_000,
+    maxGlobalRiskCooldownMs: 20_000,
+    globalRiskThreshold: 2,
+    riskWindowMs: 60_000,
+  }, { accounts, providers })
+  const governor = new Governor()
+
+  for (const account of accounts) {
+    governor.reportDeferredFailure(account.id, {
+      success: false,
+      status: 403,
+      error: 'FAIL_SYS_USER_VALIDATE RGV587 challenge',
+      errorCode: 'qwen_ai_risk_control',
+      retryable: false,
+      accountFault: true,
+    }, 'context_compaction')
+  }
+
+  const status = governor.getStatus(accounts, providers)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.recentRiskEvents, 0)
+  assert.equal(status.recentRiskAccounts, 0)
+  assert.ok(status.accounts.every(account => account.governorCooldownInMs > 4_000))
 })
 
 test('Qwen AI governor releases a slot when the returned stream already ended', { timeout: 5_000 }, async () => {
@@ -466,7 +747,7 @@ test('Qwen AI governor allows only one in-flight request per account until strea
   assert.equal(secondStarted, true)
 })
 
-test('Qwen AI governor honors a bounded Retry-After for ordinary 429 responses', () => {
+test('Qwen AI governor keeps ordinary 429 responses account-neutral', () => {
   const Governor = loadGovernorForRuntimeTest(3_000, {
     maxConcurrent: 1,
     globalMinIntervalMs: 0,
@@ -478,17 +759,19 @@ test('Qwen AI governor honors a bounded Retry-After for ordinary 429 responses',
     status: 429,
     headers: { 'Retry-After': '300' },
     error: 'upstream rate limited',
+    errorCode: 'qwen_ai_rate_limited',
+    accountFault: false,
   })).then(() => {
     const status = governor.getStatus(
       [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
       [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
     )
-    assert.ok(status.accounts[0].governorCooldownInMs >= 299_000)
-    assert.match(status.accounts[0].governorCooldownReason, /http_429_retry_after/)
+    assert.equal(status.accounts[0].governorCooldownInMs, 0)
+    assert.equal(status.accounts[0].governorCooldownReason, undefined)
   })
 })
 
-test('Qwen AI governor adds Retry-After from its configured cooldown when upstream omits it', async () => {
+test('Qwen AI governor adds Retry-After only to capacity 429 responses', async () => {
   const Governor = loadGovernorForRuntimeTest(3_000, {
     maxConcurrent: 1,
     globalMinIntervalMs: 0,
@@ -501,12 +784,296 @@ test('Qwen AI governor adds Retry-After from its configured cooldown when upstre
     success: false,
     status: 429,
     error: 'upstream capacity limited',
+    errorCode: 'qwen_ai_capacity_limit',
     retryable: false,
+    accountFault: true,
+    retryScope: 'next-account',
   }))
 
   assert.equal(result.status, 429)
   assert.equal(result.headers?.['Retry-After'], '45')
   assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, true)
+  assert.equal(result.retryScope, 'next-account')
+})
+
+test('Qwen AI capacity 429s do not open the global risk circuit', async () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    failureCooldownMs: 25,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 1_000,
+    maxGlobalRiskCooldownMs: 1_000,
+    riskWindowMs: 1_000,
+    globalRiskThreshold: 3,
+  })
+  const governor = new Governor()
+  const accounts = ['account-1', 'account-2', 'account-3', 'account-4'].map(id => ({
+    id,
+    name: id,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+
+  for (const account of accounts.slice(0, 3)) {
+    const result = await governor.run(account.id, async () => ({
+      success: false,
+      status: 429,
+      error: 'Qwen AI capacity is temporarily exhausted',
+      errorCode: 'qwen_ai_capacity_limit',
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    }))
+    assert.equal(result.errorCode, 'qwen_ai_capacity_limit')
+  }
+
+  let fourthRequestStarted = false
+  const fourthResult = await governor.run('account-4', async () => {
+    fourthRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(fourthRequestStarted, true)
+  assert.equal(fourthResult.success, true)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.recentRiskEvents, 0)
+  assert.equal(status.recentRiskAccounts, 0)
+})
+
+test('a global risk circuit admits one healthy half-open probe and closes on success', async () => {
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    failureCooldownMs: 25,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 1_000,
+    maxGlobalRiskCooldownMs: 1_000,
+    riskWindowMs: 1_000,
+    globalRiskThreshold: 3,
+  })
+  const governor = new Governor()
+  const accounts = ['account-1', 'account-2', 'account-3', 'account-4'].map(id => ({
+    id,
+    name: id,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+
+  for (const account of accounts.slice(0, 3)) {
+    const result = await governor.run(account.id, async () => ({
+      success: false,
+      status: 403,
+      error: 'FAIL_SYS_USER_VALIDATE challenge required',
+      errorCode: 'qwen_ai_risk_control',
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    }))
+    assert.equal(result.errorCode, 'qwen_ai_risk_control')
+  }
+
+  let fourthRequestStarted = false
+  const fourthResult = await governor.run('account-4', async () => {
+    fourthRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(fourthRequestStarted, true)
+  assert.equal(fourthResult.success, true)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.globalRecoveryProbeActive, false)
+  assert.equal(status.recentRiskEvents, 3)
+  assert.equal(status.recentRiskAccounts, 3)
+})
+
+test('a failed half-open probe keeps the exhausted-pool circuit open and blocks the next request', async () => {
+  const accounts = ['account-1', 'account-2', 'account-3', 'account-4', 'account-5'].map(id => ({
+    id,
+    name: id,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 5_000,
+    maxGlobalRiskCooldownMs: 5_000,
+    riskWindowMs: 5_000,
+    globalRiskThreshold: 3,
+  }, { accounts, providers })
+  const governor = new Governor()
+  const risk = {
+    success: false,
+    status: 403,
+    error: 'FAIL_SYS_USER_VALIDATE challenge required',
+    errorCode: 'qwen_ai_risk_control',
+    retryable: false,
+    accountFault: true,
+    retryScope: 'next-account',
+  }
+
+  for (const account of accounts) {
+    const result = await governor.run(account.id, async () => ({ ...risk }))
+    assert.equal(result.errorCode, 'qwen_ai_risk_control')
+  }
+
+  await new Promise(resolve => setTimeout(resolve, 30))
+  let probeStarted = false
+  const probeResult = await governor.run('account-1', async () => {
+    probeStarted = true
+    return { ...risk }
+  })
+  let nextRequestStarted = false
+  const nextResult = await governor.run('account-2', async () => {
+    nextRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(probeStarted, true)
+  assert.equal(probeResult.errorCode, 'qwen_ai_risk_control')
+  assert.equal(nextRequestStarted, false)
+  assert.equal(nextResult.status, 429)
+  assert.equal(nextResult.errorCode, 'qwen_ai_global_risk_circuit')
+  assert.equal(status.globalRecoveryProbeActive, false)
+  assert.ok(status.globalRecoveryNextInMs > 0)
+  assert.ok(status.globalCooldownInMs > 0)
+})
+
+test('a large Qwen account pool keeps healthy accounts available after isolated risks', async () => {
+  const accounts = Array.from({ length: 99 }, (_, index) => ({
+    id: `account-${index + 1}`,
+    name: `Account ${index + 1}`,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 1_000,
+    maxGlobalRiskCooldownMs: 1_000,
+    riskWindowMs: 1_000,
+    globalRiskThreshold: 3,
+  }, {
+    accounts,
+    providers: [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+  })
+  const governor = new Governor()
+
+  for (const accountId of ['account-1', 'account-2', 'account-3']) {
+    await governor.run(accountId, async () => ({
+      success: false,
+      status: 403,
+      error: 'FAIL_SYS_USER_VALIDATE challenge required',
+      errorCode: 'qwen_ai_risk_control',
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    }))
+  }
+
+  let fourthRequestStarted = false
+  const fourthResult = await governor.run('account-4', async () => {
+    fourthRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, [{
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+  }])
+
+  assert.equal(fourthRequestStarted, true)
+  assert.equal(fourthResult.success, true)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.recentRiskAccounts, 3)
+  assert.equal(status.effectiveConfig.healthyAccountCount, 96)
+})
+
+test('a large Qwen pool stays open for healthy accounts after risk reaches ten percent', async () => {
+  const accounts = Array.from({ length: 99 }, (_, index) => ({
+    id: `account-${index + 1}`,
+    name: `Account ${index + 1}`,
+    providerId: 'qwen-ai',
+    status: 'active',
+  }))
+  const providers = [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }]
+  const Governor = loadGovernorForRuntimeTest(1_000, {
+    maxConcurrent: 1,
+    globalMinIntervalMs: 0,
+    accountMinIntervalMs: 0,
+    riskCooldownMs: 25,
+    maxRiskCooldownMs: 25,
+    globalRiskCooldownMs: 5_000,
+    maxGlobalRiskCooldownMs: 5_000,
+    riskWindowMs: 5_000,
+    globalRiskThreshold: 3,
+  }, { accounts, providers })
+  const governor = new Governor()
+
+  for (const account of accounts.slice(0, 10)) {
+    await governor.run(account.id, async () => ({
+      success: false,
+      status: 403,
+      error: 'FAIL_SYS_USER_VALIDATE challenge required',
+      errorCode: 'qwen_ai_risk_control',
+      retryable: false,
+      accountFault: true,
+      retryScope: 'next-account',
+    }))
+  }
+
+  const beforeHealthyRequest = governor.getStatus(accounts, providers)
+  assert.equal(beforeHealthyRequest.globalCooldownInMs, 0)
+
+  let healthyRequestStarted = false
+  const healthyResult = await governor.run('account-11', async () => {
+    healthyRequestStarted = true
+    return { success: true, status: 200, body: {} }
+  })
+  const status = governor.getStatus(accounts, providers)
+
+  assert.equal(healthyRequestStarted, true)
+  assert.equal(healthyResult.success, true)
+  assert.equal(status.globalCooldownInMs, 0)
+  assert.equal(status.recentRiskAccounts, 10)
+  assert.equal(status.effectiveConfig.healthyAccountCount, 89)
+})
+
+test('Qwen AI global risk circuit is account-neutral and never requests account failover', async () => {
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  governor.openGlobalCooldown(5_000, 'test_global_circuit', 1)
+  let started = false
+
+  const result = await governor.run('account-1', async () => {
+    started = true
+    return { success: true, status: 200 }
+  })
+
+  assert.equal(started, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.errorCode, 'qwen_ai_global_risk_circuit')
+  assert.equal(result.retryable, false)
+  assert.equal(result.accountFault, false)
+  assert.equal(result.retryScope, undefined)
 })
 
 test('Qwen AI governor does not cool an account for an account-neutral protocol failure', async () => {
@@ -566,10 +1133,13 @@ test('Qwen AI account-neutral failures bypass load-balancer penalties on immedia
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
 
   assert.match(proxyTypes, /accountFault\?: boolean/)
-  assert.match(forwarderSource, /accountFault: typeof upstreamAccountFault === 'boolean'/)
+  assert.match(forwarderSource, /qwenAiAccountFailureDetails\(/)
+  assert.match(forwarderSource, /inferredErrorAccountFault/)
+  assert.match(forwarderSource, /accountFault: clientCancelled \|\| sessionStateFailure \|\| continuationRejected/)
+  assert.match(forwarderSource, /: inferredErrorAccountFault/)
   assert.match(chatRouteSource, /result\.accountFault !== false/)
-  assert.match(chatRouteSource, /streamFailureAccountFault\(error\) !== false/)
-  assert.match(chatRouteSource, /accountFault: streamFailureAccountFault\(error\)/)
+  assert.match(chatRouteSource, /isQwenAiAccountFault/)
+  assert.match(chatRouteSource, /const failureAccountFault = streamFailureAccountFault\(error, failureStatus\)/)
 })
 
 test('Qwen AI risk-control failures cool the account and require distinct accounts before global circuit', () => {
@@ -592,14 +1162,14 @@ test('Qwen AI risk-control failures cool the account and require distinct accoun
   assert.match(governorSource, /qwen_ai_risk_control/)
   assert.match(governorSource, /2 \*\* \(failures - 1\)/)
   assert.match(governorSource, /recordGlobalRiskControl/)
-  assert.match(governorSource, /recordGlobalRiskControl\(accountId, config\)/)
+  assert.match(governorSource, /recordGlobalRiskControl\(accountId, config,/)
   assert.match(governorSource, /new Set\(this\.riskEvents\.map\(event => event\.accountId\)\)\.size/)
   assert.match(governorSource, /qwen_ai_global_risk_circuit/)
   assert.match(governorSource, /createGlobalCircuitOpenResult/)
   assert.match(governorSource, /reportDeferredFailure/)
   assert.match(governorSource, /Retry-After/)
   assert.match(chatRouteSource, /ctx\.set\(key, value\)/)
-  assert.match(chatRouteSource, /qwenAiRequestGovernor\.reportDeferredFailure\(account\.id/)
+  assert.match(chatRouteSource, /qwenAiRequestGovernor\.reportDeferredFailure\(completionAccount\.id/)
 })
 
 test('Qwen AI governor exposes configurable global risk circuit settings', () => {
@@ -649,8 +1219,10 @@ test('Qwen AI governor auto-tunes effective rate limits from healthy accounts an
   assert.match(configSource, /qwenAiGovernorConfig\.autoTuneEnabled must be a boolean/)
   assert.match(governorSource, /calculateEffectiveConfig/)
   assert.match(governorSource, /calculateQwenAiAdaptiveLimits/)
+  assert.match(governorSource, /accountCount: options\.accountCount/)
   assert.match(governorSource, /healthyAccountCount: options\.healthyAccountCount/)
   assert.match(governorSource, /recentRiskEvents: options\.recentRiskEvents/)
+  assert.match(governorSource, /recentRiskAccountCount: options\.recentRiskAccounts/)
   assert.match(governorSource, /effectiveConfig/)
   assert.match(panelSource, /qwen-auto-tune/)
   assert.match(panelSource, /status\?\.effectiveConfig\.maxConcurrent/)
@@ -680,7 +1252,8 @@ test('Qwen AI cancellation and timeout paths are not retried or logged as succes
   assert.match(qwenAiSource, /Qwen AI response stream aborted before reading started/)
   assert.match(qwenAiSource, /QWEN_AI_STREAM_FAILURE_EVENT/)
   assert.match(qwenAiSource, /transStream\.qwenAiFailure = error/)
-  assert.match(qwenAiSource, /stream\.once\('error', \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight\) \{\s*return/)
+  assert.match(qwenAiSource, /const onUpstreamError = \(err: Error\) => \{\s*if \(finalChunkSent \|\| semanticRecoveryInFlight \|\| transientRecoveryInFlight\) \{\s*return/)
+  assert.match(qwenAiSource, /stream\.once\('error', onUpstreamError\)[\s\S]*if \(options\.signal\?\.aborted\)/)
   assert.match(forwarderSource, /retryable = status === 499[\s\S]*status === 403[\s\S]*status === 429[\s\S]*status === 504[\s\S]*\? false/)
 
   const chatRouteSource = fs.readFileSync('src/main/proxy/routes/chat.ts', 'utf8')
@@ -698,6 +1271,169 @@ test('Qwen AI cancellation and timeout paths are not retried or logged as succes
   assert.match(geminiRouteSource, /ctx\.res\.once\('close',[\s\S]*!ctx\.res\.writableEnded/)
 })
 
+test('Qwen AI load balancing prefers a complete web session over an incomplete imported session', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const incomplete = {
+    id: 'account-incomplete',
+    name: 'Incomplete',
+    providerId: provider.id,
+    status: 'active',
+    credentials: {
+      token: 'jwt-value',
+      cookies: 'cnaui=auxiliary; x-ap=value',
+    },
+  }
+  const complete = {
+    id: 'account-complete',
+    name: 'Complete',
+    providerId: provider.id,
+    status: 'active',
+    credentials: {
+      token: 'jwt-value',
+      cookies: 'cnaui=auxiliary; token=session-value; x-ap=value',
+    },
+  }
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => [incomplete, complete],
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+  const loadBalancer = new LoadBalancer()
+
+  const selected = loadBalancer.selectAccount('Qwen3.8-Max-Preview')
+
+  assert.equal(selected.account.id, complete.id)
+})
+
+test('Qwen AI load balancing can still repair an incomplete session when no ready session exists', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const incomplete = {
+    id: 'account-incomplete',
+    name: 'Incomplete',
+    providerId: provider.id,
+    status: 'active',
+    credentials: {
+      token: 'jwt-value',
+      cookies: 'cnaui=auxiliary; x-ap=value',
+    },
+  }
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => [incomplete],
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+  const loadBalancer = new LoadBalancer()
+
+  const selected = loadBalancer.selectAccount('Qwen3.8-Max-Preview')
+
+  assert.equal(selected.account.id, incomplete.id)
+})
+
+test('Qwen AI load balancing excludes an account persisted as inactive after signin rejection', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const inactive = {
+    id: 'account-unregistered',
+    name: 'Unregistered',
+    providerId: provider.id,
+    status: 'inactive',
+    credentials: { token: 'stale-jwt', cookies: 'cnaui=auxiliary' },
+  }
+  const healthy = {
+    id: 'account-healthy',
+    name: 'Healthy',
+    providerId: provider.id,
+    status: 'active',
+    credentials: { token: 'jwt-value', cookies: 'token=session-value' },
+  }
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => [inactive, healthy],
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+
+  const selected = new LoadBalancer().selectAccount('Qwen3.8-Max-Preview')
+
+  assert.equal(selected.account.id, healthy.id)
+})
+
+test('Qwen AI complete-session failover never falls through to an incomplete session', () => {
+  const provider = {
+    id: 'qwen-ai',
+    name: 'Qwen AI',
+    apiEndpoint: 'https://chat.qwen.ai',
+    enabled: true,
+  }
+  const accounts = [
+    {
+      id: 'account-complete-1',
+      name: 'Complete 1',
+      providerId: provider.id,
+      status: 'active',
+      credentials: { token: 'jwt-value', cookies: 'token=session-1; x-ap=value' },
+    },
+    {
+      id: 'account-complete-2',
+      name: 'Complete 2',
+      providerId: provider.id,
+      status: 'active',
+      credentials: { token: 'jwt-value', cookies: 'token=session-2; x-ap=value' },
+    },
+    {
+      id: 'account-incomplete',
+      name: 'Incomplete',
+      providerId: provider.id,
+      status: 'active',
+      credentials: { token: 'jwt-value', cookies: 'cnaui=auxiliary; x-ap=value' },
+    },
+  ]
+  const LoadBalancer = loadLoadBalancerForRuntimeTest({
+    getProviders: () => [provider],
+    getAccountsByProviderId: () => accounts,
+    getEffectiveModels: () => [],
+    getConfig: () => ({ modelMappings: {} }),
+  })
+  const loadBalancer = new LoadBalancer()
+  const constraints = { qwenAiWebSessionTier: 'complete' }
+
+  const secondReady = loadBalancer.selectAccount(
+    'Qwen3.8-Max-Preview',
+    'fill-first',
+    provider.id,
+    undefined,
+    new Set(['account-complete-1']),
+    constraints,
+  )
+  const exhausted = loadBalancer.selectAccount(
+    'Qwen3.8-Max-Preview',
+    'fill-first',
+    provider.id,
+    undefined,
+    new Set(['account-complete-1', 'account-complete-2']),
+    constraints,
+  )
+
+  assert.equal(secondReady.account.id, 'account-complete-2')
+  assert.equal(exhausted, null)
+})
+
 test('Qwen AI production logs avoid dumping full prompts by default', () => {
   const qwenAiSource = fs.readFileSync('src/main/proxy/adapters/qwen-ai.ts', 'utf8')
 
@@ -709,4 +1445,58 @@ test('Qwen AI production logs avoid dumping full prompts by default', () => {
   assert.match(qwenAiSource, /fileCount/)
   assert.match(qwenAiSource, /if \(QWEN_AI_DEBUG_PAYLOAD_LOGS\)/)
   assert.match(qwenAiSource, /if \(QWEN_AI_DEBUG_STREAM_LOGS\)/)
+})
+
+test('Qwen AI governor exposes soft load-balancer recovery separately from hard availability', () => {
+  const LoadBalancer = loadLoadBalancerForRuntimeTest()
+  const loadBalancer = new LoadBalancer()
+  const beforeFailure = Date.now()
+  loadBalancer.markAccountFailed('account-1')
+  const failures = loadBalancer.getAccountFailureSnapshot()
+
+  assert.equal(failures['account-1'].count, 1)
+  assert.equal(failures['account-1'].reason, 'request_failure')
+  assert.ok(failures['account-1'].recoveryUntil >= beforeFailure + 60_000)
+  assert.equal(failures['account-1'].cooldownUntil, undefined)
+
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  const status = governor.getStatus(
+    [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+    [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+    failures,
+  )
+  const account = status.accounts[0]
+
+  assert.equal(account.nextAvailableInMs, 0)
+  assert.equal(account.loadBalancerCooldownInMs, 0)
+  assert.ok(account.loadBalancerRecoveryInMs > 59_000)
+  assert.equal(account.loadBalancerFailures, 1)
+  assert.equal(account.loadBalancerReason, 'request_failure')
+})
+
+test('Qwen AI governor exposes the latest structured failover for each account', () => {
+  const Governor = loadGovernorForRuntimeTest()
+  const governor = new Governor()
+  const record = {
+    requestId: 'request-1',
+    status: 502,
+    errorCode: 'upstream_error',
+    attempt: 2,
+    accountFault: false,
+    timestamp: 1_700_000_000_000,
+  }
+  governor.reportAccountFailover('account-1', record)
+
+  const status = governor.getStatus(
+    [{ id: 'account-1', name: 'Account 1', providerId: 'qwen-ai', status: 'active' }],
+    [{ id: 'qwen-ai', name: 'Qwen AI', apiEndpoint: 'https://chat.qwen.ai' }],
+  )
+
+  assert.deepEqual(status.accounts[0].recentFailover, record)
+
+  const panelSource = fs.readFileSync('src/renderer/src/components/proxy/QwenAiGovernorPanel.tsx', 'utf8')
+  assert.match(panelSource, /loadBalancerRecoveryInMs/)
+  assert.match(panelSource, /loadBalancerFailures > 0/)
+  assert.match(panelSource, /recentFailover/)
 })

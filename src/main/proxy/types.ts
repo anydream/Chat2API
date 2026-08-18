@@ -3,6 +3,11 @@
  * Defines core data structures for proxy service
  */
 
+import type {
+  QwenAiSessionBridge,
+  QwenAiSessionState,
+} from './qwenAiSessionBridge'
+
 /**
  * OpenAI Message Format
  */
@@ -37,6 +42,7 @@ export interface ChatCompletionTool {
     name: string
     description?: string
     parameters?: Record<string, any>
+    strict?: boolean
   }
 }
 
@@ -132,9 +138,9 @@ export interface ChatCompletionRequest {
     }
   }
   /** Reasoning effort level (OpenAI compatible) - enables thinking mode */
-  reasoning_effort?: 'low' | 'medium' | 'high'
+  reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
   /** Reasoning effort level (camelCase, for AI SDK compatibility) */
-  reasoningEffort?: 'low' | 'medium' | 'high'
+  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
   /** Explicit provider thinking-mode override. */
   enable_thinking?: boolean
   /** Optional provider thinking budget. */
@@ -147,6 +153,21 @@ export interface ChatCompletionRequest {
   tool_choice?: ChatCompletionToolChoice
   /** Tool format - determines response format for tool calls */
   tool_format?: 'native' | 'json' | 'auto'
+  /** Allow compatible providers to emit more than one tool call. */
+  parallel_tool_calls?: boolean
+  /** Structured-output configuration translated from Responses text.format. */
+  response_format?: Record<string, any>
+  /** Optional client metadata preserved at the protocol boundary. */
+  metadata?: Record<string, unknown> | null
+  /** Internal image-generation hint translated from a Responses built-in tool. */
+  image_generation?: {
+    enabled: true
+    size?: string
+    model?: string
+    quality?: string
+    format?: string
+    action?: 'auto' | 'generate' | 'edit'
+  }
 }
 
 /**
@@ -270,6 +291,18 @@ export interface ProxyContext {
   isStream: boolean
   clientIP?: string
   signal?: AbortSignal
+  /** Internal request intent detected before provider forwarding. */
+  requestIntent?: 'normal' | 'context_compaction'
+  /**
+   * The HTTP route already owns a keep-alive stream, so a managed Qwen branch
+   * can remain private until terminal validation and account failover finish.
+   */
+  deferManagedStreamCommit?: boolean
+  /**
+   * Responses API state that lets Qwen continue a completed managed-tool
+   * exchange without replaying the whole client transcript.
+   */
+  qwenAiSessionBridge?: QwenAiSessionBridge
 }
 
 /**
@@ -290,10 +323,22 @@ export interface ForwardResult {
   errorCode?: string
   /** False when a protocol-level response failure should not penalize the selected account. */
   accountFault?: boolean
+  /** Retry only by selecting another account before any generation request was accepted upstream. */
+  retryScope?: 'next-account'
   /** Internal hint for a narrowly scoped retry that may bypass one account interval. */
   recoveryHint?: 'managed_tool_stream_validation'
   providerSessionId?: string
   parentMessageId?: string
+  /** Account that produced the client-visible result after internal routing. */
+  effectiveAccountId?: string
+  /** Provider that produced the client-visible result after internal routing. */
+  effectiveProviderId?: string
+  /** Actual provider model used for the client-visible result. */
+  effectiveActualModel?: string
+  /** Live Qwen chat/parent state to persist after the response completes. */
+  qwenAiSessionState?: QwenAiSessionState
+  /** Client-visible tool call IDs emitted by a completed Qwen managed turn. */
+  qwenAiToolCallIds?: string[]
 }
 
 /**
